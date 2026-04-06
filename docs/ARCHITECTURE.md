@@ -70,8 +70,8 @@ Auto-sets `CUDA_VISIBLE_DEVICES` (NVIDIA) or `HIP_VISIBLE_DEVICES` (AMD) at disp
 ```yaml
 # ~/.tasch/config.yaml
 role: both
-node_name: gpu-38
-master_addr: 10.0.1.38
+node_name: gpu-10
+master_addr: 10.0.1.10
 ports:
   gossip: 7946
   grpc: 50051

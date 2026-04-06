@@ -38,7 +38,7 @@ Then shows detected hardware (CPU, RAM, GPUs) and writes `~/.tasch/config.yaml`.
 ### Non-interactive (scripting)
 
 ```bash
-tasch setup --non-interactive --role=worker --node-name=gpu-44 --master-addr=10.0.1.38
+tasch setup --non-interactive --role=worker --node-name=gpu-20 --master-addr=10.0.1.10
 ```
 
 ### Config file
@@ -46,8 +46,8 @@ tasch setup --non-interactive --role=worker --node-name=gpu-44 --master-addr=10.
 `~/.tasch/config.yaml`:
 ```yaml
 role: both
-node_name: gpu-server-38
-master_addr: 10.0.1.38
+node_name: gpu-server-10
+master_addr: 10.0.1.10
 ports:
   gossip: 7946
   grpc: 50051
@@ -76,15 +76,15 @@ tasch jobs submit "ad.cpu_cores >= 1" "echo hello"
 
 ### Two servers (GPU training)
 
-**Server 38 (master + worker):**
+**Server 10 (master + worker):**
 ```bash
 tasch setup         # select "Both"
 tasch start
 ```
 
-**Server 44 (worker):**
+**Server 20 (worker):**
 ```bash
-tasch setup         # select "Worker", enter server-38 IP
+tasch setup         # select "Worker", enter server-10 IP
 tasch start
 ```
 

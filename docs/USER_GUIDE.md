@@ -15,12 +15,12 @@ tasch nodes    # verify cluster
 ```bash
 $ tasch nodes
 --- Cluster Nodes ---
-Node: gpu-38
+Node: gpu-10
   OS: linux | Arch: amd64 | Cores: 32 | Memory: 128000MB | GPUs: 2
     GPU 0: NVIDIA A100-SXM4-40GB (40960MB)
     GPU 1: NVIDIA A100-SXM4-40GB (40960MB)
     CUDA: 12.2
-Node: gpu-44
+Node: gpu-20
   OS: linux | Arch: amd64 | Cores: 16 | Memory: 64000MB | GPUs: 4
     GPU 0: AMD Instinct MI250X (65536MB)
     ...
@@ -117,7 +117,7 @@ Job dj-abc123-r0
   State:    COMPLETED
   Command:  torchrun ...
   Group:    dj-abc123
-  Worker:   gpu-38
+  Worker:   gpu-10
   Submit:   2026-04-06T10:00:00+00:00
   Start:    2026-04-06T10:00:02+00:00
   End:      2026-04-06T10:05:30+00:00

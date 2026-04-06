@@ -4,7 +4,7 @@
 
 ```
 ┌──────────┐         ┌──────────┐
-│ Server 38│ ◄─────► │ Server 44│
+│ Server 10│ ◄─────► │ Server 20│
 │ (master  │  gossip │ (worker) │
 │ +worker) │  + ZMQ  │ 4x V100  │
 │ 2x A100  │         │          │
@@ -37,8 +37,8 @@ Select role:
   3) Both    — master + worker on this machine
 
 Role [3]: 3
-Node name [gpu-server-38]:
-Master address [10.0.1.38]:
+Node name [gpu-server-10]:
+Master address [10.0.1.10]:
 ...
 
 Detected hardware:
@@ -60,9 +60,9 @@ tasch start    # reads config, starts master/worker/both
 
 ### 3. Add remote workers
 
-On server 44:
+On server 20:
 ```bash
-tasch setup    # select "Worker", enter server-38 IP as master address
+tasch setup    # select "Worker", enter server-10 IP as master address
 tasch start
 ```
 
@@ -153,8 +153,8 @@ tasch jobs logs <id> [--follow]      # Stream logs
 `~/.tasch/config.yaml`:
 ```yaml
 role: both              # master | worker | both
-node_name: gpu-server-38
-master_addr: 10.0.1.38
+node_name: gpu-server-10
+master_addr: 10.0.1.10
 ports:
   gossip: 7946
   grpc: 50051

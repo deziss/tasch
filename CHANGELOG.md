@@ -1,49 +1,70 @@
 # Changelog
 
-## [v0.4.0] — 2026-04-06
+## [v0.6.0] — 2026-04-06
 
-Unified binary, interactive setup, AMD GPU support, and CLI redesign.
-
-### Breaking Changes
-
-- **Single binary** — Three separate binaries (`master`, `worker`, `cli`) replaced by one `tasch` binary with subcommands. Old `cmd/master`, `cmd/worker`, `cmd/cli` directories removed.
-- **CLI renamed** — `tasch submit` → `tasch jobs submit`, `tasch list` → `tasch jobs`, `tasch status` → `tasch nodes`, `tasch job <id>` → `tasch jobs status <id>`, `tasch logs` → `tasch jobs logs`.
+Production robustness: persistence, retry, health checks, circuit breaker, GPU tracking, TLS.
 
 ### Added
-
-- **`tasch setup`** — Interactive setup wizard. Asks role (master/worker/both), node name, master address, ports. Detects hardware (CPU, RAM, GPUs). Writes `~/.tasch/config.yaml`. Supports `--non-interactive` mode for scripting.
-
-- **`tasch start` / `tasch stop`** — Config-driven start. Reads role from config, starts appropriate components. PID-based stop via SIGTERM.
-
-- **Config file** — `~/.tasch/config.yaml` stores role, node name, master address, ports. CLI commands read config to find master. `TASCH_*` env vars override config values.
-
-- **AMD GPU support** — `pkg/profiler` now tries `rocm-smi` when `nvidia-smi` is not found. New ClassAd fields: `gpu_vendor` ("nvidia"/"amd"), `rocm_version`. CEL: `ad.gpu_vendor == "amd"`.
-
-- **`HIP_VISIBLE_DEVICES`** — Master auto-sets `HIP_VISIBLE_DEVICES` instead of `CUDA_VISIBLE_DEVICES` when dispatching to AMD GPU workers.
-
-- **CLI works everywhere** — `tasch nodes` and `tasch jobs` work from any machine (master or worker) as long as the config points to the master.
+- **BoltDB persistence** — Jobs, groups, fairshare to `~/.tasch/tasch.db`. Master restart resumes queued jobs.
+- **Job retry** — Auto-retry failed jobs (default 3x) with exponential backoff (10s, 40s, 90s).
+- **Dead letter queue** — Jobs exhausting all retries archived. `tasch jobs failed` to view.
+- **Health endpoints** — `/health` (liveness), `/ready` (readiness with members, queue depth, drain status).
+- **Queue size limits** — Max 10,000 jobs (configurable). Rejects with `RESOURCE_EXHAUSTED` when full.
+- **Graceful drain** — `tasch stop` → stop accepting → wait for running jobs → shutdown.
+- **Double-start prevention** — PID file check on `tasch start`.
+- **Stop with grace period** — SIGTERM → 15s wait → SIGKILL fallback.
+- **ZMQ auto-reconnection** — Worker reconnects with exponential backoff (1s-30s).
+- **gRPC keepalive** — 30s heartbeat, 10s timeout on worker connections.
+- **ReportResult retry** — Worker retries result reporting once on failure (10s timeout).
+- **Circuit breaker** — 3 consecutive failures on a worker → blocked 5 minutes.
+- **GPU resource tracking** — Allocated GPUs tracked per node, prevents oversubscription.
+- **TLS support** — Optional mTLS for gRPC. Config fields: `tls.enabled`, `tls.cert_file`, `tls.key_file`, `tls.ca_file`.
+- **Persistence hooks** — `OnJobChange`/`OnGroupChange` callbacks on GlobalScheduler for write-through persistence.
+- Config fields: `max_queue_size`, `max_retries`, `drain_timeout`, `tls`, `ports.metrics`.
 
 ### Changed
+- `Enqueue()` returns `error` (queue full check).
+- `StartMaster()` returns `*MasterHandle` with `Draining` flag and `Queue` ref for drain orchestration.
+- Scheduler state changes fire persistence hooks (outside lock).
 
-- **Project structure** — Code reorganized: `internal/config`, `internal/setup`, `internal/daemon`, `internal/cli`. Master and worker logic extracted from `cmd/` into importable packages with `StartMaster(cfg)` and `StartWorker(cfg)` functions.
+---
 
-- **Makefile** — Now builds single `bin/tasch` binary.
+## [v0.5.0] — 2026-04-06
+
+Observability and failure handling.
+
+### Added
+- **Prometheus metrics** — 9 metrics: jobs submitted/completed, queue depth, running jobs, cluster nodes, dispatch duration, job duration, groups pending, walltime kills, worker lost.
+- **Worker loss detection** — Gossip EventHooks `OnLeave` → fail running jobs on departed worker.
+- **Gang scheduling timeout** — 5 min timeout for distributed groups waiting for nodes.
+- **`CreatedAt` on JobGroup** — Enables gang timeout tracking.
+- **`RunningJobsOnNode()`** — Enables worker loss cleanup.
+- **Metrics HTTP server** on configurable port (default 9090).
+
+---
+
+## [v0.4.0] — 2026-04-06
+
+Unified binary, interactive setup, AMD GPU support, CLI redesign.
+
+### Breaking Changes
+- Single `tasch` binary replaces `master`, `worker`, `cli`.
+- CLI renamed: `tasch submit` → `tasch jobs submit`, `tasch status` → `tasch nodes`, etc.
+
+### Added
+- `tasch setup` interactive wizard → `~/.tasch/config.yaml`.
+- `tasch start` / `tasch stop` — config-driven daemon.
+- AMD GPU detection via `rocm-smi`. `gpu_vendor` ClassAd field. Auto `HIP_VISIBLE_DEVICES`.
+- CLI works from any machine (reads master addr from config).
 
 ---
 
 ## [v0.3.0] — 2026-04-06
 
-GPU-aware scheduling, cross-server clusters, distributed training with gang scheduling.
+GPU-aware scheduling, cross-server clusters, distributed training.
 
 ### Added
-- GPU detection (NVIDIA) via nvidia-smi — ClassAd fields: `gpu_count`, `gpu_models`, `gpu_memory_mb`, `cuda_version`
-- `TASCH_MASTER_ADDR` env var for cross-server worker joining
-- `SubmitDistributedJob` RPC + `tasch train` command for multi-node training
-- Gang scheduling — all ranks dispatched simultaneously
-- Group completion tracking — failed rank cancels siblings
-- `--gpus` and `--env` flags on submit
-- `CUDA_VISIBLE_DEVICES` auto-set
-- GPU pre-filter in dispatch loop
+- NVIDIA GPU detection, `TASCH_MASTER_ADDR` for remote workers, `SubmitDistributedJob` RPC, gang scheduling, group completion tracking, `--gpus`/`--env` flags, `CUDA_VISIBLE_DEVICES` auto-set.
 
 ---
 
@@ -51,17 +72,8 @@ GPU-aware scheduling, cross-server clusters, distributed training with gang sche
 
 Job lifecycle, backfill, fairshare, walltime, log streaming.
 
-### Added
-- Job states: QUEUED → RUNNING → COMPLETED/FAILED/CANCELLED
-- CancelJob, GetJobStatus, ListJobs, StreamLogs, ReportResult RPCs
-- Backfill scheduling, fairshare accounting, walltime enforcement
-- CLI: cancel, job, list, logs commands
-
 ---
 
 ## [v0.1.0] — Initial Release
 
-### Added
-- Memberlist gossip discovery, ZMQ dispatch, CEL matchmaking
-- Min-heap scheduler, gRPC API (SubmitJob, WorkerStatus)
-- Hardware ClassAd profiling, 3-binary architecture
+Memberlist gossip, ZMQ dispatch, CEL matchmaking, min-heap scheduler.

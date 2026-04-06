@@ -1,21 +1,19 @@
 # API Reference
 
-**Proto:** `api/v1/scheduler.proto` | **Default port:** 50051
+**Proto:** `api/v1/scheduler.proto` | **Default port:** 50051 | **Optional TLS**
 
-## Service: SchedulerService (8 RPCs)
+## SchedulerService (8 RPCs)
 
 | RPC | Description |
 |-----|-------------|
-| `SubmitJob` | Submit single job |
-| `SubmitDistributedJob` | Submit multi-node training job |
+| `SubmitJob` | Submit single job (with retry, queue limit) |
+| `SubmitDistributedJob` | Multi-node training (gang scheduling) |
 | `CancelJob` | Cancel queued/running job |
-| `GetJobStatus` | Get job detail + output |
-| `StreamLogs` | Stream job logs (server-side streaming) |
-| `WorkerStatus` | Get cluster nodes |
-| `ListJobs` | List all jobs |
+| `GetJobStatus` | Job detail + output + retry count |
+| `StreamLogs` | Stream logs (server-side streaming) |
+| `WorkerStatus` | Cluster nodes + ClassAds |
+| `ListJobs` | List all jobs (filterable) |
 | `ReportResult` | Worker reports completion (internal) |
-
----
 
 ### SubmitJob
 
@@ -25,11 +23,11 @@
 | `command` | string | Shell command |
 | `priority` | int32 | Lower = higher (default: 10) |
 | `user` | string | Fairshare tracking |
-| `walltime_seconds` | int32 | Max time (0 = no limit) |
+| `walltime_seconds` | int32 | Max time (0 = unlimited) |
 | `gpus_required` | int32 | GPU count |
-| `env_vars` | map\<string,string\> | Custom env vars |
+| `env_vars` | map | Custom env vars |
 
-**Response:** `job_id`, `status` ("QUEUED")
+Returns `job_id` + `status`. Rejects with `RESOURCE_EXHAUSTED` if queue full. Rejects with `UNAVAILABLE` if draining.
 
 ### SubmitDistributedJob
 
@@ -39,47 +37,20 @@
 | `command` | string | Same on all ranks |
 | `num_nodes` | int32 | Node count |
 | `gpus_per_node` | int32 | GPUs per node |
-| `priority` | int32 | |
-| `user` | string | |
-| `walltime_seconds` | int32 | Per-rank limit |
 | `master_port` | int32 | DDP port (default: 29500) |
-| `env_vars` | map\<string,string\> | Additional env vars |
+| `priority`, `user`, `walltime_seconds`, `env_vars` | | Same as SubmitJob |
 
-**Response:** `group_id`, `job_ids` (per rank), `status`
+Auto-injected: `RANK`, `WORLD_SIZE`, `MASTER_PORT`, `LOCAL_RANK`, `NPROC_PER_NODE`. `MASTER_ADDR` at dispatch.
 
-Auto-injected per rank: `RANK`, `WORLD_SIZE`, `MASTER_PORT`, `LOCAL_RANK`, `NPROC_PER_NODE`. `MASTER_ADDR` injected at dispatch time.
+### GetJobStatus Response
 
-### CancelJob
+Includes: `job_id`, `state`, `worker_node`, `command`, `output`, `error`, `submit_time`, `start_time`, `end_time`, `group_id`.
 
-**Request:** `job_id` | **Response:** `job_id`, `status`, `message`
-
-### GetJobStatus
-
-**Response:** `job_id`, `state`, `worker_node`, `command`, `output`, `error`, `submit_time`, `start_time`, `end_time`, `group_id`
-
-**States:** QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED, NOT_FOUND
-
-### ListJobs
-
-**Request:** `state_filter` (optional) | **Response:** repeated `JobInfo` (`job_id`, `state`, `command`, `requirement`, `worker_node`, `priority`, `user`, `submit_time`, `group_id`)
-
-### StreamLogs
-
-**Request:** `job_id` | **Response (stream):** `timestamp` (ms), `level`, `message`, `job_id`
-
-### WorkerStatus
-
-**Response:** `worker_nodes` map (node name → ClassAd JSON)
-
-### ReportResult (internal — workers only)
-
-**Request:** `job_id`, `worker_node`, `success`, `output`, `error`, `start_time`, `end_time`
+States: `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `NOT_FOUND`.
 
 ---
 
-## ZeroMQ Internal Protocol
-
-**Port:** 5555 | **Encoding:** JSON
+## ZeroMQ Dispatch Payload
 
 ```go
 type DispatchPayload struct {
@@ -94,7 +65,32 @@ type DispatchPayload struct {
 
 ---
 
-## ClassAd JSON (Worker Advertisement)
+## Health + Metrics Endpoints (port 9090)
+
+| Endpoint | Description |
+|----------|-------------|
+| `/health` | Liveness (200 always) |
+| `/ready` | Readiness (members, queue_depth, draining) |
+| `/metrics` | Prometheus metrics |
+
+### Prometheus Metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `tasch_jobs_submitted_total` | Counter | user |
+| `tasch_jobs_completed_total` | Counter | user, status |
+| `tasch_queue_depth` | Gauge | |
+| `tasch_running_jobs` | Gauge | |
+| `tasch_cluster_nodes` | Gauge | |
+| `tasch_dispatch_duration_seconds` | Histogram | |
+| `tasch_job_duration_seconds` | Histogram | user, status |
+| `tasch_groups_pending` | Gauge | |
+| `tasch_walltime_kills_total` | Counter | |
+| `tasch_worker_lost_total` | Counter | |
+
+---
+
+## ClassAd JSON
 
 ```json
 {

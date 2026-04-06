@@ -12,25 +12,12 @@ tasch nodes    # verify cluster
 
 ### `tasch nodes` — Cluster Status
 
-```bash
-$ tasch nodes
---- Cluster Nodes ---
-Node: gpu-10
-  OS: linux | Arch: amd64 | Cores: 32 | Memory: 128000MB | GPUs: 2
-    GPU 0: NVIDIA A100-SXM4-40GB (40960MB)
-    GPU 1: NVIDIA A100-SXM4-40GB (40960MB)
-    CUDA: 12.2
-Node: gpu-20
-  OS: linux | Arch: amd64 | Cores: 16 | Memory: 64000MB | GPUs: 4
-    GPU 0: AMD Instinct MI250X (65536MB)
-    ...
-    ROCm: 5.7.1
-```
+Shows all workers with hardware + GPU info.
 
 ### `tasch jobs` — List Jobs
 
 ```bash
-tasch jobs                     # list all
+tasch jobs                     # all jobs
 tasch jobs --state=RUNNING     # filter by state
 ```
 
@@ -44,32 +31,21 @@ tasch jobs submit <cel_expression> <command> [flags]
 |------|-------|---------|-------------|
 | `--priority` | `-p` | 10 | Lower = runs first |
 | `--user` | `-u` | anonymous | Fairshare tracking |
-| `--walltime` | `-w` | 0 | Max seconds (0 = no limit) |
+| `--walltime` | `-w` | 0 | Max seconds (0 = unlimited) |
 | `--gpus` | | 0 | GPUs required |
 | `--env` | `-e` | | KEY=VALUE (repeatable) |
 
-**Examples:**
-
+Examples:
 ```bash
-# Simple job
 tasch jobs submit "ad.cpu_cores >= 1" "echo hello"
-
-# GPU training with 2 GPUs, 1 hour limit
-tasch jobs submit --gpus=2 --walltime=3600 --user=alice \
-  "ad.gpu_count >= 2" "python train.py"
-
-# Custom env vars
-tasch jobs submit --gpus=1 --env="BATCH_SIZE=64" --env="LR=0.001" \
-  "ad.gpu_count >= 1" "python train.py"
-
-# Only AMD GPUs
-tasch jobs submit --gpus=2 "ad.gpu_vendor == 'amd' && ad.gpu_count >= 2" \
-  "python train.py"
+tasch jobs submit --gpus=2 --walltime=3600 "ad.gpu_count >= 2" "python train.py"
+tasch jobs submit --env="LR=0.001" --gpus=1 "ad.gpu_count >= 1" "python train.py"
+tasch jobs submit "ad.gpu_vendor == 'amd'" "python train.py"  # AMD only
 ```
 
-### `tasch jobs train` — Distributed Training
+**Auto-retry:** Failed jobs are automatically retried up to 3 times (configurable via `max_retries` in config) with exponential backoff (10s, 40s, 90s). After all retries, jobs go to the dead letter queue.
 
-Runs the same command on N nodes with auto-injected PyTorch DDP variables.
+### `tasch jobs train` — Distributed Training
 
 ```bash
 tasch jobs train <command> [flags]
@@ -82,68 +58,48 @@ tasch jobs train <command> [flags]
 | `--requirement` | `ad.gpu_count >= 1` | CEL expression |
 | `--master-port` | 29500 | DDP coordination port |
 
-**Auto-injected env vars per rank:**
-
-| Variable | Description |
-|----------|-------------|
-| `$RANK` | Node rank (0, 1, ..., N-1) |
-| `$WORLD_SIZE` | Total nodes |
-| `$MASTER_ADDR` | Rank-0 node IP (auto-resolved) |
-| `$MASTER_PORT` | Coordination port |
-| `$LOCAL_RANK` | 0 |
-| `$NPROC_PER_NODE` | GPUs per node |
-
-**Example:**
+Auto-injected env vars: `$RANK`, `$WORLD_SIZE`, `$MASTER_ADDR`, `$MASTER_PORT`, `$LOCAL_RANK`, `$NPROC_PER_NODE`.
 
 ```bash
-tasch jobs train --nodes=2 --gpus-per-node=2 --walltime=7200 --user=ml-team \
+tasch jobs train --nodes=2 --gpus-per-node=2 --walltime=7200 \
   "torchrun --nproc_per_node=\$NPROC_PER_NODE --nnodes=\$WORLD_SIZE \
    --node_rank=\$RANK --master_addr=\$MASTER_ADDR --master_port=\$MASTER_PORT \
    train.py --data=s3://s3.merai.app/dataset"
 ```
 
-**How it works:**
-1. Creates N rank jobs in a group
-2. Gang-schedules: waits for N matching nodes
-3. Resolves rank-0 IP → injects `MASTER_ADDR`
-4. Dispatches all ranks simultaneously
-5. If one rank fails, all siblings are cancelled
+Gang scheduling: waits for ALL N nodes before dispatching. If one rank fails, all siblings are cancelled. 5-minute timeout if nodes can't be found.
 
-### `tasch jobs status` — Job Details
+### `tasch jobs status <id>` — Job Details
+
+Shows state, command, worker, timing, output, errors, group, retry count.
+
+### `tasch jobs cancel <id>` — Cancel
+
+Cancels QUEUED (removed from queue) or RUNNING (kill signal to worker).
+
+### `tasch jobs logs <id>` — Stream Logs
 
 ```bash
-$ tasch jobs status dj-abc123-r0
-Job dj-abc123-r0
-  State:    COMPLETED
-  Command:  torchrun ...
-  Group:    dj-abc123
-  Worker:   gpu-10
-  Submit:   2026-04-06T10:00:00+00:00
-  Start:    2026-04-06T10:00:02+00:00
-  End:      2026-04-06T10:05:30+00:00
-  Duration: 5m28s
-  Output:
-    Training complete. Loss: 0.023
+tasch jobs logs <id>           # existing logs
+tasch jobs logs <id> --follow  # live stream
 ```
 
-### `tasch jobs cancel` — Cancel a Job
+### `tasch jobs failed` — Dead Letter Queue
+
+Shows jobs that exhausted all retry attempts.
 
 ```bash
-tasch jobs cancel <job_id>
-```
-
-### `tasch jobs logs` — Stream Logs
-
-```bash
-tasch jobs logs <job_id>           # existing logs
-tasch jobs logs <job_id> --follow  # live stream
+$ tasch jobs failed
+--- Dead Letter Queue (2 jobs) ---
+JOB_ID     USER       TRIES  ERROR
+------------------------------------------------------------
+a3f2b1c0   alice      3      exit status 1
+b7e4d2f1   bob        3      walltime exceeded (300s)
 ```
 
 ---
 
 ## CEL Expression Reference
-
-### Variables
 
 | Variable | Type | Description |
 |----------|------|-------------|
@@ -151,79 +107,54 @@ tasch jobs logs <job_id> --follow  # live stream
 | `ad.architecture` | string | `amd64`, `arm64` |
 | `ad.cpu_cores` | int | Logical CPU count |
 | `ad.total_memory_mb` | int | Total RAM in MB |
-| `ad.available_mem_mb` | int | Available RAM in MB |
-| `ad.host_type` | string | `container` or `vm_or_baremetal` |
 | `ad.gpu_count` | int | Number of GPUs (0 if none) |
 | `ad.gpu_vendor` | string | `nvidia`, `amd`, or empty |
-| `ad.gpu_models` | list | GPU model names |
 | `ad.gpu_memory_mb` | list | Per-GPU VRAM in MB |
 | `ad.cuda_version` | string | CUDA version (NVIDIA) |
 | `ad.rocm_version` | string | ROCm version (AMD) |
+| `ad.host_type` | string | `container` or `vm_or_baremetal` |
 
-### Operators
+Operators: `==`, `!=`, `>=`, `<=`, `>`, `<`, `&&`, `||`, `!`
 
-`==`, `!=`, `>=`, `<=`, `>`, `<`, `&&`, `||`, `!`
-
-Missing fields evaluate to `false` (non-match), not an error.
-
-### Examples
-
-```python
-ad.gpu_count >= 2                                    # 2+ GPUs
-ad.gpu_vendor == "nvidia" && ad.gpu_count >= 2       # NVIDIA only
-ad.gpu_vendor == "amd" && ad.gpu_memory_mb[0] >= 32000  # AMD with 32GB+
-ad.cpu_cores >= 8 && ad.total_memory_mb >= 16384     # 8 cores + 16GB
-ad.os == "linux" && ad.host_type == "vm_or_baremetal" # bare metal Linux
-```
+Missing fields → `false` (non-match), not error.
 
 ---
 
-## Concepts
+## Reliability Features
 
-### Job States
+### Job Retry
+Failed jobs auto-retry up to `max_retries` (default 3) with exponential backoff. After all retries, moved to dead letter queue. Distributed training jobs (group jobs) do NOT retry — if one rank fails, all are cancelled.
 
-```
-QUEUED → RUNNING → COMPLETED | FAILED
-                → CANCELLED (from QUEUED or RUNNING)
-```
+### Persistence
+All jobs persisted to `~/.tasch/tasch.db`. Master restart restores queued jobs. Running jobs at crash time are marked FAILED.
 
-### Priority
+### Circuit Breaker
+If a worker fails 3 consecutive jobs, it's blocked from receiving new jobs for 5 minutes. Resets on success.
 
-Lower number = higher urgency. Default 10. Priority 1 runs before 10.
+### GPU Tracking
+Master tracks how many GPUs are allocated on each node. Prevents dispatching more GPUs than available, even with concurrent dispatch cycles.
 
-### Fairshare
+### Queue Limits
+Max `max_queue_size` jobs in queue (default 10,000). New submissions rejected with error when full.
 
-Heavy users get a priority penalty that decays over time.
+### Graceful Drain
+`tasch stop` → master stops accepting new jobs → waits up to `drain_timeout` seconds for running jobs to finish → then shuts down.
 
-### Walltime
+### Health Checks
+- `/health` — liveness (always 200)
+- `/ready` — readiness (member count, queue depth, drain status)
+- `/metrics` — Prometheus metrics
 
-Max execution time. Killed automatically if exceeded.
-
-### Backfill
-
-When the top job can't run, lower-priority jobs fill idle nodes.
-
-### Gang Scheduling
-
-Distributed jobs wait for ALL N nodes before dispatching any rank. Prevents NCCL deadlocks.
-
----
-
-## Workflow Examples
-
-### Batch processing
-```bash
-for i in $(seq 1 100); do
-  tasch jobs submit "ad.cpu_cores >= 2" "python process.py --file=$i" --user=batch --walltime=300
-done
-```
-
-### Monitor a distributed job
-```bash
-tasch jobs train --nodes=2 "torchrun ... train.py"
-# → Group ID: dj-abc123
-
-tasch jobs | grep dj-abc123         # see all ranks
-tasch jobs logs dj-abc123-r0 -f     # stream rank 0
-tasch jobs status dj-abc123-r1      # check rank 1
-```
+### Prometheus Metrics
+| Metric | Type |
+|--------|------|
+| `tasch_jobs_submitted_total` | Counter (by user) |
+| `tasch_jobs_completed_total` | Counter (by user, status) |
+| `tasch_queue_depth` | Gauge |
+| `tasch_running_jobs` | Gauge |
+| `tasch_cluster_nodes` | Gauge |
+| `tasch_dispatch_duration_seconds` | Histogram |
+| `tasch_job_duration_seconds` | Histogram (by user, status) |
+| `tasch_groups_pending` | Gauge |
+| `tasch_walltime_kills_total` | Counter |
+| `tasch_worker_lost_total` | Counter |

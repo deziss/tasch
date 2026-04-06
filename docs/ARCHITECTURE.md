@@ -2,103 +2,139 @@
 
 ## Overview
 
-Single `tasch` binary operates in three modes based on config:
+Single `tasch` binary operates as master, worker, or both based on config.
 
 ```
-tasch (role: master)  → Scheduler + gRPC server + ZMQ publisher + gossip
-tasch (role: worker)  → GPU profiler + gossip + ZMQ subscriber + executor
-tasch (role: both)    → All of the above in one process
+┌───────────────────────────────────────────────────────────┐
+│                   CLI Commands                             │
+│     tasch nodes · tasch jobs submit · tasch jobs train     │
+└──────────────────────────┬────────────────────────────────┘
+                           │ gRPC (optional TLS)
+┌──────────────────────────▼────────────────────────────────┐
+│                    Master Scheduler                        │
+│                                                            │
+│  gRPC Server (8 RPCs)  ·  BoltDB Persistence               │
+│  Min-Heap Queue        ·  Fairshare Calculator              │
+│  CEL Matchmaker        ·  Circuit Breaker                   │
+│  Gang Scheduler        ·  GPU Resource Tracker              │
+│  Walltime Enforcer     ·  Job Retry + Dead Letters          │
+│  ZMQ Publisher         ·  Prometheus Metrics                │
+│  Health: /health /ready /metrics                           │
+│  Gossip Discovery + Worker Loss Detection                  │
+└──────────────────────────┬────────────────────────────────┘
+                           │ ZMQ PUB/SUB (auto-reconnect) + Gossip
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+         ┌────────┐  ┌────────┐  ┌────────┐
+         │Worker 1│  │Worker 2│  │Worker N│
+         │NVIDIA  │  │AMD     │  │CPU-only│
+         │gRPC KA │  │gRPC KA │  │gRPC KA │
+         └────────┘  └────────┘  └────────┘
 ```
 
-```
-┌────────────────────────────────────────────────────┐
-│                   CLI Commands                      │
-│         tasch nodes / tasch jobs submit ...         │
-└───────────────────────┬────────────────────────────┘
-                        │ gRPC (reads master_addr from config)
-┌───────────────────────▼────────────────────────────┐
-│              Master Scheduler                       │
-│  8 gRPC RPCs · Min-Heap Queue · CEL Matchmaker     │
-│  Gang Scheduler · Backfill · Fairshare · Walltime  │
-│  ZMQ PUB · Gossip                                  │
-└───────────────────────┬────────────────────────────┘
-                        │ ZMQ PUB/SUB + Gossip
-              ┌─────────┼─────────┐
-              ▼         ▼         ▼
-         ┌────────┐ ┌────────┐ ┌────────┐
-         │Worker 1│ │Worker 2│ │Worker N│
-         │NVIDIA  │ │AMD     │ │CPU-only│
-         └────────┘ └────────┘ └────────┘
-```
+## Protocol Layers
 
-## Three Protocol Layers
+| Protocol | Port | Purpose |
+|----------|------|---------|
+| Memberlist (SWIM) | 7946 | Node discovery + ClassAd broadcast + failure detection |
+| ZeroMQ PUB/SUB | 5555 | Job dispatch + cancel signals (auto-reconnect) |
+| gRPC (HTTP/2) | 50051 | CLI commands + worker result reporting (keepalive + TLS) |
+| HTTP | 9090 | Health checks + Prometheus metrics |
 
-| Protocol | Purpose | Port |
-|----------|---------|------|
-| **Memberlist (SWIM gossip)** | Node discovery + ClassAd broadcast | 7946 |
-| **ZeroMQ PUB/SUB** | Job dispatch + cancel signals | 5555 |
-| **gRPC (HTTP/2)** | CLI commands + worker result reporting | 50051 |
-
-## Dispatch Loop (master, every 1s)
+## Dispatch Loop (1s cycle)
 
 ```
-Phase 0: Gang-schedule PENDING distributed job groups
-         → Find N distinct matching nodes → dispatch all ranks simultaneously
-Phase 1: Match top-priority single job → dispatch to first matching node
-Phase 2: Backfill → lower-priority jobs fill idle nodes
+Phase 0: Gang-schedule PENDING distributed groups (5 min timeout)
+Phase 1: Match top-priority single job (circuit breaker + GPU tracking check)
+Phase 2: Backfill lower-priority jobs on idle nodes
 ```
 
-## GPU Profiling
+Each cycle updates Prometheus gauges: queue depth, running jobs, cluster nodes, pending groups.
 
-Workers detect GPUs at startup:
-1. Try `nvidia-smi --query-gpu=name,memory.total` → NVIDIA
-2. If not found, try `rocm-smi --showproductname --showmeminfo vram` → AMD
-3. If neither found → gpu_count: 0
+## Persistence (BoltDB)
 
-Auto-sets `CUDA_VISIBLE_DEVICES` (NVIDIA) or `HIP_VISIBLE_DEVICES` (AMD) at dispatch time.
+`~/.tasch/tasch.db` — 4 buckets:
 
-## Gang Scheduling (Distributed Jobs)
+| Bucket | Contents |
+|--------|----------|
+| `jobs` | All jobs (any state) |
+| `groups` | Distributed job groups |
+| `fairshare` | Per-user usage counters |
+| `dead_letters` | Jobs that exhausted all retries |
 
-1. `SubmitDistributedJob` creates N rank jobs with DDP env vars
-2. Gang scheduler waits until N distinct matching nodes available
-3. Resolves rank-0 node IP → injects `MASTER_ADDR` into all ranks
-4. Dispatches all ranks simultaneously
-5. If one rank fails → cancels all siblings
+Write-through: `OnJobChange` / `OnGroupChange` hooks on GlobalScheduler fire on every state transition.
 
-## Config-Based Architecture
+On restart: QUEUED jobs re-enqueued, RUNNING jobs marked FAILED, groups marked FAILED, fairshare restored.
 
-```yaml
-# ~/.tasch/config.yaml
-role: both
-node_name: gpu-10
-master_addr: 10.0.1.10
-ports:
-  gossip: 7946
-  grpc: 50051
-  zmq: 5555
+## Job Retry
+
+```
+Job fails → RetryCount < MaxRetries?
+  Yes → sleep(retryCount² × 10s) → re-enqueue as QUEUED
+  No  → save to dead_letters bucket → mark FAILED
 ```
 
-- `tasch start` reads config to determine what to start
-- `tasch jobs/nodes` reads config to find master gRPC address
-- Works from any machine with a config file pointing to the master
+Distributed training jobs (GroupID set) never retry — one rank failure cancels all siblings.
+
+## Circuit Breaker
+
+Per-worker consecutive failure tracking:
+- 3+ consecutive failures → worker blocked for 5 minutes
+- Success resets counter
+- Dispatch loop skips blocked workers
+
+## GPU Resource Tracking
+
+```
+dispatch → gpuTracker.Allocate(node, count)
+complete/cancel/worker-lost → gpuTracker.Release(node, count)
+dispatch check → gpuTracker.Available(node, totalFromClassAd) >= required
+```
+
+Prevents multiple concurrent dispatches from oversubscribing GPUs on the same node.
+
+## Worker Resilience
+
+- **ZMQ auto-reconnect**: exponential backoff 1s → 2s → 4s → ... → 30s max
+- **gRPC keepalive**: 30s interval, 10s timeout, permits without stream
+- **ReportResult**: 10s timeout + one retry on failure
+- **TLS**: optional CA verification when connecting to master
+
+## Graceful Shutdown
+
+```
+SIGTERM received
+  → draining = true (reject new submissions)
+  → wait up to drain_timeout for running jobs
+  → cancel worker
+  → cancel master (gRPC graceful stop + close ZMQ + close BoltDB)
+  → remove PID file
+
+tasch stop:
+  → SIGTERM → wait 15s → SIGKILL if stuck
+```
 
 ## Package Layout
 
 ```
-cmd/tasch/main.go              # Entry point, Cobra root command
+cmd/tasch/main.go              # Entry point + Cobra root
 internal/
-  config/config.go             # Config YAML struct + load/save
-  setup/setup.go               # Interactive wizard
-  daemon/master.go             # Master scheduler (all handlers + scheduling)
-  daemon/worker.go             # Worker agent (execution + reporting)
-  daemon/stop.go               # PID-based stop
-  cli/jobs.go                  # tasch jobs * commands
-  cli/nodes.go                 # tasch nodes command
-  cli/connect.go               # Shared gRPC client from config
+  config/                      # Config YAML + TLS + env overrides
+  setup/                       # Interactive wizard
+  store/store.go               # BoltDB persistence (4 buckets)
+  daemon/
+    master.go                  # All scheduler logic + gRPC handlers
+    worker.go                  # Executor + ZMQ reconnect + gRPC keepalive
+    metrics.go                 # Prometheus metric definitions
+    stop.go                    # PID-based stop with SIGKILL fallback
+  cli/
+    jobs.go                    # tasch jobs * commands + dead letters
+    nodes.go                   # tasch nodes
+    connect.go                 # gRPC client from config
 pkg/
-  profiler/                    # Hardware + GPU detection (NVIDIA + AMD)
-  scheduler/                   # Min-heap, Job/JobGroup, fairshare
+  profiler/                    # NVIDIA + AMD GPU detection
+  scheduler/                   # Min-heap, Job/JobGroup, hooks, fairshare
   matchmaker/                  # Google CEL evaluator
-  discovery/                   # Memberlist gossip
+  discovery/                   # Memberlist + EventHooks
   messaging/                   # ZeroMQ PUB/SUB
 ```

@@ -1,86 +1,68 @@
 # Development Guide
 
-## Prerequisites
-
-- Go 1.21+ (recommended 1.24+)
-- Make
-- protoc + protoc-gen-go + protoc-gen-go-grpc (only if modifying API)
-
 ## Build
 
 ```bash
 make build     # → bin/tasch
 make clean     # remove binary
 make proto     # regenerate gRPC stubs
-make test      # unit tests
+make test      # unit tests (13 tests)
 make run-test  # build + integration test (11 scenarios)
 ```
 
 ## Project Structure
 
 ```
-cmd/tasch/main.go              # Single binary entry point
+cmd/tasch/main.go              # Single binary, Cobra root, drain logic
 internal/
-  config/config.go             # Config YAML load/save
-  setup/setup.go               # Interactive setup wizard
-  daemon/master.go             # Master: handlers + scheduling + gang-sched
-  daemon/worker.go             # Worker: execution + GPU env injection
-  daemon/stop.go               # PID-based stop
-  cli/jobs.go                  # tasch jobs * subcommands
-  cli/nodes.go                 # tasch nodes
-  cli/connect.go               # gRPC client from config
+  config/config.go             # Config YAML + TLS + queue limits + retry + drain timeout
+  setup/setup.go               # Interactive wizard
+  store/store.go               # BoltDB persistence (jobs, groups, fairshare, dead letters)
+  daemon/
+    master.go                  # Scheduler, gRPC handlers, circuit breaker, GPU tracker, retry, persistence
+    worker.go                  # Executor, ZMQ auto-reconnect, gRPC keepalive, report retry
+    metrics.go                 # 9 Prometheus metrics
+    stop.go                    # PID stop + SIGKILL fallback
+  cli/
+    jobs.go                    # tasch jobs * subcommands + dead letter queue
+    nodes.go                   # tasch nodes
+    connect.go                 # gRPC client from config
 pkg/
   profiler/profiler.go         # NVIDIA + AMD GPU detection
-  scheduler/queue.go           # Min-heap, Job, JobGroup, fairshare
+  scheduler/queue.go           # Min-heap, Job/JobGroup, OnJobChange/OnGroupChange hooks, fairshare
   matchmaker/evaluator.go      # CEL evaluation
-  discovery/discovery.go       # Memberlist gossip
+  discovery/discovery.go       # Memberlist + EventHooks (OnJoin, OnLeave)
   messaging/                   # ZMQ PUB/SUB + DispatchPayload
-api/v1/scheduler.proto         # 8 gRPC RPCs
 ```
 
 ## Tests
 
-**Unit tests** (11 tests): `make test`
+**Unit tests** (13): `make test`
 - `pkg/matchmaker`: 5 tests (CEL)
-- `pkg/scheduler`: 6 tests (queue, cancel, backfill, fairshare)
+- `pkg/scheduler`: 8 tests (queue, FIFO, state, cancel, backfill, fairshare, queue limit, persistence hooks)
 
-**Integration tests** (11 scenarios): `make run-test`
-1. Cluster nodes
-2. Basic job submit
-3. Priority + walltime
-4. Job listing
-5. Job detail
-6. Submit + cancel
-7. Log streaming
-8. Distributed training (gang scheduling)
-9. Env var passing
-10. `tasch nodes` from worker config
-11. `tasch jobs` from worker config
+**Integration** (11 scenarios): `make run-test`
 
 ## Code Patterns
 
-### Adding a CLI command
+### Adding persistence for a new data type
+1. Add bucket + methods to `internal/store/store.go`
+2. Wire hook in `StartMaster()` in `internal/daemon/master.go`
 
-Add to `internal/cli/jobs.go` or create a new file. Register in `cmd/tasch/main.go`.
+### Adding a Prometheus metric
+1. Define in `internal/daemon/metrics.go`
+2. Register in `initMetrics()`
+3. Increment/observe in master.go handlers
 
-### Adding a gRPC RPC
-
-1. Edit `api/v1/scheduler.proto`
-2. `make proto`
-3. Implement handler on `schedulerServer` in `internal/daemon/master.go`
-
-### Adding a ClassAd field
-
-Add to `ClassAd` struct in `pkg/profiler/profiler.go`. Instantly available in CEL.
-
-### Adding GPU vendor support
-
-Add a `detect<Vendor>GPUs()` function in `pkg/profiler/profiler.go`. Call it from `DetectGPUs()`.
+### Adding a circuit breaker rule
+Modify `circuitBreaker` struct in `master.go`. Currently: 3 failures = 5 min block.
 
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
+| `go.etcd.io/bbolt` | BoltDB embedded database |
+| `prometheus/client_golang` | Metrics |
 | `hashicorp/memberlist` | SWIM gossip |
 | `go-zeromq/zmq4` | Pure-Go ZMQ |
 | `google/cel-go` | CEL expressions |

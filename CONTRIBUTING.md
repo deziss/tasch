@@ -1,36 +1,36 @@
 # Contributing to Tasch
 
-## Getting Started
+## Setup
 
 ```bash
 git clone https://github.com/deziss/tasch.git
 cd tasch
-make build    # single binary → bin/tasch
-make test     # unit tests
-make run-test # integration tests (11 scenarios)
+make build && make test && make run-test
 ```
-
-## Development Workflow
-
-1. Create a feature branch
-2. Make changes
-3. `make test` + `make run-test`
-4. Submit PR
 
 ## Where to Add Things
 
 | What | Where |
 |------|-------|
-| New CLI command | `internal/cli/` |
-| New gRPC RPC | `api/v1/scheduler.proto` → `make proto` → `internal/daemon/master.go` |
-| New ClassAd field | `pkg/profiler/profiler.go` |
-| New GPU vendor | `pkg/profiler/profiler.go` → add `detect<Vendor>GPUs()` |
-| New scheduling policy | `internal/daemon/master.go` → `dispatchLoop()` |
-| Config changes | `internal/config/config.go` + `internal/setup/setup.go` |
+| CLI command | `internal/cli/` |
+| gRPC RPC | `api/v1/scheduler.proto` → `make proto` → `internal/daemon/master.go` |
+| ClassAd field | `pkg/profiler/profiler.go` |
+| GPU vendor | `pkg/profiler/profiler.go` → `detect<Vendor>GPUs()` |
+| Scheduler policy | `internal/daemon/master.go` → `dispatchLoop()` |
+| Persistence bucket | `internal/store/store.go` |
+| Prometheus metric | `internal/daemon/metrics.go` |
+| Config field | `internal/config/config.go` + `internal/setup/setup.go` |
+
+## Testing
+
+- Unit: `make test` (13 tests)
+- Integration: `make run-test` (11 scenarios)
+- All tests must pass before merging
 
 ## Commit Style
 
-Imperative mood:
-- `add AMD GPU detection via rocm-smi`
-- `rename tasch submit to tasch jobs submit`
-- `fix gang scheduler deadlock on single-node groups`
+```
+feat: add job priority boost for GPU jobs
+fix: circuit breaker not resetting on success
+docs: update API reference with retry fields
+```

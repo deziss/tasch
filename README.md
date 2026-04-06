@@ -1,6 +1,6 @@
 # Tasch — Distributed Task Scheduler
 
-**Tasch** is a lightweight, distributed task scheduler with GPU support. One binary, one setup command, and your cluster is ready.
+**Tasch** is a production-grade, distributed task scheduler with GPU support. One binary, one setup command, and your cluster is ready.
 
 ```
 ┌──────────┐         ┌──────────┐
@@ -21,89 +21,63 @@ sudo cp bin/tasch /usr/local/bin/
 
 ## Quick Start
 
-### 1. Setup
-
 ```bash
-# Interactive wizard — asks role, node name, ports
-tasch setup
+tasch setup    # interactive wizard — role, name, master addr, ports
+tasch start    # starts master/worker/both based on config
 ```
 
-```
-Welcome to Tasch Distributed Scheduler!
-
-Select role:
-  1) Master  — schedules and dispatches jobs
-  2) Worker  — executes jobs on this machine
-  3) Both    — master + worker on this machine
-
-Role [3]: 3
-Node name [gpu-server-10]:
-Master address [10.0.1.10]:
-...
-
-Detected hardware:
-  CPU:  32 cores (AMD EPYC 7543)
-  RAM:  128GB
-  GPU 0: NVIDIA A100-SXM4-40GB (40960MB)
-  GPU 1: NVIDIA A100-SXM4-40GB (40960MB)
-  CUDA: 12.2
-
-Config written to ~/.tasch/config.yaml
-Start with: tasch start
-```
-
-### 2. Start
-
+Remote worker (server 20):
 ```bash
-tasch start    # reads config, starts master/worker/both
-```
-
-### 3. Add remote workers
-
-On server 20:
-```bash
-tasch setup    # select "Worker", enter server-10 IP as master address
+tasch setup    # select "Worker", enter server-10 IP
 tasch start
 ```
 
-### 4. Use it
-
+Use from any machine:
 ```bash
-tasch nodes                    # see all cluster nodes + GPUs
-tasch jobs                     # list jobs
-tasch jobs submit "ad.gpu_count >= 1" "python train.py" --gpus=1
+tasch nodes                    # cluster status + GPUs
+tasch jobs submit --gpus=1 "ad.gpu_count >= 1" "python train.py"
 tasch jobs train --nodes=2 "torchrun ... train.py"
-tasch jobs status <id>         # job details + output
-tasch jobs logs <id>           # stream logs
+tasch jobs                     # list all jobs
+tasch jobs status <id>         # detail + output
+tasch jobs logs <id> --follow  # live log streaming
 tasch jobs cancel <id>
-tasch stop                     # graceful shutdown
+tasch jobs failed              # dead letter queue
+tasch stop                     # graceful drain + shutdown
 ```
-
-These commands work from **any machine** with a config pointing to the master.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
 | **Single binary** | `tasch setup` → `tasch start` → done |
-| **GPU detection** | NVIDIA (`nvidia-smi`) + AMD (`rocm-smi`), auto-detected |
-| **Distributed training** | `tasch jobs train` with gang scheduling + DDP env vars |
+| **GPU detection** | NVIDIA (`nvidia-smi`) + AMD (`rocm-smi`), auto `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` |
+| **Distributed training** | `tasch jobs train` — gang scheduling + auto DDP env vars (`RANK`, `WORLD_SIZE`, `MASTER_ADDR`) |
+| **BoltDB persistence** | Jobs, groups, fairshare survive master restart (`~/.tasch/tasch.db`) |
+| **Job retry** | Auto-retry failed jobs (default 3x) with exponential backoff. Dead letter queue for exhausted retries |
+| **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
+| **Prometheus metrics** | 9 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
+| **Circuit breaker** | 3 consecutive failures → worker blocked 5 minutes |
+| **GPU resource tracking** | Prevents GPU oversubscription across concurrent dispatches |
+| **Graceful drain** | `tasch stop` → stop accepting → wait for running jobs → shutdown |
+| **ZMQ auto-reconnect** | Worker reconnects to master with exponential backoff (1s-30s) |
+| **gRPC keepalive** | 30s heartbeat, 10s timeout, survives transient disconnects |
+| **TLS support** | Optional mTLS for gRPC (`tls.enabled`, cert/key/CA in config) |
+| **Queue limits** | Max 10,000 jobs (configurable). Rejects when full |
 | **CEL matchmaking** | `ad.gpu_count >= 2 && ad.gpu_vendor == "nvidia"` |
-| **Cross-server** | Workers join via gossip — just set master address |
-| **Backfill** | Idle nodes run lower-priority jobs while big jobs wait |
+| **Backfill scheduling** | Lower-priority jobs fill idle nodes while big jobs wait |
 | **Fairshare** | Heavy users get priority penalties (auto-decaying) |
-| **Walltime** | `--walltime=3600` kills jobs that exceed the limit |
-| **Env injection** | `--env BATCH_SIZE=64` + auto `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` |
-| **Live logs** | `tasch jobs logs <id> --follow` |
+| **Walltime** | `--walltime=3600` kills jobs exceeding the limit |
+| **Worker loss detection** | Gossip detects node departure → running jobs marked FAILED |
+| **Gang timeout** | Distributed jobs fail after 5 min if not enough nodes |
 
 ## CLI Reference
 
 ```
 tasch setup                          # Interactive setup wizard
 tasch start                          # Start based on config
-tasch stop                           # Graceful shutdown
+tasch stop                           # Graceful drain + shutdown
 
-tasch nodes                          # Cluster status + GPU info
+tasch nodes                          # Cluster nodes + GPU info
 
 tasch jobs                           # List all jobs
 tasch jobs submit <expr> <cmd>       # Submit single job
@@ -111,6 +85,7 @@ tasch jobs train <cmd>               # Distributed training
 tasch jobs cancel <id>               # Cancel job
 tasch jobs status <id>               # Job detail + output
 tasch jobs logs <id> [--follow]      # Stream logs
+tasch jobs failed                    # Dead letter queue
 ```
 
 ### Submit Flags
@@ -137,31 +112,47 @@ tasch jobs logs <id> [--follow]      # Stream logs
 | Variable | Type | Example |
 |----------|------|---------|
 | `ad.gpu_count` | int | `ad.gpu_count >= 2` |
-| `ad.gpu_vendor` | string | `ad.gpu_vendor == "nvidia"` |
-| `ad.gpu_models` | list | |
+| `ad.gpu_vendor` | string | `"nvidia"` or `"amd"` |
 | `ad.gpu_memory_mb` | list | `ad.gpu_memory_mb[0] >= 40000` |
 | `ad.cuda_version` | string | |
 | `ad.rocm_version` | string | |
 | `ad.cpu_cores` | int | `ad.cpu_cores >= 8` |
 | `ad.total_memory_mb` | int | |
 | `ad.os` | string | `ad.os == "linux"` |
-| `ad.architecture` | string | `ad.architecture == "amd64"` |
+| `ad.architecture` | string | |
 | `ad.host_type` | string | `vm_or_baremetal` or `container` |
 
 ## Config File
 
 `~/.tasch/config.yaml`:
 ```yaml
-role: both              # master | worker | both
+role: both
 node_name: gpu-server-10
 master_addr: 10.0.1.10
+max_queue_size: 10000
+max_retries: 3
+drain_timeout: 60
 ports:
   gossip: 7946
   grpc: 50051
   zmq: 5555
+  metrics: 9090
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  ca_file: ""
 ```
 
 Override with `--config <path>` or `TASCH_*` env vars.
+
+## Endpoints
+
+| Endpoint | Port | Description |
+|----------|------|-------------|
+| `/health` | 9090 | Liveness probe (always 200) |
+| `/ready` | 9090 | Readiness (members, queue depth, drain status) |
+| `/metrics` | 9090 | Prometheus metrics |
 
 ## Project Structure
 
@@ -169,17 +160,20 @@ Override with `--config <path>` or `TASCH_*` env vars.
 tasch/
 ├── cmd/tasch/main.go           # Single binary entry point
 ├── internal/
-│   ├── config/config.go        # Config YAML load/save
-│   ├── setup/setup.go          # Interactive setup wizard
-│   ├── daemon/master.go        # Master scheduler (8 gRPC RPCs, dispatch, gang-sched)
-│   ├── daemon/worker.go        # Worker agent (GPU profiling, exec, env inject)
-│   ├── daemon/stop.go          # PID-based stop
-│   └── cli/                    # CLI commands (jobs, nodes)
+│   ├── config/                 # Config YAML + TLS + validation
+│   ├── setup/                  # Interactive setup wizard
+│   ├── daemon/
+│   │   ├── master.go           # Scheduler, dispatch, gang-sched, retry, circuit breaker, GPU tracking
+│   │   ├── worker.go           # Executor, ZMQ reconnect, gRPC keepalive
+│   │   ├── metrics.go          # Prometheus metrics (9 metrics)
+│   │   └── stop.go             # PID-based stop with SIGKILL fallback
+│   ├── store/store.go          # BoltDB persistence (jobs, groups, fairshare, dead letters)
+│   └── cli/                    # CLI commands (jobs, nodes, failed)
 ├── pkg/
-│   ├── profiler/               # Hardware + GPU detection (NVIDIA + AMD)
-│   ├── scheduler/              # Min-heap queue, Job/JobGroup, fairshare
+│   ├── profiler/               # NVIDIA + AMD GPU detection
+│   ├── scheduler/              # Min-heap queue, Job/JobGroup, fairshare, hooks
 │   ├── matchmaker/             # Google CEL evaluator
-│   ├── discovery/              # Memberlist gossip wrapper
+│   ├── discovery/              # Memberlist gossip + EventHooks
 │   └── messaging/              # ZeroMQ PUB/SUB
 ├── api/v1/scheduler.proto      # 8 gRPC RPCs
 ├── Makefile
@@ -190,10 +184,10 @@ tasch/
 
 | Document | Description |
 |----------|-------------|
-| [Setup Guide](docs/SETUP.md) | Installation, single/multi-node deployment |
+| [Setup Guide](docs/SETUP.md) | Installation, deployment, TLS, systemd |
 | [User Guide](docs/USER_GUIDE.md) | All commands, CEL syntax, training workflows |
 | [API Reference](docs/API.md) | 8 gRPC RPCs, Protobuf messages, ZMQ protocol |
-| [Architecture](docs/ARCHITECTURE.md) | System design, gang scheduling, GPU profiling |
+| [Architecture](docs/ARCHITECTURE.md) | System design, persistence, circuit breaker, GPU tracking |
 | [Development](docs/DEVELOPMENT.md) | Building, testing, code patterns |
 | [Changelog](CHANGELOG.md) | Version history |
 

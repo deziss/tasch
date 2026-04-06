@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"container/heap"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -28,6 +29,10 @@ type Job struct {
 	// GPU and resource fields
 	GPUsRequired int               `json:"gpus_required"`
 	EnvVars      map[string]string `json:"env_vars,omitempty"`
+
+	// Retry
+	MaxRetries int `json:"max_retries"`
+	RetryCount int `json:"retry_count"`
 
 	// Distributed job group
 	GroupID string `json:"group_id,omitempty"`
@@ -92,10 +97,15 @@ func (jq *JobQueue) Pop() interface{} {
 
 // GlobalScheduler manages the job queue, job state, and job groups.
 type GlobalScheduler struct {
-	mu     sync.Mutex
-	queue  JobQueue
-	jobs   map[string]*Job
-	groups map[string]*JobGroup
+	mu           sync.Mutex
+	queue        JobQueue
+	jobs         map[string]*Job
+	groups       map[string]*JobGroup
+	MaxQueueSize int // 0 = unlimited
+
+	// Persistence hooks (called outside lock via deferred calls)
+	OnJobChange   func(job *Job)
+	OnGroupChange func(group *JobGroup)
 }
 
 // NewGlobalScheduler initializes a new Global Scheduler.
@@ -110,12 +120,19 @@ func NewGlobalScheduler() *GlobalScheduler {
 }
 
 // Enqueue adds a job to the priority queue with QUEUED state.
-func (gs *GlobalScheduler) Enqueue(job *Job) {
+// Returns error if queue is full.
+func (gs *GlobalScheduler) Enqueue(job *Job) error {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
+	if gs.MaxQueueSize > 0 && gs.queue.Len() >= gs.MaxQueueSize {
+		gs.mu.Unlock()
+		return fmt.Errorf("queue full (%d jobs)", gs.MaxQueueSize)
+	}
 	job.State = StateQueued
 	gs.jobs[job.ID] = job
 	heap.Push(&gs.queue, job)
+	gs.mu.Unlock()
+	gs.notifyJobChange(job)
+	return nil
 }
 
 // Dequeue removes and returns the highest priority job.
@@ -176,10 +193,10 @@ func (gs *GlobalScheduler) RemoveByID(jobID string) *Job {
 // Cancel removes a job from the queue if QUEUED, or marks it CANCELLED if RUNNING.
 func (gs *GlobalScheduler) Cancel(jobID string) (*Job, bool) {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
 
 	job, exists := gs.jobs[jobID]
 	if !exists {
+		gs.mu.Unlock()
 		return nil, false
 	}
 
@@ -190,36 +207,58 @@ func (gs *GlobalScheduler) Cancel(jobID string) (*Job, bool) {
 		}
 		job.State = StateCancelled
 		job.EndTime = time.Now()
+		gs.mu.Unlock()
+		gs.notifyJobChange(job)
 		return job, true
 	case StateRunning:
 		job.State = StateCancelled
 		job.EndTime = time.Now()
+		gs.mu.Unlock()
+		gs.notifyJobChange(job)
 		return job, true
 	default:
+		gs.mu.Unlock()
 		return job, false
+	}
+}
+
+func (gs *GlobalScheduler) notifyJobChange(job *Job) {
+	if gs.OnJobChange != nil {
+		gs.OnJobChange(job)
+	}
+}
+
+func (gs *GlobalScheduler) notifyGroupChange(group *JobGroup) {
+	if gs.OnGroupChange != nil {
+		gs.OnGroupChange(group)
 	}
 }
 
 // MarkRunning transitions a job to RUNNING state.
 func (gs *GlobalScheduler) MarkRunning(jobID, workerNode string) {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	if job, ok := gs.jobs[jobID]; ok {
+	job, ok := gs.jobs[jobID]
+	if ok {
 		job.State = StateRunning
 		job.WorkerNode = workerNode
 		job.StartTime = time.Now()
+	}
+	gs.mu.Unlock()
+	if ok {
+		gs.notifyJobChange(job)
 	}
 }
 
 // MarkCompleted transitions a job to COMPLETED or FAILED state.
 func (gs *GlobalScheduler) MarkCompleted(jobID string, success bool, output, errMsg string) {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
 	job, ok := gs.jobs[jobID]
 	if !ok {
+		gs.mu.Unlock()
 		return
 	}
 	if job.State == StateCancelled {
+		gs.mu.Unlock()
 		return
 	}
 	if success {
@@ -230,6 +269,8 @@ func (gs *GlobalScheduler) MarkCompleted(jobID string, success bool, output, err
 	job.Output = output
 	job.Error = errMsg
 	job.EndTime = time.Now()
+	gs.mu.Unlock()
+	gs.notifyJobChange(job)
 }
 
 // GetJob returns a job by ID.
@@ -276,8 +317,9 @@ func (gs *GlobalScheduler) RunningJobsOnNode(nodeName string) []*Job {
 // RegisterGroup registers a new job group for distributed training.
 func (gs *GlobalScheduler) RegisterGroup(g *JobGroup) {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
 	gs.groups[g.GroupID] = g
+	gs.mu.Unlock()
+	gs.notifyGroupChange(g)
 }
 
 // GetGroup returns a job group by ID.
@@ -304,9 +346,13 @@ func (gs *GlobalScheduler) PendingGroups() []*JobGroup {
 // SetGroupState updates a group's state.
 func (gs *GlobalScheduler) SetGroupState(groupID, state string) {
 	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	if g, ok := gs.groups[groupID]; ok {
+	g, ok := gs.groups[groupID]
+	if ok {
 		g.State = state
+	}
+	gs.mu.Unlock()
+	if ok {
+		gs.notifyGroupChange(g)
 	}
 }
 

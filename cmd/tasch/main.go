@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/deziss/tasch/internal/cli"
 	"github.com/deziss/tasch/internal/config"
@@ -109,13 +110,20 @@ func startCmd() *cobra.Command {
 				os.Exit(1)
 			}
 
+			// Double-start prevention
+			if pidData, err := os.ReadFile(config.PidPath()); err == nil {
+				fmt.Printf("Tasch may already be running (PID file exists: %s). Stop with: tasch stop\n", string(pidData))
+				os.Exit(1)
+			}
+
 			fmt.Printf("Starting tasch (%s mode)...\n", cfg.Role)
 
-			var masterCancel, workerCancel func()
+			var masterHandle *daemon.MasterHandle
+			var workerCancel func()
 
 			if cfg.Role == "master" || cfg.Role == "both" {
 				var err error
-				masterCancel, err = daemon.StartMaster(cfg)
+				masterHandle, err = daemon.StartMaster(cfg)
 				if err != nil {
 					log.Fatalf("Master failed to start: %v", err)
 				}
@@ -138,11 +146,27 @@ func startCmd() *cobra.Command {
 			<-sigChan
 
 			fmt.Println("\nShutting down...")
+
+			// Graceful drain: stop accepting new jobs, wait for running to finish
+			if masterHandle != nil {
+				masterHandle.Draining.Store(true)
+				fmt.Printf("Draining (waiting up to %ds for running jobs)...\n", cfg.DrainTimeout)
+				deadline := time.Now().Add(time.Duration(cfg.DrainTimeout) * time.Second)
+				for time.Now().Before(deadline) {
+					running := masterHandle.Queue.RunningJobs()
+					if len(running) == 0 {
+						break
+					}
+					fmt.Printf("  %d jobs still running...\n", len(running))
+					time.Sleep(2 * time.Second)
+				}
+			}
+
 			if workerCancel != nil {
 				workerCancel()
 			}
-			if masterCancel != nil {
-				masterCancel()
+			if masterHandle != nil {
+				masterHandle.Cancel()
 			}
 			daemon.RemovePID()
 			fmt.Println("Tasch stopped.")

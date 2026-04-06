@@ -5,14 +5,20 @@ import (
 	"time"
 )
 
+func enqueue(t *testing.T, gs *GlobalScheduler, job *Job) {
+	t.Helper()
+	if err := gs.Enqueue(job); err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+}
+
 func TestEnqueueDequeue(t *testing.T) {
 	gs := NewGlobalScheduler()
 
-	gs.Enqueue(&Job{ID: "low", Priority: 20, SubmitTime: time.Now(), Command: "echo low"})
-	gs.Enqueue(&Job{ID: "high", Priority: 1, SubmitTime: time.Now(), Command: "echo high"})
-	gs.Enqueue(&Job{ID: "mid", Priority: 10, SubmitTime: time.Now(), Command: "echo mid"})
+	enqueue(t, gs, &Job{ID: "low", Priority: 20, SubmitTime: time.Now(), Command: "echo low"})
+	enqueue(t, gs, &Job{ID: "high", Priority: 1, SubmitTime: time.Now(), Command: "echo high"})
+	enqueue(t, gs, &Job{ID: "mid", Priority: 10, SubmitTime: time.Now(), Command: "echo mid"})
 
-	// Should dequeue in priority order: high (1), mid (10), low (20)
 	j := gs.Dequeue()
 	if j.ID != "high" {
 		t.Errorf("Expected 'high', got '%s'", j.ID)
@@ -38,9 +44,9 @@ func TestFIFOSamePriority(t *testing.T) {
 	t2 := t1.Add(1 * time.Second)
 	t3 := t1.Add(2 * time.Second)
 
-	gs.Enqueue(&Job{ID: "c", Priority: 10, SubmitTime: t3})
-	gs.Enqueue(&Job{ID: "a", Priority: 10, SubmitTime: t1})
-	gs.Enqueue(&Job{ID: "b", Priority: 10, SubmitTime: t2})
+	enqueue(t, gs, &Job{ID: "c", Priority: 10, SubmitTime: t3})
+	enqueue(t, gs, &Job{ID: "a", Priority: 10, SubmitTime: t1})
+	enqueue(t, gs, &Job{ID: "b", Priority: 10, SubmitTime: t2})
 
 	order := []string{"a", "b", "c"}
 	for _, expected := range order {
@@ -53,7 +59,7 @@ func TestFIFOSamePriority(t *testing.T) {
 
 func TestJobStateTracking(t *testing.T) {
 	gs := NewGlobalScheduler()
-	gs.Enqueue(&Job{ID: "j1", Priority: 10, SubmitTime: time.Now(), Command: "echo test"})
+	enqueue(t, gs, &Job{ID: "j1", Priority: 10, SubmitTime: time.Now(), Command: "echo test"})
 
 	job, ok := gs.GetJob("j1")
 	if !ok || job.State != StateQueued {
@@ -78,8 +84,8 @@ func TestJobStateTracking(t *testing.T) {
 
 func TestCancel(t *testing.T) {
 	gs := NewGlobalScheduler()
-	gs.Enqueue(&Job{ID: "j1", Priority: 10, SubmitTime: time.Now()})
-	gs.Enqueue(&Job{ID: "j2", Priority: 10, SubmitTime: time.Now()})
+	enqueue(t, gs, &Job{ID: "j1", Priority: 10, SubmitTime: time.Now()})
+	enqueue(t, gs, &Job{ID: "j2", Priority: 10, SubmitTime: time.Now()})
 
 	_, ok := gs.Cancel("j1")
 	if !ok {
@@ -91,7 +97,6 @@ func TestCancel(t *testing.T) {
 		t.Fatalf("Expected CANCELLED, got %s", job.State)
 	}
 
-	// Queue should only have j2
 	if gs.QueueLen() != 1 {
 		t.Fatalf("Expected queue length 1, got %d", gs.QueueLen())
 	}
@@ -105,10 +110,9 @@ func TestCancel(t *testing.T) {
 func TestBackfill(t *testing.T) {
 	gs := NewGlobalScheduler()
 
-	gs.Enqueue(&Job{ID: "big", Priority: 1, SubmitTime: time.Now(), Requirement: "ad.cpu_cores >= 64"})
-	gs.Enqueue(&Job{ID: "small", Priority: 10, SubmitTime: time.Now(), Requirement: "ad.cpu_cores >= 1"})
+	enqueue(t, gs, &Job{ID: "big", Priority: 1, SubmitTime: time.Now(), Requirement: "ad.cpu_cores >= 64"})
+	enqueue(t, gs, &Job{ID: "small", Priority: 10, SubmitTime: time.Now(), Requirement: "ad.cpu_cores >= 1"})
 
-	// Backfill: skip "big" (can't match), take "small"
 	found := gs.Backfill(func(j *Job) bool {
 		return j.Requirement == "ad.cpu_cores >= 1"
 	})
@@ -117,7 +121,6 @@ func TestBackfill(t *testing.T) {
 		t.Fatalf("Expected backfill to find 'small', got %v", found)
 	}
 
-	// Only "big" should remain
 	if gs.QueueLen() != 1 {
 		t.Fatalf("Expected queue length 1, got %d", gs.QueueLen())
 	}
@@ -138,5 +141,45 @@ func TestFairshareCalculator(t *testing.T) {
 	fc.DecayUsage(0.5)
 	if p := fc.CalculatePenalty("alice"); p != 1 {
 		t.Fatalf("Expected penalty 1 after 50%% decay, got %d", p)
+	}
+}
+
+func TestQueueLimit(t *testing.T) {
+	gs := NewGlobalScheduler()
+	gs.MaxQueueSize = 2
+
+	err := gs.Enqueue(&Job{ID: "j1", Priority: 10, SubmitTime: time.Now()})
+	if err != nil {
+		t.Fatalf("First enqueue should succeed: %v", err)
+	}
+	err = gs.Enqueue(&Job{ID: "j2", Priority: 10, SubmitTime: time.Now()})
+	if err != nil {
+		t.Fatalf("Second enqueue should succeed: %v", err)
+	}
+	err = gs.Enqueue(&Job{ID: "j3", Priority: 10, SubmitTime: time.Now()})
+	if err == nil {
+		t.Fatal("Third enqueue should fail (queue full)")
+	}
+}
+
+func TestPersistenceHooks(t *testing.T) {
+	gs := NewGlobalScheduler()
+	var jobChanges, groupChanges int
+	gs.OnJobChange = func(job *Job) { jobChanges++ }
+	gs.OnGroupChange = func(group *JobGroup) { groupChanges++ }
+
+	enqueue(t, gs, &Job{ID: "j1", Priority: 10, SubmitTime: time.Now()})
+	gs.MarkRunning("j1", "w1")
+	gs.MarkCompleted("j1", true, "", "")
+
+	if jobChanges != 3 {
+		t.Fatalf("Expected 3 job change callbacks, got %d", jobChanges)
+	}
+
+	gs.RegisterGroup(&JobGroup{GroupID: "g1", State: "PENDING"})
+	gs.SetGroupState("g1", "RUNNING")
+
+	if groupChanges != 2 {
+		t.Fatalf("Expected 2 group change callbacks, got %d", groupChanges)
 	}
 }

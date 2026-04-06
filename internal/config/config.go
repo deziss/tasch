@@ -10,10 +10,14 @@ import (
 
 // Config holds the Tasch node configuration written by `tasch setup`.
 type Config struct {
-	Role       string     `yaml:"role"`        // master, worker, both
-	NodeName   string     `yaml:"node_name"`
-	MasterAddr string     `yaml:"master_addr"` // IP/hostname of master node
-	Ports      PortConfig `yaml:"ports"`
+	Role         string     `yaml:"role"`           // master, worker, both
+	NodeName     string     `yaml:"node_name"`
+	MasterAddr   string     `yaml:"master_addr"`    // IP/hostname of master node
+	Ports        PortConfig `yaml:"ports"`
+	MaxQueueSize int        `yaml:"max_queue_size"` // 0 = unlimited
+	MaxRetries   int        `yaml:"max_retries"`    // default 3
+	DrainTimeout int        `yaml:"drain_timeout"`  // seconds, default 60
+	TLS          TLSConfig  `yaml:"tls"`
 }
 
 // PortConfig holds all network port settings.
@@ -24,12 +28,23 @@ type PortConfig struct {
 	Metrics int `yaml:"metrics"`
 }
 
+// TLSConfig holds optional TLS/mTLS settings.
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	CAFile   string `yaml:"ca_file"`
+}
+
 // DefaultConfig returns a config with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		Role:       "both",
-		NodeName:   "",
-		MasterAddr: "127.0.0.1",
+		Role:         "both",
+		NodeName:     "",
+		MasterAddr:   "127.0.0.1",
+		MaxQueueSize: 10000,
+		MaxRetries:   3,
+		DrainTimeout: 60,
 		Ports: PortConfig{
 			Gossip:  7946,
 			GRPC:    50051,
@@ -46,6 +61,15 @@ func DefaultPath() string {
 		return "config.yaml"
 	}
 	return filepath.Join(home, ".tasch", "config.yaml")
+}
+
+// StorePath returns ~/.tasch/tasch.db
+func StorePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "tasch.db"
+	}
+	return filepath.Join(home, ".tasch", "tasch.db")
 }
 
 // PidPath returns ~/.tasch/tasch.pid

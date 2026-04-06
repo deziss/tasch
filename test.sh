@@ -14,8 +14,12 @@ cleanup() {
     kill $MASTER_PID $WORKER1_PID $WORKER2_PID 2>/dev/null || true
     wait $MASTER_PID $WORKER1_PID $WORKER2_PID 2>/dev/null || true
     rm -rf "$TEST_DIR"
+    rm -f ~/.tasch/tasch.db ~/.tasch/tasch.pid  # Clean test state
 }
 trap cleanup EXIT
+
+# Clean state from previous runs
+rm -f ~/.tasch/tasch.db ~/.tasch/tasch.pid
 
 echo "=== Building ==="
 make build

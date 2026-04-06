@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/deziss/tasch/api/v1"
 	"github.com/deziss/tasch/internal/config"
+	"github.com/deziss/tasch/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -243,8 +244,45 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 	}
 	logsCmd.Flags().BoolVarP(&logsFollow, "follow", "f", false, "Follow log output")
 
+	// --- failed (dead letter queue) ---
+	failedCmd := &cobra.Command{
+		Use:   "failed",
+		Short: "Show jobs that exhausted all retries (dead letter queue)",
+		Run: func(cmd *cobra.Command, args []string) {
+			cfg := cfgLoader()
+			// Dead letters are in local BoltDB — only works on master machine
+			storeImport, err := store.Open(config.StorePath())
+			if err != nil {
+				// Fallback: list FAILED jobs from gRPC
+				client, conn := GetClient(cfg)
+				defer conn.Close()
+				listJobs(client, "FAILED")
+				return
+			}
+			defer storeImport.Close()
+
+			_ = cfg // used for fallback path
+			deadLetters, err := storeImport.LoadDeadLetters()
+			if err != nil || len(deadLetters) == 0 {
+				fmt.Println("No dead letter jobs found.")
+				return
+			}
+
+			fmt.Printf("--- Dead Letter Queue (%d jobs) ---\n", len(deadLetters))
+			fmt.Printf("%-10s %-10s %-6s %s\n", "JOB_ID", "USER", "TRIES", "ERROR")
+			fmt.Println(strings.Repeat("-", 60))
+			for _, j := range deadLetters {
+				errMsg := j.Error
+				if len(errMsg) > 30 {
+					errMsg = errMsg[:27] + "..."
+				}
+				fmt.Printf("%-10s %-10s %-6d %s\n", j.ID, j.User, j.RetryCount, errMsg)
+			}
+		},
+	}
+
 	// Wire up subcommands
-	jobsCmd.AddCommand(submitCmd, trainCmd, cancelCmd, statusCmd, logsCmd)
+	jobsCmd.AddCommand(submitCmd, trainCmd, cancelCmd, statusCmd, logsCmd, failedCmd)
 
 	return jobsCmd
 }

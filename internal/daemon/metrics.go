@@ -1,11 +1,7 @@
 package daemon
 
 import (
-	"fmt"
-	"net/http"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -77,14 +73,4 @@ func initMetrics() {
 	)
 }
 
-func startMetricsServer(port int) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	go func() {
-		addr := fmt.Sprintf(":%d", port)
-		fmt.Printf("Prometheus metrics at http://0.0.0.0%s/metrics\n", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			fmt.Printf("Metrics server error: %v\n", err)
-		}
-	}()
-}
+// startMetricsServer is now replaced by startHealthAndMetrics in master.go

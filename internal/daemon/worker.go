@@ -17,11 +17,67 @@ import (
 	"github.com/deziss/tasch/pkg/messaging"
 	"github.com/deziss/tasch/pkg/profiler"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
+// subscribeWithReconnect creates a ZMQ subscriber with automatic reconnection.
+func subscribeWithReconnect(ctx context.Context, endpoint string) <-chan string {
+	ch := make(chan string, 100)
+	go func() {
+		defer close(ch)
+		backoff := 1 * time.Second
+		for {
+			sub, err := messaging.NewZMQSubscriber(ctx, endpoint)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[zmq] Reconnecting to %s in %s: %v", endpoint, backoff, err)
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+			backoff = 1 * time.Second
+			for {
+				msg, err := sub.Receive()
+				if err != nil {
+					if ctx.Err() != nil {
+						sub.Close()
+						return
+					}
+					log.Printf("[zmq] Receive error, reconnecting: %v", err)
+					sub.Close()
+					break
+				}
+				ch <- msg
+			}
+		}
+	}()
+	return ch
+}
+
+// reportWithRetry reports job result to master with timeout and one retry.
+func reportWithRetry(client pb.SchedulerServiceClient, req *pb.ReportResultRequest) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := client.ReportResult(ctx, req)
+	if err != nil {
+		log.Printf("[report] First attempt failed for job %s: %v, retrying...", req.JobId, err)
+		time.Sleep(2 * time.Second)
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		_, err = client.ReportResult(ctx2, req)
+		if err != nil {
+			log.Printf("[report] Retry failed for job %s: %v", req.JobId, err)
+		}
+	}
+}
+
 // StartWorker initializes and runs a worker agent.
-// It blocks until the returned cancel function is called.
 func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	nodeName := cfg.NodeName
 	masterHost := cfg.MasterAddr
@@ -31,7 +87,6 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		return nil, fmt.Errorf("hardware profiling: %w", err)
 	}
 
-	// Auto-detect advertise address for remote masters
 	advertiseAddr := os.Getenv("TASCH_ADVERTISE_ADDR")
 	if advertiseAddr == "" && masterHost != "127.0.0.1" {
 		advertiseAddr = discovery.GetLocalIP()
@@ -39,7 +94,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 
 	disc, err := discovery.NewNodeDiscovery(nodeName, 0, []byte(ad), advertiseAddr, 0, nil)
 	if err != nil {
-		return nil, fmt.Errorf("discovery init: %w", err)
+		return nil, fmt.Errorf("discovery: %w", err)
 	}
 
 	joinAddr := fmt.Sprintf("%s:%d", masterHost, cfg.Ports.Gossip)
@@ -53,23 +108,37 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		grpcAddr = fmt.Sprintf("%s:%d", masterHost, cfg.Ports.GRPC)
 	}
 
-	grpcConn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// gRPC with keepalive for resilience
+	dialOpts := []grpc.DialOption{
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	}
+	if cfg.TLS.Enabled && cfg.TLS.CAFile != "" {
+		creds, err := credentials.NewClientTLSFromFile(cfg.TLS.CAFile, "")
+		if err != nil {
+			disc.Shutdown()
+			return nil, fmt.Errorf("TLS: %w", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(creds))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	grpcConn, err := grpc.NewClient(grpcAddr, dialOpts...)
 	if err != nil {
 		disc.Shutdown()
-		return nil, fmt.Errorf("gRPC connect to %s: %w", grpcAddr, err)
+		return nil, fmt.Errorf("gRPC connect: %w", err)
 	}
 	masterClient := pb.NewSchedulerServiceClient(grpcConn)
 
 	subCtx, cancelSub := context.WithCancel(context.Background())
 	subEndpoint := fmt.Sprintf("tcp://%s:%d", masterHost, cfg.Ports.ZMQ)
 
-	sub, err := messaging.NewZMQSubscriber(subCtx, subEndpoint)
-	if err != nil {
-		cancelSub()
-		grpcConn.Close()
-		disc.Shutdown()
-		return nil, fmt.Errorf("ZMQ subscribe to %s: %w", subEndpoint, err)
-	}
+	// ZMQ with auto-reconnection
+	msgCh := subscribeWithReconnect(subCtx, subEndpoint)
 
 	fmt.Printf("Worker '%s' joined cluster (master: %s)\n", nodeName, masterHost)
 	fmt.Println("Listening for tasks...")
@@ -78,15 +147,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	cancelFuncs := make(map[string]context.CancelFunc)
 
 	go func() {
-		for {
-			msg, err := sub.Receive()
-			if err != nil {
-				if subCtx.Err() != nil {
-					return
-				}
-				continue
-			}
-
+		for msg := range msgCh {
 			var payload messaging.DispatchPayload
 			if err := json.Unmarshal([]byte(msg), &payload); err != nil {
 				continue
@@ -125,7 +186,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 						cancelMu.Unlock()
 					}()
 
-					fmt.Printf("Received Job %s: Executing '%s'...\n", p.JobID, p.Command)
+					fmt.Printf("Job %s: executing '%s'...\n", p.JobID, p.Command)
 					startTime := time.Now()
 
 					var stdout, stderr bytes.Buffer
@@ -156,23 +217,20 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					if execErr != nil {
 						errMsg = execErr.Error()
 						if ctx.Err() == context.DeadlineExceeded {
-							errMsg = fmt.Sprintf("walltime exceeded (%ds limit)", p.WalltimeSeconds)
+							errMsg = fmt.Sprintf("walltime exceeded (%ds)", p.WalltimeSeconds)
 						} else if ctx.Err() == context.Canceled {
-							errMsg = "cancelled by user"
+							errMsg = "cancelled"
 						}
-						fmt.Printf("Job %s exited with error: %s\n", p.JobID, errMsg)
+						fmt.Printf("Job %s error: %s\n", p.JobID, errMsg)
 					} else {
-						fmt.Printf("Job %s completed successfully.\n", p.JobID)
+						fmt.Printf("Job %s completed.\n", p.JobID)
 					}
 
-					_, reportErr := masterClient.ReportResult(context.Background(), &pb.ReportResultRequest{
+					reportWithRetry(masterClient, &pb.ReportResultRequest{
 						JobId: p.JobID, WorkerNode: nodeName, Success: success,
 						Output: stdout.String(), Error: errMsg,
 						StartTime: startTime.Unix(), EndTime: endTime.Unix(),
 					})
-					if reportErr != nil {
-						log.Printf("Warning: failed to report result for job %s: %v", p.JobID, reportErr)
-					}
 				}(payload)
 			}
 		}
@@ -180,7 +238,6 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 
 	return func() {
 		cancelSub()
-		sub.Close()
 		grpcConn.Close()
 		disc.Shutdown()
 	}, nil

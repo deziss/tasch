@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package v1;
+
+option go_package = "github.com/deziss/tasch/api/v1";
+
+service SchedulerService {
+  // Submit a job with a CEL requirement constraint
+  rpc SubmitJob (SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Submit a distributed training job across multiple nodes
+  rpc SubmitDistributedJob (SubmitDistributedJobRequest) returns (SubmitDistributedJobResponse);
+
+  // Cancel a queued or running job
+  rpc CancelJob (CancelJobRequest) returns (CancelJobResponse);
+
+  // Get the status and result of a specific job
+  rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusResponse);
+
+  // Stream execution logs back from a running or completed job
+  rpc StreamLogs (LogStreamRequest) returns (stream LogMessage);
+
+  // Retrieve the global queued tasks and active workers states
+  rpc WorkerStatus (WorkerStatusRequest) returns (WorkerStatusResponse);
+
+  // List all jobs in the queue with their states
+  rpc ListJobs (ListJobsRequest) returns (ListJobsResponse);
+
+  // Worker reports job completion/failure back to master
+  rpc ReportResult (ReportResultRequest) returns (ReportResultResponse);
+}
+
+message SubmitJobRequest {
+  string cel_requirement = 1;
+  string command = 2;
+  int32 priority = 3;                   // Lower = higher priority (default: 10)
+  string user = 4;                      // For fairshare tracking
+  int32 walltime_seconds = 5;           // Max execution time (0 = no limit)
+  int32 gpus_required = 6;              // Number of GPUs needed (0 = none)
+  map<string, string> env_vars = 7;     // Custom environment variables
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+  string status = 2;
+}
+
+message SubmitDistributedJobRequest {
+  string cel_requirement = 1;           // Must match on ALL allocated nodes
+  string command = 2;                   // Command template (same on all nodes)
+  int32 num_nodes = 3;                  // How many nodes to allocate
+  int32 gpus_per_node = 4;             // GPUs per node
+  int32 priority = 5;
+  string user = 6;
+  int32 walltime_seconds = 7;
+  int32 master_port = 8;               // DDP coordination port (default: 29500)
+  map<string, string> env_vars = 9;    // Additional env vars for all ranks
+}
+
+message SubmitDistributedJobResponse {
+  string group_id = 1;
+  repeated string job_ids = 2;
+  string status = 3;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  string job_id = 1;
+  string status = 2;
+  string message = 3;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message GetJobStatusResponse {
+  string job_id = 1;
+  string state = 2;       // QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
+  string worker_node = 3;
+  string command = 4;
+  string output = 5;
+  string error = 6;
+  int64 submit_time = 7;
+  int64 start_time = 8;
+  int64 end_time = 9;
+  string group_id = 10;   // Empty if not part of a distributed job
+}
+
+message LogStreamRequest {
+  string job_id = 1;
+}
+
+message LogMessage {
+  int64 timestamp = 1;
+  string level = 2;
+  string message = 3;
+  string job_id = 4;
+}
+
+message WorkerStatusRequest {}
+
+message WorkerStatusResponse {
+  map<string, string> worker_nodes = 1;
+}
+
+message ListJobsRequest {
+  string state_filter = 1; // Optional: filter by state
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message JobInfo {
+  string job_id = 1;
+  string state = 2;
+  string command = 3;
+  string requirement = 4;
+  string worker_node = 5;
+  int32 priority = 6;
+  string user = 7;
+  int64 submit_time = 8;
+  string group_id = 9;
+}
+
+message ReportResultRequest {
+  string job_id = 1;
+  string worker_node = 2;
+  bool success = 3;
+  string output = 4;
+  string error = 5;
+  int64 start_time = 6;
+  int64 end_time = 7;
+}
+
+message ReportResultResponse {
+  bool acknowledged = 1;
+}

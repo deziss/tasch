@@ -22,15 +22,42 @@ func (m *metaDelegate) GetBroadcasts(overhead, limit int) [][]byte { return nil 
 func (m *metaDelegate) LocalState(join bool) []byte { return nil }
 func (m *metaDelegate) MergeRemoteState(buf []byte, join bool) {}
 
+// eventDelegate implements memberlist.EventDelegate to detect node join/leave.
+type eventDelegate struct {
+	onJoin  func(name string)
+	onLeave func(name string)
+}
+
+func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
+	if e.onJoin != nil {
+		e.onJoin(node.Name)
+	}
+}
+
+func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
+	if e.onLeave != nil {
+		e.onLeave(node.Name)
+	}
+}
+
+func (e *eventDelegate) NotifyUpdate(node *memberlist.Node) {}
+
 // NodeDiscovery manages the SWIM-gossip protocol for automatic worker discovery
 type NodeDiscovery struct {
 	list *memberlist.Memberlist
 }
 
+// EventHooks holds optional callbacks for cluster membership events.
+type EventHooks struct {
+	OnJoin  func(name string)
+	OnLeave func(name string)
+}
+
 // NewNodeDiscovery initializes a new memberlist agent on the local node.
 // advertiseAddr/advertisePort allow remote workers to advertise their real IP
 // to the cluster instead of 127.0.0.1. Pass empty string / 0 to skip.
-func NewNodeDiscovery(nodeName string, bindPort int, meta []byte, advertiseAddr string, advertisePort int) (*NodeDiscovery, error) {
+// hooks is optional — pass nil if no event callbacks are needed.
+func NewNodeDiscovery(nodeName string, bindPort int, meta []byte, advertiseAddr string, advertisePort int, hooks *EventHooks) (*NodeDiscovery, error) {
 	config := memberlist.DefaultLocalConfig()
 	config.Name = nodeName
 	config.BindPort = bindPort
@@ -46,6 +73,10 @@ func NewNodeDiscovery(nodeName string, bindPort int, meta []byte, advertiseAddr 
 
 	if meta != nil {
 		config.Delegate = &metaDelegate{meta: meta}
+	}
+
+	if hooks != nil {
+		config.Events = &eventDelegate{onJoin: hooks.OnJoin, onLeave: hooks.OnLeave}
 	}
 
 	list, err := memberlist.Create(config)

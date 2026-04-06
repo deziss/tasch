@@ -46,12 +46,13 @@ type Job struct {
 
 // JobGroup represents a distributed training job spanning multiple nodes.
 type JobGroup struct {
-	GroupID     string   `json:"group_id"`
-	JobIDs      []string `json:"job_ids"`
-	NumNodes    int      `json:"num_nodes"`
-	GPUsPerNode int      `json:"gpus_per_node"`
-	MasterPort  int      `json:"master_port"`
-	State       string   `json:"state"` // PENDING, RUNNING, COMPLETED, FAILED
+	GroupID     string    `json:"group_id"`
+	JobIDs      []string  `json:"job_ids"`
+	NumNodes    int       `json:"num_nodes"`
+	GPUsPerNode int       `json:"gpus_per_node"`
+	MasterPort  int       `json:"master_port"`
+	State       string    `json:"state"` // PENDING, RUNNING, COMPLETED, FAILED
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // JobQueue implements heap.Interface and holds Jobs.
@@ -255,6 +256,19 @@ func (gs *GlobalScheduler) ListJobs(stateFilter string) []*Job {
 // RunningJobs returns all jobs currently in RUNNING state.
 func (gs *GlobalScheduler) RunningJobs() []*Job {
 	return gs.ListJobs(StateRunning)
+}
+
+// RunningJobsOnNode returns all RUNNING jobs assigned to a specific worker node.
+func (gs *GlobalScheduler) RunningJobsOnNode(nodeName string) []*Job {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	var result []*Job
+	for _, job := range gs.jobs {
+		if job.State == StateRunning && job.WorkerNode == nodeName {
+			result = append(result, job)
+		}
+	}
+	return result
 }
 
 // --- Job Group Management ---

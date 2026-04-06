@@ -18,9 +18,10 @@ type Config struct {
 
 // PortConfig holds all network port settings.
 type PortConfig struct {
-	Gossip int `yaml:"gossip"`
-	GRPC   int `yaml:"grpc"`
-	ZMQ    int `yaml:"zmq"`
+	Gossip  int `yaml:"gossip"`
+	GRPC    int `yaml:"grpc"`
+	ZMQ     int `yaml:"zmq"`
+	Metrics int `yaml:"metrics"`
 }
 
 // DefaultConfig returns a config with sensible defaults.
@@ -30,9 +31,10 @@ func DefaultConfig() *Config {
 		NodeName:   "",
 		MasterAddr: "127.0.0.1",
 		Ports: PortConfig{
-			Gossip: 7946,
-			GRPC:   50051,
-			ZMQ:    5555,
+			Gossip:  7946,
+			GRPC:    50051,
+			ZMQ:     5555,
+			Metrics: 9090,
 		},
 	}
 }
@@ -99,5 +101,8 @@ func (c *Config) ApplyEnvOverrides() {
 	}
 	if v := os.Getenv("TASCH_ZMQ_PORT"); v != "" {
 		fmt.Sscanf(v, "%d", &c.Ports.ZMQ)
+	}
+	if v := os.Getenv("TASCH_METRICS_PORT"); v != "" {
+		fmt.Sscanf(v, "%d", &c.Ports.Metrics)
 	}
 }

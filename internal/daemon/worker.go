@@ -37,7 +37,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		advertiseAddr = discovery.GetLocalIP()
 	}
 
-	disc, err := discovery.NewNodeDiscovery(nodeName, 0, []byte(ad), advertiseAddr, 0)
+	disc, err := discovery.NewNodeDiscovery(nodeName, 0, []byte(ad), advertiseAddr, 0, nil)
 	if err != nil {
 		return nil, fmt.Errorf("discovery init: %w", err)
 	}

@@ -95,6 +95,7 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 		EnvVars:         req.EnvVars,
 	}
 	s.queue.Enqueue(job)
+	jobsSubmittedTotal.WithLabelValues(user).Inc()
 	s.appendLog(jobID, "INFO", fmt.Sprintf("Job queued | Priority: %d (base: %d, penalty: +%d) | GPUs: %d | Expr: '%s'", effectivePriority, priority, penalty, req.GpusRequired, req.CelRequirement))
 	fmt.Printf("Job %s queued | User: %s, Priority: %d, GPUs: %d\n", jobID, user, effectivePriority, req.GpusRequired)
 	return &pb.SubmitJobResponse{JobId: jobID, Status: "QUEUED"}, nil
@@ -147,7 +148,9 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 	s.queue.RegisterGroup(&scheduler.JobGroup{
 		GroupID: groupID, JobIDs: jobIDs, NumNodes: numNodes,
 		GPUsPerNode: gpusPerNode, MasterPort: masterPort, State: "PENDING",
+		CreatedAt: time.Now(),
 	})
+	jobsSubmittedTotal.WithLabelValues(user).Add(float64(numNodes))
 	fmt.Printf("Distributed job %s queued | %d nodes x %d GPUs | User: %s\n", groupID, numNodes, gpusPerNode, user)
 	return &pb.SubmitDistributedJobResponse{GroupId: groupID, JobIds: jobIDs, Status: "QUEUED"}, nil
 }
@@ -258,6 +261,13 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 	if !req.Success {
 		status = "FAILED"
 	}
+	if job, ok := s.queue.GetJob(req.JobId); ok {
+		jobsCompletedTotal.WithLabelValues(job.User, status).Inc()
+		dur := job.EndTime.Sub(job.StartTime).Seconds()
+		if dur > 0 {
+			jobDuration.WithLabelValues(job.User, status).Observe(dur)
+		}
+	}
 	s.appendLog(req.JobId, "INFO", fmt.Sprintf("Job %s on worker %s | Output: %s", status, req.WorkerNode, truncate(req.Output, 200)))
 	if req.Error != "" {
 		s.appendLog(req.JobId, "ERROR", req.Error)
@@ -306,6 +316,8 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 
 // --- Scheduling ---
 
+const gangTimeout = 5 * time.Minute
+
 func nodeMatchesGPU(memberMeta []byte, gpusRequired int) bool {
 	if gpusRequired <= 0 {
 		return true
@@ -322,7 +334,27 @@ func dispatchLoop(srv *schedulerServer) {
 	for {
 		time.Sleep(1 * time.Second)
 
+		// Update gauges each cycle
+		queueDepth.Set(float64(srv.queue.QueueLen()))
+		runningJobs.Set(float64(len(srv.queue.RunningJobs())))
+		clusterNodes.Set(float64(len(srv.disc.Members())))
+		groupsPending.Set(float64(len(srv.queue.PendingGroups())))
+
 		for _, group := range srv.queue.PendingGroups() {
+			if !group.CreatedAt.IsZero() && time.Since(group.CreatedAt) > gangTimeout {
+				fmt.Printf("[gang] Group %s timed out after %s — failing all ranks\n", group.GroupID, gangTimeout)
+				for _, jid := range group.JobIDs {
+					job, ok := srv.queue.Cancel(jid)
+					if ok && job != nil && job.WorkerNode != "" {
+						payload := messaging.DispatchPayload{TargetNode: job.WorkerNode, JobID: job.ID, Action: "cancel"}
+						b, _ := json.Marshal(payload)
+						srv.pub.Send(string(b))
+					}
+					srv.appendLog(jid, "ERROR", fmt.Sprintf("Gang group %s timed out waiting for %d matching nodes", group.GroupID, group.NumNodes))
+				}
+				srv.queue.SetGroupState(group.GroupID, "FAILED")
+				continue
+			}
 			tryDispatchGroup(srv, group)
 		}
 
@@ -434,6 +466,7 @@ func tryDispatchGroup(srv *schedulerServer, group *scheduler.JobGroup) {
 }
 
 func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
+	dispatchStart := time.Now()
 	srv.queue.MarkRunning(job.ID, nodeName)
 
 	envVars := make(map[string]string)
@@ -472,6 +505,7 @@ func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 	b, _ := json.Marshal(payload)
 	srv.pub.Send(string(b))
 
+	dispatchDuration.Observe(time.Since(dispatchStart).Seconds())
 	srv.appendLog(job.ID, "INFO", fmt.Sprintf("Dispatched to node %s", nodeName))
 	fmt.Printf("Job %s matched with node %s. Dispatching...\n", job.ID, nodeName)
 }
@@ -485,6 +519,7 @@ func walltimeEnforcer(srv *schedulerServer) {
 			}
 			if time.Now().After(job.StartTime.Add(time.Duration(job.WalltimeSeconds) * time.Second)) {
 				fmt.Printf("[walltime] Job %s exceeded %ds limit. Cancelling...\n", job.ID, job.WalltimeSeconds)
+				walltimeKillsTotal.Inc()
 				srv.queue.Cancel(job.ID)
 				payload := messaging.DispatchPayload{TargetNode: job.WorkerNode, JobID: job.ID, Action: "cancel"}
 				b, _ := json.Marshal(payload)
@@ -505,13 +540,33 @@ func truncate(s string, maxLen int) string {
 // StartMaster initializes and runs the master scheduler.
 // It blocks until the returned cancel function is called.
 func StartMaster(cfg *config.Config) (cancel func(), err error) {
-	disc, err := discovery.NewNodeDiscovery("master-node", cfg.Ports.Gossip, nil, "", 0)
+	queue := scheduler.NewGlobalScheduler()
+	fairshare := scheduler.NewFairshareCalculator()
+
+	hooks := &discovery.EventHooks{
+		OnLeave: func(nodeName string) {
+			jobs := queue.RunningJobsOnNode(nodeName)
+			if len(jobs) == 0 {
+				return
+			}
+			workerLostTotal.Inc()
+			fmt.Printf("[heartbeat] Worker %s left cluster — failing %d running job(s)\n", nodeName, len(jobs))
+			for _, job := range jobs {
+				queue.MarkCompleted(job.ID, false, "", "worker node lost")
+				if job.GroupID != "" {
+					if group, ok := queue.GetGroup(job.GroupID); ok && group.State == "RUNNING" {
+						queue.SetGroupState(job.GroupID, "FAILED")
+						fmt.Printf("[heartbeat] Group %s failed due to worker %s loss\n", job.GroupID, nodeName)
+					}
+				}
+			}
+		},
+	}
+
+	disc, err := discovery.NewNodeDiscovery("master-node", cfg.Ports.Gossip, nil, "", 0, hooks)
 	if err != nil {
 		return nil, fmt.Errorf("discovery init: %w", err)
 	}
-
-	queue := scheduler.NewGlobalScheduler()
-	fairshare := scheduler.NewFairshareCalculator()
 
 	eval, err := matchmaker.NewEvaluator()
 	if err != nil {
@@ -531,6 +586,9 @@ func StartMaster(cfg *config.Config) (cancel func(), err error) {
 		logStore:    make(map[string][]*pb.LogMessage),
 		logChannels: make(map[string][]chan *pb.LogMessage),
 	}
+
+	initMetrics()
+	startMetricsServer(cfg.Ports.Metrics)
 
 	go dispatchLoop(srv)
 	go walltimeEnforcer(srv)
@@ -552,7 +610,7 @@ func StartMaster(cfg *config.Config) (cancel func(), err error) {
 	pb.RegisterSchedulerServiceServer(grpcServer, srv)
 
 	go func() {
-		fmt.Printf("Master scheduler listening on :%d (gRPC), :%d (ZMQ), :%d (gossip)\n", cfg.Ports.GRPC, cfg.Ports.ZMQ, cfg.Ports.Gossip)
+		fmt.Printf("Master scheduler listening on :%d (gRPC), :%d (ZMQ), :%d (gossip), :%d (metrics)\n", cfg.Ports.GRPC, cfg.Ports.ZMQ, cfg.Ports.Gossip, cfg.Ports.Metrics)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Printf("gRPC server error: %v", err)
 		}

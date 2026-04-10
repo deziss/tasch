@@ -13,11 +13,23 @@
 
 ## Install
 
+### From Source
 ```bash
 git clone https://github.com/deziss/tasch.git
 cd tasch && make build
 sudo cp bin/tasch /usr/local/bin/
 ```
+
+### From Package (.deb / .rpm)
+Download the latest release from GitHub and install via your package manager:
+```bash
+# Debian/Ubuntu
+sudo dpkg -i tasch_0.1.0_amd64.deb
+
+# RHEL/CentOS/Fedora
+sudo rpm -i tasch-0.1.0-1.x86_64.rpm
+```
+After installation, the binary is at `/usr/bin/tasch`, and the configuration is at `/etc/tasch/config.yaml`.
 
 ## Quick Start
 

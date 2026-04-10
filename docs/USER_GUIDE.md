@@ -126,7 +126,33 @@ Missing fields → `false` (non-match), not error.
 Failed jobs auto-retry up to `max_retries` (default 3) with exponential backoff. After all retries, moved to dead letter queue. Distributed training jobs (group jobs) do NOT retry — if one rank fails, all are cancelled.
 
 ### Persistence
-All jobs persisted to `~/.tasch/tasch.db`. Master restart restores queued jobs. Running jobs at crash time are marked FAILED.
+All jobs persisted to `tasch.db`.
+- **User-local**: `~/.tasch/tasch.db`
+- **System-wide**: `/var/lib/tasch/tasch.db`
+
+Master restart restores queued jobs. Running jobs at crash time are marked FAILED.
+
+---
+
+## System-wide Installation (Service)
+
+If installed via `.deb` or `.rpm`, Tasch can be managed as a systemd service.
+
+### Configuration
+The system configuration is located at `/etc/tasch/config.yaml`. The service runs as the `tasch` user.
+
+### Service Management
+```bash
+sudo systemctl enable tasch
+sudo systemctl start tasch
+sudo systemctl status tasch
+sudo journalctl -u tasch -f  # Follow logs
+```
+
+### Data and Logs
+- **Config**: `/etc/tasch/config.yaml`
+- **State/Database**: `/var/lib/tasch/tasch.db`
+- **Binary**: `/usr/bin/tasch`
 
 ### Circuit Breaker
 If a worker fails 3 consecutive jobs, it's blocked from receiving new jobs for 5 minutes. Resets on success.

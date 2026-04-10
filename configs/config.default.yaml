@@ -1,0 +1,13 @@
+role: both
+node_name: node-1
+master_addr: 127.0.0.1
+max_queue_size: 10000
+max_retries: 3
+drain_timeout: 60
+ports:
+  gossip: 7946
+  grpc: 50051
+  zmq: 5555
+  metrics: 9090
+tls:
+  enabled: false

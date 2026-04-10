@@ -54,8 +54,14 @@ func DefaultConfig() *Config {
 	}
 }
 
-// DefaultPath returns ~/.tasch/config.yaml
+// DefaultPath returns the first existing path from:
+// 1. /etc/tasch/config.yaml (system-wide)
+// 2. ~/.tasch/config.yaml (user-local)
 func DefaultPath() string {
+	if _, err := os.Stat("/etc/tasch/config.yaml"); err == nil {
+		return "/etc/tasch/config.yaml"
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "config.yaml"
@@ -63,8 +69,11 @@ func DefaultPath() string {
 	return filepath.Join(home, ".tasch", "config.yaml")
 }
 
-// StorePath returns ~/.tasch/tasch.db
+// StorePath returns the storage path, prioritizing /var/lib/tasch if it exists.
 func StorePath() string {
+	if info, err := os.Stat("/var/lib/tasch"); err == nil && info.IsDir() {
+		return "/var/lib/tasch/tasch.db"
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "tasch.db"
@@ -72,8 +81,11 @@ func StorePath() string {
 	return filepath.Join(home, ".tasch", "tasch.db")
 }
 
-// PidPath returns ~/.tasch/tasch.pid
+// PidPath returns the PID file path, prioritizing /run/tasch or /var/lib/tasch for system services.
 func PidPath() string {
+	if info, err := os.Stat("/var/lib/tasch"); err == nil && info.IsDir() {
+		return "/var/lib/tasch/tasch.pid"
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "tasch.pid"

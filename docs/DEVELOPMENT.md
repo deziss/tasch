@@ -4,7 +4,10 @@
 
 ```bash
 make build     # → bin/tasch
-make clean     # remove binary
+make deb       # → build .deb package
+make rpm       # → build .rpm package
+make package   # → build both
+make clean     # remove binary and dist/
 make proto     # regenerate gRPC stubs
 make test      # unit tests (13 tests)
 make run-test  # build + integration test (11 scenarios)

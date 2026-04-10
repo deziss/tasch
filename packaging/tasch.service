@@ -1,0 +1,15 @@
+[Unit]
+Description=Tasch — Distributed Task Scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=tasch
+Group=tasch
+ExecStart=/usr/bin/tasch start --config /etc/tasch/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

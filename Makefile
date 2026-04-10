@@ -1,7 +1,9 @@
+VERSION := 0.1.0
 BINARY_DIR := bin
+DIST_DIR := dist
 MODULE := github.com/deziss/tasch
 
-.PHONY: build clean proto test run-test
+.PHONY: build clean proto test run-test package deb rpm
 
 build:
 	@echo "Building tasch..."
@@ -9,16 +11,16 @@ build:
 	@echo "Done. Binary: $(BINARY_DIR)/tasch"
 
 clean:
-	rm -rf $(BINARY_DIR)
+	rm -rf $(BINARY_DIR) $(DIST_DIR)
 
-proto:
-	PATH="$$HOME/go/bin:$$PATH" protoc \
-		--go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		api/v1/scheduler.proto
+package: deb rpm
 
-test:
-	go test ./... -v
+deb: build
+	@echo "Packaging DEB..."
+	mkdir -p $(DIST_DIR)
+	nfpm package --config nfpm.yaml --target $(DIST_DIR)/ --packager deb
 
-run-test: build
-	bash test.sh
+rpm: build
+	@echo "Packaging RPM..."
+	mkdir -p $(DIST_DIR)
+	nfpm package --config nfpm.yaml --target $(DIST_DIR)/ --packager rpm

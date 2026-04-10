@@ -2,6 +2,8 @@
 
 ## Setup
 
+PREREQUISITES: Go 1.24+, `nfpm` (for packaging), `protoc` (for gRPC).
+
 ```bash
 git clone https://github.com/deziss/tasch.git
 cd tasch
@@ -20,6 +22,7 @@ make build && make test && make run-test
 | Persistence bucket | `internal/store/store.go` |
 | Prometheus metric | `internal/daemon/metrics.go` |
 | Config field | `internal/config/config.go` + `internal/setup/setup.go` |
+| Packaging | `nfpm.yaml` + `packaging/` |
 
 ## Testing
 

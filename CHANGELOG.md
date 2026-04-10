@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.7.0] — 2026-04-10
+
+Debian and RPM packaging, systemd integration, and system-wide configuration.
+
+### Added
+- **.deb and .rpm packaging** via `nfpm`. Build with `make deb`, `make rpm`, or `make package`.
+- **systemd integration** — `tasch.service` unit file included in packages.
+- **System-wide configuration** — Prioritizes `/etc/tasch/config.yaml` and `/var/lib/tasch/` for database/PID when running as a global service.
+- **Automated user creation** — `postinstall.sh` creates `tasch` system user/group with isolated home in `/var/lib/tasch`.
+- **Makefile targets** — `package`, `deb`, `rpm` added for automated distribution builds.
+
+---
+
 ## [v0.6.0] — 2026-04-06
 
 Production robustness: persistence, retry, health checks, circuit breaker, GPU tracking, TLS.

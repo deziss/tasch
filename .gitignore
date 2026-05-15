@@ -4,3 +4,4 @@ dist/
 *.pid
 .tasch/
 vendor/
+graphify-out/

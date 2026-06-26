@@ -1,14 +1,20 @@
 # Tasch — Distributed Task Scheduler
 
-**Tasch** is a production-grade, distributed task scheduler with GPU support. One binary, one setup command, and your cluster is ready.
+**Tasch** is a production-grade, distributed task scheduler with multi-GPU and cross-platform support. One binary, one setup command, and your cluster is ready.
 
 ```
-┌──────────┐         ┌──────────┐
-│ Server 10│ ◄─────► │ Server 20│
-│ (master  │  gossip │ (worker) │
-│ +worker) │  + ZMQ  │ 4x V100  │
-│ 2x A100  │         │          │
-└──────────┘         └──────────┘
+┌──────────────────┐        ┌──────────────────┐
+│  Server 10       │◄──────►│  Server 20       │
+│  (master+worker) │ gossip │  (worker)        │
+│  Linux/amd64     │ + ZMQ  │  Linux/arm64     │
+│  2× NVIDIA A100  │        │  4× AMD RX7900   │
+└──────────────────┘        └──────────────────┘
+
+┌──────────────────┐        ┌──────────────────┐
+│  Mac Studio      │        │  Windows VM      │
+│  Apple M2 Ultra  │        │  Windows/arm64   │
+│  Metal GPU       │        │  Intel Arc GPU   │
+└──────────────────┘        └──────────────────┘
 ```
 
 ## Install
@@ -18,6 +24,15 @@
 git clone https://github.com/deziss/tasch.git
 cd tasch && make build
 sudo cp bin/tasch /usr/local/bin/
+```
+
+### Cross-Platform Builds
+Use the included build script to compile for all supported platforms:
+```bash
+chmod +x build.sh && ./build.sh
+# Produces: dist/tasch-linux-amd64, dist/tasch-linux-arm64,
+#           dist/tasch-windows-amd64.exe, dist/tasch-windows-arm64.exe,
+#           dist/tasch-darwin-amd64, dist/tasch-darwin-arm64
 ```
 
 ### From Package (.deb / .rpm)
@@ -46,7 +61,7 @@ tasch start
 
 Use from any machine:
 ```bash
-tasch nodes                    # cluster status + GPUs
+tasch nodes                    # cluster status + GPUs + OS + arch
 tasch jobs submit --gpus=1 "ad.gpu_count >= 1" "python train.py"
 tasch jobs train --nodes=2 "torchrun ... train.py"
 tasch jobs                     # list all jobs
@@ -62,25 +77,29 @@ tasch stop                     # graceful drain + shutdown
 | Feature | Description |
 |---------|-------------|
 | **Single binary** | `tasch setup` → `tasch start` → done |
-| **GPU detection** | NVIDIA (`nvidia-smi`) + AMD (`rocm-smi`), auto `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` |
+| **Cross-platform** | Linux, Windows, macOS · amd64 and arm64 (64-bit only) |
+| **Multi-GPU vendor** | NVIDIA · AMD · Intel · Apple Metal · Jetson Tegra |
+| **GPU env binding** | Auto-injects `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `ONEAPI_DEVICE_SELECTOR`, `METAL_DEVICE_INDEX` per vendor |
 | **Distributed training** | `tasch jobs train` — gang scheduling + auto DDP env vars (`RANK`, `WORLD_SIZE`, `MASTER_ADDR`) |
 | **BoltDB persistence** | Jobs, groups, fairshare survive master restart (`~/.tasch/tasch.db`) |
-| **Job retry** | Auto-retry failed jobs (default 3x) with exponential backoff. Dead letter queue for exhausted retries |
+| **Job retry** | Auto-retry failed jobs (default 3×) with exponential backoff. Dead letter queue for exhausted retries |
 | **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
-| **Prometheus metrics** | 9 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
+| **Prometheus metrics** | 10 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
 | **Circuit breaker** | 3 consecutive failures → worker blocked 5 minutes |
-| **GPU resource tracking** | Prevents GPU oversubscription across concurrent dispatches |
+| **Multi-resource tracking** | Prevents GPU, CPU, and memory oversubscription across concurrent dispatches |
+| **ZMQ dispatch handshake** | Worker sends HTTP acknowledgement on job start; master re-queues unacknowledged jobs after 10s |
 | **Graceful drain** | `tasch stop` → stop accepting → wait for running jobs → shutdown |
-| **ZMQ auto-reconnect** | Worker reconnects to master with exponential backoff (1s-30s) |
+| **ZMQ auto-reconnect** | Worker reconnects to master with exponential backoff (1s–30s) |
 | **gRPC keepalive** | 30s heartbeat, 10s timeout, survives transient disconnects |
 | **TLS support** | Optional mTLS for gRPC (`tls.enabled`, cert/key/CA in config) |
 | **Queue limits** | Max 10,000 jobs (configurable). Rejects when full |
-| **CEL matchmaking** | `ad.gpu_count >= 2 && ad.gpu_vendor == "nvidia"` |
+| **CEL matchmaking** | `ad.gpu_count >= 2 && ad.gpu_vendor == "nvidia" && ad.os == "linux"` |
 | **Backfill scheduling** | Lower-priority jobs fill idle nodes while big jobs wait |
 | **Fairshare** | Heavy users get priority penalties (auto-decaying) |
 | **Walltime** | `--walltime=3600` kills jobs exceeding the limit |
 | **Worker loss detection** | Gossip detects node departure → running jobs marked FAILED |
 | **Gang timeout** | Distributed jobs fail after 5 min if not enough nodes |
+| **Async DB writes** | Decoupled BoltDB writes via buffered channel — scheduling never blocks on disk |
 
 ## CLI Reference
 
@@ -89,7 +108,7 @@ tasch setup                          # Interactive setup wizard
 tasch start                          # Start based on config
 tasch stop                           # Graceful drain + shutdown
 
-tasch nodes                          # Cluster nodes + GPU info
+tasch nodes                          # Cluster nodes + GPU/OS/arch info
 
 tasch jobs                           # List all jobs
 tasch jobs submit <expr> <cmd>       # Submit single job
@@ -124,15 +143,15 @@ tasch jobs failed                    # Dead letter queue
 | Variable | Type | Example |
 |----------|------|---------|
 | `ad.gpu_count` | int | `ad.gpu_count >= 2` |
-| `ad.gpu_vendor` | string | `"nvidia"` or `"amd"` |
+| `ad.gpu_vendor` | string | `"nvidia"`, `"amd"`, `"intel"`, `"apple"` |
 | `ad.gpu_memory_mb` | list | `ad.gpu_memory_mb[0] >= 40000` |
-| `ad.cuda_version` | string | |
-| `ad.rocm_version` | string | |
+| `ad.cuda_version` | string | NVIDIA CUDA version |
+| `ad.rocm_version` | string | AMD ROCm version |
 | `ad.cpu_cores` | int | `ad.cpu_cores >= 8` |
-| `ad.total_memory_mb` | int | |
-| `ad.os` | string | `ad.os == "linux"` |
-| `ad.architecture` | string | |
-| `ad.host_type` | string | `vm_or_baremetal` or `container` |
+| `ad.total_memory_mb` | int | `ad.total_memory_mb >= 16000` |
+| `ad.os` | string | `"linux"`, `"windows"`, `"darwin"` |
+| `ad.architecture` | string | `"amd64"`, `"arm64"` |
+| `ad.host_type` | string | `"vm_or_baremetal"` or `"container"` |
 
 ## Config File
 
@@ -165,6 +184,7 @@ Override with `--config <path>` or `TASCH_*` env vars.
 | `/health` | 9090 | Liveness probe (always 200) |
 | `/ready` | 9090 | Readiness (members, queue depth, drain status) |
 | `/metrics` | 9090 | Prometheus metrics |
+| `/acknowledge_start` | 9090 | Internal: worker → master job handshake (POST) |
 
 ## Project Structure
 
@@ -172,35 +192,43 @@ Override with `--config <path>` or `TASCH_*` env vars.
 tasch/
 ├── cmd/tasch/main.go           # Single binary entry point
 ├── internal/
-│   ├── config/                 # Config YAML + TLS + validation
+│   ├── config/                 # Config YAML + TLS + env overrides
 │   ├── setup/                  # Interactive setup wizard
 │   ├── daemon/
-│   │   ├── master.go           # Scheduler, dispatch, gang-sched, retry, circuit breaker, GPU tracking
-│   │   ├── worker.go           # Executor, ZMQ reconnect, gRPC keepalive
-│   │   ├── metrics.go          # Prometheus metrics (9 metrics)
+│   │   ├── master.go           # Scheduler, dispatch, gang-sched, retry, circuit breaker, multi-resource tracking
+│   │   ├── worker.go           # Executor, ZMQ reconnect, gRPC keepalive, start acknowledgement
+│   │   ├── exec_unix.go        # Unix shell command builder (sh -c)
+│   │   ├── exec_windows.go     # Windows cmd.exe command builder (hidden window)
+│   │   ├── metrics.go          # Prometheus metrics
 │   │   └── stop.go             # PID-based stop with SIGKILL fallback
 │   ├── store/store.go          # BoltDB persistence (jobs, groups, fairshare, dead letters)
 │   └── cli/                    # CLI commands (jobs, nodes, failed)
 ├── pkg/
-│   ├── profiler/               # NVIDIA + AMD GPU detection
+│   ├── profiler/               # Cross-platform GPU detection
+│   │   ├── profiler.go         # Shared Host struct and profiling entry point
+│   │   ├── profiler_linux.go   # NVIDIA + AMD + Jetson Tegra detection
+│   │   ├── profiler_windows.go # WMI/PowerShell detection (NVIDIA, AMD, Intel, Qualcomm)
+│   │   ├── profiler_darwin.go  # Apple Metal + Unified Memory detection
+│   │   └── profiler_fallback.go# Stub for unsupported OS
 │   ├── scheduler/              # Min-heap queue, Job/JobGroup, fairshare, hooks
 │   ├── matchmaker/             # Google CEL evaluator
 │   ├── discovery/              # Memberlist gossip + EventHooks
 │   └── messaging/              # ZeroMQ PUB/SUB
 ├── api/v1/scheduler.proto      # 8 gRPC RPCs
+├── build.sh                    # Cross-platform build script (6 targets)
 ├── Makefile
-└── test.sh                     # 11-scenario integration test
+└── test.sh                     # 13-scenario integration test
 ```
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
-| [Setup Guide](docs/SETUP.md) | Installation, deployment, TLS, systemd |
+| [Setup Guide](docs/SETUP.md) | Installation, deployment, TLS, systemd, cross-platform |
 | [User Guide](docs/USER_GUIDE.md) | All commands, CEL syntax, training workflows |
 | [API Reference](docs/API.md) | 8 gRPC RPCs, Protobuf messages, ZMQ protocol |
 | [Architecture](docs/ARCHITECTURE.md) | System design, persistence, circuit breaker, GPU tracking |
-| [Development](docs/DEVELOPMENT.md) | Building, testing, code patterns |
+| [Development](docs/DEVELOPMENT.md) | Building, testing, cross-compilation, code patterns |
 | [Changelog](CHANGELOG.md) | Version history |
 
 ## License

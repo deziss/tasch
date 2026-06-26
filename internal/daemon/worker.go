@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
-	"os/exec"
 	"sync"
 	"time"
 
@@ -35,7 +35,11 @@ func subscribeWithReconnect(ctx context.Context, endpoint string) <-chan string 
 					return
 				}
 				log.Printf("[zmq] Reconnecting to %s in %s: %v", endpoint, backoff, err)
-				time.Sleep(backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return
+				}
 				if backoff < 30*time.Second {
 					backoff *= 2
 				}
@@ -60,19 +64,32 @@ func subscribeWithReconnect(ctx context.Context, endpoint string) <-chan string 
 	return ch
 }
 
-// reportWithRetry reports job result to master with timeout and one retry.
-func reportWithRetry(client pb.SchedulerServiceClient, req *pb.ReportResultRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err := client.ReportResult(ctx, req)
-	if err != nil {
-		log.Printf("[report] First attempt failed for job %s: %v, retrying...", req.JobId, err)
-		time.Sleep(2 * time.Second)
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		_, err = client.ReportResult(ctx2, req)
-		if err != nil {
-			log.Printf("[report] Retry failed for job %s: %v", req.JobId, err)
+// reportWithRetry reports job result to master with exponential backoff.
+func reportWithRetry(ctx context.Context, client pb.SchedulerServiceClient, req *pb.ReportResultRequest) {
+	backoff := 1 * time.Second
+	for {
+		reportCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := client.ReportResult(reportCtx, req)
+		cancel()
+		if err == nil {
+			return // Success
+		}
+
+		if ctx.Err() != nil {
+			log.Printf("[report] Worker shutdown, discarding result report for job %s: %v", req.JobId, err)
+			return
+		}
+
+		log.Printf("[report] Report failed for job %s: %v. Retrying in %v...", req.JobId, err, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			log.Printf("[report] Worker shutdown during backoff, discarding result report for job %s", req.JobId)
+			return
+		}
+
+		if backoff < 60*time.Second {
+			backoff *= 2
 		}
 	}
 }
@@ -167,6 +184,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 
 			case "execute", "":
 				go func(p messaging.DispatchPayload) {
+					acknowledgeStart(masterHost, cfg.Ports.Metrics, p.JobID)
 					var ctx context.Context
 					var cf context.CancelFunc
 					if p.WalltimeSeconds > 0 {
@@ -190,7 +208,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					startTime := time.Now()
 
 					var stdout, stderr bytes.Buffer
-					cmd := exec.CommandContext(ctx, "sh", "-c", p.Command)
+					cmd := prepareCommand(ctx, p.Command)
 					cmd.Stdout = &stdout
 					cmd.Stderr = &stderr
 
@@ -226,7 +244,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 						fmt.Printf("Job %s completed.\n", p.JobID)
 					}
 
-					reportWithRetry(masterClient, &pb.ReportResultRequest{
+					reportWithRetry(subCtx, masterClient, &pb.ReportResultRequest{
 						JobId: p.JobID, WorkerNode: nodeName, Success: success,
 						Output: stdout.String(), Error: errMsg,
 						StartTime: startTime.Unix(), EndTime: endTime.Unix(),
@@ -241,4 +259,23 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		grpcConn.Close()
 		disc.Shutdown()
 	}, nil
+}
+
+func acknowledgeStart(masterHost string, port int, jobID string) {
+	url := fmt.Sprintf("http://%s:%d/acknowledge_start", masterHost, port)
+	payload := map[string]string{"job_id": jobID}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(url, "application/json", bytes.NewBuffer(b))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }

@@ -27,8 +27,10 @@ type Job struct {
 	WalltimeSeconds int       `json:"walltime_seconds"` // Max execution time; 0 = no limit
 
 	// GPU and resource fields
-	GPUsRequired int               `json:"gpus_required"`
-	EnvVars      map[string]string `json:"env_vars,omitempty"`
+	GPUsRequired     int               `json:"gpus_required"`
+	CPUsRequired     int               `json:"cpus_required"`
+	MemoryRequiredMB int               `json:"memory_required_mb"`
+	EnvVars          map[string]string `json:"env_vars,omitempty"`
 
 	// Retry
 	MaxRetries int `json:"max_retries"`
@@ -58,6 +60,34 @@ type JobGroup struct {
 	MasterPort  int       `json:"master_port"`
 	State       string    `json:"state"` // PENDING, RUNNING, COMPLETED, FAILED
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+// Copy returns a deep copy of the Job.
+func (j *Job) Copy() *Job {
+	if j == nil {
+		return nil
+	}
+	copied := *j
+	if j.EnvVars != nil {
+		copied.EnvVars = make(map[string]string, len(j.EnvVars))
+		for k, v := range j.EnvVars {
+			copied.EnvVars[k] = v
+		}
+	}
+	return &copied
+}
+
+// Copy returns a deep copy of the JobGroup.
+func (g *JobGroup) Copy() *JobGroup {
+	if g == nil {
+		return nil
+	}
+	copied := *g
+	if g.JobIDs != nil {
+		copied.JobIDs = make([]string, len(g.JobIDs))
+		copy(copied.JobIDs, g.JobIDs)
+	}
+	return &copied
 }
 
 // JobQueue implements heap.Interface and holds Jobs.
@@ -142,7 +172,7 @@ func (gs *GlobalScheduler) Dequeue() *Job {
 	if gs.queue.Len() == 0 {
 		return nil
 	}
-	return heap.Pop(&gs.queue).(*Job)
+	return heap.Pop(&gs.queue).(*Job).Copy()
 }
 
 // Peek returns the highest priority job without removing it.
@@ -152,7 +182,7 @@ func (gs *GlobalScheduler) Peek() *Job {
 	if gs.queue.Len() == 0 {
 		return nil
 	}
-	return gs.queue[0]
+	return gs.queue[0].Copy()
 }
 
 // QueueLen returns the number of jobs currently in the queue.
@@ -168,9 +198,9 @@ func (gs *GlobalScheduler) Backfill(matchFunc func(job *Job) bool) *Job {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	for i, job := range gs.queue {
-		if matchFunc(job) {
+		if matchFunc(job.Copy()) {
 			heap.Remove(&gs.queue, i)
-			return job
+			return job.Copy()
 		}
 	}
 	return nil
@@ -187,7 +217,7 @@ func (gs *GlobalScheduler) RemoveByID(jobID string) *Job {
 	if job.index >= 0 && job.index < gs.queue.Len() {
 		heap.Remove(&gs.queue, job.index)
 	}
-	return job
+	return job.Copy()
 }
 
 // Cancel removes a job from the queue if QUEUED, or marks it CANCELLED if RUNNING.
@@ -209,17 +239,43 @@ func (gs *GlobalScheduler) Cancel(jobID string) (*Job, bool) {
 		job.EndTime = time.Now()
 		gs.mu.Unlock()
 		gs.notifyJobChange(job)
-		return job, true
+		return job.Copy(), true
 	case StateRunning:
 		job.State = StateCancelled
 		job.EndTime = time.Now()
 		gs.mu.Unlock()
 		gs.notifyJobChange(job)
-		return job, true
+		return job.Copy(), true
 	default:
 		gs.mu.Unlock()
-		return job, false
+		return job.Copy(), false
 	}
+}
+
+// Requeue resets the job's runtime fields and enqueues it again.
+func (gs *GlobalScheduler) Requeue(jobID string, incrementRetry bool) (*Job, error) {
+	gs.mu.Lock()
+	job, ok := gs.jobs[jobID]
+	if !ok {
+		gs.mu.Unlock()
+		return nil, fmt.Errorf("job not found")
+	}
+	if incrementRetry {
+		job.RetryCount++
+	}
+	job.State = StateQueued
+	job.WorkerNode = ""
+	job.StartTime = time.Time{}
+	job.EndTime = time.Time{}
+	job.Output = ""
+	job.Error = ""
+	job.index = -1 // Reset heap index
+
+	heap.Push(&gs.queue, job)
+	gs.mu.Unlock()
+
+	gs.notifyJobChange(job)
+	return job.Copy(), nil
 }
 
 func (gs *GlobalScheduler) notifyJobChange(job *Job) {
@@ -247,6 +303,23 @@ func (gs *GlobalScheduler) MarkRunning(jobID, workerNode string) {
 	if ok {
 		gs.notifyJobChange(job)
 	}
+}
+
+// RequeueRunningJob transitions a RUNNING job back to QUEUED state and pushes it back onto the heap.
+func (gs *GlobalScheduler) RequeueRunningJob(jobID string) (*Job, bool) {
+	gs.mu.Lock()
+	job, ok := gs.jobs[jobID]
+	if !ok || job.State != StateRunning {
+		gs.mu.Unlock()
+		return nil, false
+	}
+	job.State = StateQueued
+	job.WorkerNode = ""
+	job.StartTime = time.Time{}
+	heap.Push(&gs.queue, job)
+	gs.mu.Unlock()
+	gs.notifyJobChange(job)
+	return job.Copy(), true
 }
 
 // MarkCompleted transitions a job to COMPLETED or FAILED state.
@@ -278,7 +351,10 @@ func (gs *GlobalScheduler) GetJob(jobID string) (*Job, bool) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	job, ok := gs.jobs[jobID]
-	return job, ok
+	if !ok {
+		return nil, false
+	}
+	return job.Copy(), true
 }
 
 // ListJobs returns all tracked jobs, optionally filtered by state.
@@ -288,7 +364,7 @@ func (gs *GlobalScheduler) ListJobs(stateFilter string) []*Job {
 	var result []*Job
 	for _, job := range gs.jobs {
 		if stateFilter == "" || job.State == stateFilter {
-			result = append(result, job)
+			result = append(result, job.Copy())
 		}
 	}
 	return result
@@ -306,7 +382,7 @@ func (gs *GlobalScheduler) RunningJobsOnNode(nodeName string) []*Job {
 	var result []*Job
 	for _, job := range gs.jobs {
 		if job.State == StateRunning && job.WorkerNode == nodeName {
-			result = append(result, job)
+			result = append(result, job.Copy())
 		}
 	}
 	return result
@@ -327,7 +403,10 @@ func (gs *GlobalScheduler) GetGroup(groupID string) (*JobGroup, bool) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	g, ok := gs.groups[groupID]
-	return g, ok
+	if !ok {
+		return nil, false
+	}
+	return g.Copy(), true
 }
 
 // PendingGroups returns all groups in PENDING state.
@@ -337,7 +416,7 @@ func (gs *GlobalScheduler) PendingGroups() []*JobGroup {
 	var result []*JobGroup
 	for _, g := range gs.groups {
 		if g.State == "PENDING" {
-			result = append(result, g)
+			result = append(result, g.Copy())
 		}
 	}
 	return result

@@ -94,6 +94,23 @@ func (s *Store) DeleteJob(jobID string) error {
 	})
 }
 
+// GetJob retrieves a single job from the store by ID.
+func (s *Store) GetJob(jobID string) (*scheduler.Job, error) {
+	var job scheduler.Job
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketJobs)
+		v := b.Get([]byte(jobID))
+		if v == nil {
+			return fmt.Errorf("job not found")
+		}
+		return json.Unmarshal(v, &job)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
 // --- Groups ---
 
 // SaveGroup persists a job group.
@@ -182,4 +199,21 @@ func (s *Store) LoadDeadLetters() ([]*scheduler.Job, error) {
 		})
 	})
 	return jobs, err
+}
+
+// GetDeadLetter retrieves a single dead letter job from the store by ID.
+func (s *Store) GetDeadLetter(jobID string) (*scheduler.Job, error) {
+	var job scheduler.Job
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDeadLetters)
+		v := b.Get([]byte(jobID))
+		if v == nil {
+			return fmt.Errorf("dead letter not found")
+		}
+		return json.Unmarshal(v, &job)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
 }

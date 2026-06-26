@@ -3,13 +3,16 @@ package matchmaker
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/google/cel-go/cel"
 )
 
 // Evaluator compiles Job requirement expressions and evaluates them against worker advertisements.
 type Evaluator struct {
-	env *cel.Env
+	env   *cel.Env
+	mu    sync.RWMutex
+	cache map[string]cel.Program
 }
 
 // NewEvaluator sets up the Google CEL environment and variables for matchmaking.
@@ -22,19 +25,33 @@ func NewEvaluator() (*Evaluator, error) {
 		return nil, fmt.Errorf("failed to create CEL environment: %w", err)
 	}
 
-	return &Evaluator{env: env}, nil
+	return &Evaluator{
+		env:   env,
+		cache: make(map[string]cel.Program),
+	}, nil
 }
 
 // Match evaluates whether a specified job requirement expression is satisfied by the worker ClassAd.
 func (e *Evaluator) Match(expression string, adJSON string) (bool, error) {
-	ast, issues := e.env.Compile(expression)
-	if issues != nil && issues.Err() != nil {
-		return false, fmt.Errorf("compile error: %w", issues.Err())
-	}
+	e.mu.RLock()
+	prg, cached := e.cache[expression]
+	e.mu.RUnlock()
 
-	prg, err := e.env.Program(ast)
-	if err != nil {
-		return false, fmt.Errorf("program construction error: %w", err)
+	if !cached {
+		ast, issues := e.env.Compile(expression)
+		if issues != nil && issues.Err() != nil {
+			return false, fmt.Errorf("compile error: %w", issues.Err())
+		}
+
+		var err error
+		prg, err = e.env.Program(ast)
+		if err != nil {
+			return false, fmt.Errorf("program construction error: %w", err)
+		}
+
+		e.mu.Lock()
+		e.cache[expression] = prg
+		e.mu.Unlock()
 	}
 
 	var adMap map[string]interface{}

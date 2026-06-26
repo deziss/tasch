@@ -250,18 +250,37 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Short: "Show jobs that exhausted all retries (dead letter queue)",
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
-			// Dead letters are in local BoltDB — only works on master machine
+			client, conn := GetClient(cfg)
+			defer conn.Close()
+
+			resp, err := client.ListJobs(context.Background(), &pb.ListJobsRequest{StateFilter: "DEAD_LETTER"})
+			if err == nil {
+				if len(resp.Jobs) == 0 {
+					fmt.Println("No dead letter jobs found.")
+					return
+				}
+				fmt.Printf("--- Dead Letter Queue (%d jobs) ---\n", len(resp.Jobs))
+				fmt.Printf("%-14s %-12s %-10s %-15s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "COMMAND")
+				fmt.Println(strings.Repeat("-", 70))
+				for _, j := range resp.Jobs {
+					command := j.Command
+					if len(command) > 25 {
+						command = command[:22] + "..."
+					}
+					fmt.Printf("%-14s %-12s %-10s %-15s %s\n", j.JobId, j.State, j.User, j.WorkerNode, command)
+				}
+				return
+			}
+
+			// Fallback: local BoltDB
 			storeImport, err := store.Open(config.StorePath())
 			if err != nil {
 				// Fallback: list FAILED jobs from gRPC
-				client, conn := GetClient(cfg)
-				defer conn.Close()
 				listJobs(client, "FAILED")
 				return
 			}
 			defer storeImport.Close()
 
-			_ = cfg // used for fallback path
 			deadLetters, err := storeImport.LoadDeadLetters()
 			if err != nil || len(deadLetters) == 0 {
 				fmt.Println("No dead letter jobs found.")

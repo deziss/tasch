@@ -54,7 +54,8 @@ MASTER_PID=$!
 sleep 2
 
 echo "=== Starting worker 2 ==="
-$TASCH start --config="$WORKER2_CONFIG" > "$TEST_DIR/worker2.log" 2>&1 &
+mkdir -p "$TEST_DIR/home2"
+env HOME="$TEST_DIR/home2" $TASCH start --config="$WORKER2_CONFIG" > "$TEST_DIR/worker2.log" 2>&1 &
 WORKER2_PID=$!
 # Assign a dummy for cleanup
 WORKER1_PID=$$
@@ -86,6 +87,10 @@ NODES_OUT=$($CLI nodes)
 echo "$NODES_OUT"
 if ! echo "$NODES_OUT" | grep -q "node-1" || ! echo "$NODES_OUT" | grep -q "node-2"; then
     echo "ERROR: Both node-1 and node-2 must be active in the cluster!"
+    echo "--- MASTER LOG ---"
+    cat "$TEST_DIR/master.log"
+    echo "--- WORKER2 LOG ---"
+    cat "$TEST_DIR/worker2.log"
     exit 1
 fi
 

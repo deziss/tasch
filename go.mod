@@ -1,16 +1,22 @@
 module github.com/deziss/tasch
 
-go 1.24.2
+go 1.25.0
+
+// go 1.25 is required by google.golang.org/grpc v1.82.1, which is the first release without
+// GO-2026-6061 — a vulnerability in the HTTP/2 transport server the master runs. The toolchain
+// is pinned to a patch release without the 37 standard-library vulnerabilities that
+// govulncheck reports against go1.24.2.
+toolchain go1.25.13
 
 require (
-	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/google/cel-go v0.27.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.10.2
-	google.golang.org/grpc v1.80.0
+	go.etcd.io/bbolt v1.4.3
+	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -22,7 +28,6 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
-	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect
@@ -45,15 +50,14 @@ require (
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	go.etcd.io/bbolt v1.4.3 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
-	golang.org/x/mod v0.31.0 // indirect
-	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
-	golang.org/x/tools v0.40.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260120221211-b8f7ae30c516 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
+	golang.org/x/mod v0.35.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/tools v0.44.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 )

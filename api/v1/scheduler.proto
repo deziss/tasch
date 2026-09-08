@@ -28,6 +28,47 @@ service SchedulerService {
 
   // Worker reports job completion/failure back to master
   rpc ReportResult (ReportResultRequest) returns (ReportResultResponse);
+
+  // Worker confirms it has started a job.
+  //
+  // This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
+  // endpoint mutated scheduler state with no authentication, so a caller could forge
+  // acknowledgements for guessed job IDs and disarm the safety net that re-queues a dispatch
+  // nothing picked up. It also required the worker to guess the master's metrics port from its
+  // own config, so the handshake silently failed whenever the two differed.
+  rpc AcknowledgeStart (AcknowledgeStartRequest) returns (AcknowledgeStartResponse);
+
+  // Worker subscribes to the dispatches addressed to it.
+  //
+  // This replaces the ZeroMQ PUB/SUB bus, on which the master broadcast every job's command
+  // and environment variables in cleartext to every subscriber, with per-node targeting
+  // enforced only by the receiving worker. Anything that could reach the bus port could read
+  // every credential the cluster dispatched. This stream carries only the calling node's work
+  // and rides the same authenticated, optionally TLS-protected connection as everything else.
+  rpc WatchDispatch (WatchDispatchRequest) returns (stream DispatchMessage);
+}
+
+message AcknowledgeStartRequest {
+  string job_id = 1;
+  string worker_node = 2;
+  int64 attempt = 3;
+}
+
+message AcknowledgeStartResponse {
+  bool acknowledged = 1;
+}
+
+message WatchDispatchRequest {
+  string node_name = 1;
+}
+
+message DispatchMessage {
+  string job_id = 1;
+  string command = 2;
+  int32 walltime_seconds = 3;
+  string action = 4;                 // "execute" or "cancel"
+  map<string, string> env_vars = 5;
+  int64 attempt = 6;                 // Fencing token, echoed back in ReportResult
 }
 
 message SubmitJobRequest {
@@ -38,6 +79,14 @@ message SubmitJobRequest {
   int32 walltime_seconds = 5;           // Max execution time (0 = no limit)
   int32 gpus_required = 6;              // Number of GPUs needed (0 = none)
   map<string, string> env_vars = 7;     // Custom environment variables
+
+  // Explicit resource reservations. Distinct from cel_requirement, which filters which nodes
+  // are eligible: "ad.cpu_cores >= 4" asks for a node with at least 4 cores, it does not
+  // reserve 4 of them. These were previously scraped out of the CEL string with a regex, so
+  // any expression the regex did not literally match reserved nothing and the node was freely
+  // oversubscribed. 0 falls back to that regex for backward compatibility.
+  int32 cpus_required = 8;              // CPU cores to reserve (0 = infer from cel_requirement)
+  int32 memory_required_mb = 9;         // Memory to reserve in MB (0 = infer)
 }
 
 message SubmitJobResponse {
@@ -135,6 +184,12 @@ message ReportResultRequest {
   string error = 5;
   int64 start_time = 6;
   int64 end_time = 7;
+
+  // Dispatch attempt this result belongs to, echoed back from the dispatch payload. The master
+  // discards results from a stale attempt: without it, a late report from a previously
+  // dispatched worker released the allocation belonging to whichever node is running the job
+  // now, and no result could be told apart from a duplicate.
+  int64 attempt = 8;
 }
 
 message ReportResultResponse {

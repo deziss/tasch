@@ -11,7 +11,9 @@ import (
 	"github.com/deziss/tasch/internal/cli"
 	"github.com/deziss/tasch/internal/config"
 	"github.com/deziss/tasch/internal/daemon"
+	"github.com/deziss/tasch/internal/logging"
 	"github.com/deziss/tasch/internal/setup"
+	"github.com/deziss/tasch/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -28,7 +30,11 @@ Get started:
   tasch start     Start the scheduler
   tasch nodes     View cluster nodes
   tasch jobs      Manage jobs`,
+		Version: version.String(),
 	}
+	// Print the full build description rather than just the number, so a deployed node can be
+	// matched to a commit.
+	rootCmd.SetVersionTemplate("{{.Version}}\n")
 
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", config.DefaultPath(), "Config file path")
 
@@ -37,6 +43,8 @@ Get started:
 	rootCmd.AddCommand(stopCmd())
 	rootCmd.AddCommand(cli.NodesCmd(loadConfig))
 	rootCmd.AddCommand(cli.JobsCmd(loadConfig))
+	rootCmd.AddCommand(versionCmd())
+	rootCmd.AddCommand(configCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -49,7 +57,9 @@ func loadConfig() *config.Config {
 		// If no config exists, use defaults (allows `tasch jobs --config` override)
 		cfg = config.DefaultConfig()
 	}
-	cfg.ApplyEnvOverrides()
+	if err := cfg.ApplyEnvOverrides(); err != nil {
+		log.Fatalf("Invalid environment override: %v", err)
+	}
 	return cfg
 }
 
@@ -110,11 +120,25 @@ func startCmd() *cobra.Command {
 				os.Exit(1)
 			}
 
-			// Double-start prevention
-			if pidData, err := os.ReadFile(config.PidPath()); err == nil {
-				fmt.Printf("Tasch may already be running (PID file exists: %s). Stop with: tasch stop\n", string(pidData))
+			// Double-start prevention. Check that the PID is actually alive rather than trusting
+			// the file's existence — a stale file from a crash would otherwise block every
+			// subsequent start, and systemd would restart-loop into a failed unit.
+			if pid, running := daemon.IsRunning(); running {
+				fmt.Printf("Tasch is already running (PID %d). Stop with: tasch stop\n", pid)
 				os.Exit(1)
+			} else if pid != 0 {
+				fmt.Printf("Removing stale PID file for dead process %d.\n", pid)
+				daemon.RemovePID()
 			}
+
+			if err := cfg.Validate(); err != nil {
+				log.Fatalf("Invalid configuration: %v", err)
+			}
+
+			// Install the structured logger before anything starts, so every daemon event —
+			// including memberlist's and gRPC's, which use the standard log package — lands in
+			// one parseable stream.
+			logging.Setup(cfg.LogFormat, cfg.LogLevel)
 
 			fmt.Printf("Starting tasch (%s mode)...\n", cfg.Role)
 
@@ -137,7 +161,10 @@ func startCmd() *cobra.Command {
 				}
 			}
 
-			daemon.WritePID()
+			if err := daemon.WritePID(); err != nil {
+				// Without a PID file `tasch stop` cannot find this process.
+				log.Printf("Warning: could not write PID file: %v", err)
+			}
 
 			fmt.Println("Tasch is running. Stop with: tasch stop")
 
@@ -181,9 +208,75 @@ func stopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the running tasch instance",
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := daemon.StopDaemon(); err != nil {
+			cfg := loadConfig()
+			// Outlast the daemon's own drain, plus a margin for the final shutdown steps.
+			if err := daemon.StopDaemon(cfg.DrainTimeout + 15); err != nil {
 				log.Fatalf("%v", err)
 			}
 		},
 	}
+}
+
+// --- version ---
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the build version, commit, and toolchain",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println(version.String())
+		},
+	}
+}
+
+// --- config ---
+
+func configCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "Inspect and check the configuration",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "validate",
+		Short: "Check the config for errors without starting anything",
+		Run: func(cmd *cobra.Command, args []string) {
+			cfg, err := config.LoadConfig(configPath)
+			if err != nil {
+				fmt.Printf("Config error: %v\n", err)
+				os.Exit(1)
+			}
+			if err := cfg.ApplyEnvOverrides(); err != nil {
+				fmt.Printf("Environment override error: %v\n", err)
+				os.Exit(1)
+			}
+			if err := cfg.Validate(); err != nil {
+				fmt.Printf("Invalid configuration: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Config %s is valid.\n", configPath)
+			fmt.Printf("  role:    %s\n", cfg.Role)
+			fmt.Printf("  node:    %s\n", cfg.NodeName)
+			fmt.Printf("  master:  %s\n", cfg.GRPCAddr())
+
+			// Call out the settings that silently leave a cluster wide open.
+			if !cfg.Auth.Enabled {
+				fmt.Println("  WARNING: auth.enabled is false — any host that can reach the gRPC port")
+				fmt.Println("           can run arbitrary commands on every worker.")
+			}
+			if cfg.Gossip.EncryptionKey == "" && cfg.Gossip.KeyFile == "" {
+				fmt.Println("  WARNING: gossip.encryption_key is unset — any host can join the cluster")
+				fmt.Println("           and advertise fabricated resources to attract jobs.")
+			}
+			if !cfg.TLS.Enabled {
+				fmt.Println("  WARNING: tls.enabled is false — job commands and environment variables")
+				fmt.Println("           travel in cleartext.")
+			}
+			if cfg.MaxConcurrentJobs == 0 {
+				fmt.Println("  NOTE:    max_concurrent_jobs is unlimited; a burst of submissions can")
+				fmt.Println("           fork a worker to death.")
+			}
+		},
+	})
+	return cmd
 }

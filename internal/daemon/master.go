@@ -2,11 +2,16 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,11 +20,12 @@ import (
 	"time"
 
 	pb "github.com/deziss/tasch/api/v1"
+	"github.com/deziss/tasch/internal/auth"
 	"github.com/deziss/tasch/internal/config"
+	"github.com/deziss/tasch/internal/logging"
 	"github.com/deziss/tasch/internal/store"
 	"github.com/deziss/tasch/pkg/discovery"
 	"github.com/deziss/tasch/pkg/matchmaker"
-	"github.com/deziss/tasch/pkg/messaging"
 	"github.com/deziss/tasch/pkg/scheduler"
 	"github.com/google/uuid"
 	"github.com/hashicorp/memberlist"
@@ -42,7 +48,7 @@ type schedulerServer struct {
 	disc      *discovery.NodeDiscovery
 	queue     *scheduler.GlobalScheduler
 	eval      *matchmaker.Evaluator
-	pub       *messaging.ZMQPublisher
+	bus       *dispatchBus
 	fairshare *scheduler.FairshareCalculator
 	store     *store.Store
 	cfg       *config.Config
@@ -58,6 +64,9 @@ type schedulerServer struct {
 	// Dispatch acknowledgement tracking
 	dispatchPendingMu sync.Mutex
 	dispatchPending   map[string]time.Time
+
+	// lastTick is the UnixNano of the most recent scheduling cycle, read by /health.
+	lastTick atomic.Int64
 
 	logMu       sync.Mutex
 	logStore    map[string][]*pb.LogMessage
@@ -93,9 +102,10 @@ func (cb *circuitBreaker) RecordFailure(node string, jobID string) {
 	cb.lastFailedJob[node] = jobID
 
 	cb.failures[node]++
-	if cb.failures[node] >= 3 {
-		cb.blocked[node] = time.Now().Add(5 * time.Minute)
-		fmt.Printf("[circuit-breaker] Node %s blocked for 5 minutes (%d consecutive failures)\n", node, cb.failures[node])
+	if cb.failures[node] >= circuitBreakerThreshold {
+		cb.blocked[node] = time.Now().Add(circuitBreakerBlockDuration)
+		slog.Warn("node blocked by circuit breaker",
+			"node", node, "consecutive_failures", cb.failures[node], "duration", circuitBreakerBlockDuration)
 	}
 }
 
@@ -123,74 +133,267 @@ func (cb *circuitBreaker) IsBlocked(node string) bool {
 	return true
 }
 
+// jobIDBytes is the entropy in a job ID, in bytes.
+//
+// IDs were an 8-character UUID prefix — 32 bits, which by the birthday bound collides with
+// ~50% probability at only ~77k jobs, and nothing ever evicts a job from memory or from the
+// database. 64 bits pushes that to billions of jobs while keeping the ID short enough to
+// retype from a terminal. Enqueue rejects a duplicate outright, so a collision fails loudly
+// instead of overwriting another job.
+const jobIDBytes = 8
+
+// newJobID returns a random 16-character hex job identifier.
+func newJobID() string {
+	b := make([]byte, jobIDBytes)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is not recoverable here, and a predictable ID would be worse
+		// than none: fall back to a UUID, which is still unique.
+		return strings.ReplaceAll(uuid.New().String(), "-", "")[:jobIDBytes*2]
+	}
+	return hex.EncodeToString(b)
+}
+
+// Circuit breaker tuning. These were bare literals at the point of use.
+const (
+	circuitBreakerThreshold     = 3
+	circuitBreakerBlockDuration = 5 * time.Minute
+)
+
 // --- GPU Resource Tracker ---
 
+// allocation records what one job holds on one node, including the physical GPU indices it
+// was given.
+type allocation struct {
+	node    string
+	devices []int // physical GPU indices, e.g. [2 3]
+	cpus    int
+	memMB   int
+}
+
+// nodeState is the per-node view of what is currently in use.
+type nodeState struct {
+	devices map[int]string // GPU index → job ID holding it
+	cpus    int
+	memMB   int
+}
+
+// gpuTracker tracks which resources each running job holds.
+//
+// Allocations are keyed by job ID rather than accumulated into per-node counters. That is what
+// makes Release idempotent: releasing an unknown job is a no-op, so the several paths that can
+// each end a job — completion, cancel, walltime kill, gang-sibling cancel, dispatch timeout,
+// worker loss — can no longer double-release and drive a node's usage to zero while its jobs
+// are still running.
+//
+// GPUs are tracked as individual device indices, not a count, so two jobs on the same node
+// receive different physical devices.
 type gpuTracker struct {
-	mu            sync.Mutex
-	gpusAllocated map[string]int // node → GPUs currently in use
-	cpusAllocated map[string]int // node → CPUs currently in use
-	memAllocated  map[string]int // node → Memory currently in use (MB)
+	mu    sync.Mutex
+	nodes map[string]*nodeState
+	byJob map[string]*allocation
 }
 
 func newGPUTracker() *gpuTracker {
 	return &gpuTracker{
-		gpusAllocated: make(map[string]int),
-		cpusAllocated: make(map[string]int),
-		memAllocated:  make(map[string]int),
+		nodes: make(map[string]*nodeState),
+		byJob: make(map[string]*allocation),
 	}
 }
 
-func (gt *gpuTracker) Allocate(node string, gpus, cpus, memMB int) {
-	gt.mu.Lock()
-	defer gt.mu.Unlock()
-	gt.gpusAllocated[node] += gpus
-	gt.cpusAllocated[node] += cpus
-	gt.memAllocated[node] += memMB
+// nodeLocked returns the node's state, creating it if absent. Caller must hold gt.mu.
+func (gt *gpuTracker) nodeLocked(node string) *nodeState {
+	ns, ok := gt.nodes[node]
+	if !ok {
+		ns = &nodeState{devices: make(map[int]string)}
+		gt.nodes[node] = ns
+	}
+	return ns
 }
 
-func (gt *gpuTracker) Release(node string, gpus, cpus, memMB int) {
+// Allocate reserves resources for jobID on node and returns the GPU indices assigned to it.
+//
+// totalGPUs is the node's physical GPU count, needed to pick free device indices. Allocating a
+// job that already holds resources returns its existing devices unchanged, so a re-dispatch
+// cannot double-book. Returns false if the node cannot satisfy the GPU request.
+func (gt *gpuTracker) Allocate(node, jobID string, gpus, cpus, memMB, totalGPUs int) ([]int, bool) {
 	gt.mu.Lock()
 	defer gt.mu.Unlock()
-	gt.gpusAllocated[node] -= gpus
-	if gt.gpusAllocated[node] <= 0 {
-		delete(gt.gpusAllocated, node)
+
+	if existing, ok := gt.byJob[jobID]; ok {
+		return append([]int(nil), existing.devices...), true
 	}
-	gt.cpusAllocated[node] -= cpus
-	if gt.cpusAllocated[node] <= 0 {
-		delete(gt.cpusAllocated, node)
+
+	ns := gt.nodeLocked(node)
+
+	devices := make([]int, 0, gpus)
+	for idx := 0; idx < totalGPUs && len(devices) < gpus; idx++ {
+		if _, taken := ns.devices[idx]; !taken {
+			devices = append(devices, idx)
+		}
 	}
-	gt.memAllocated[node] -= memMB
-	if gt.memAllocated[node] <= 0 {
-		delete(gt.memAllocated, node)
+	if len(devices) < gpus {
+		if ns.cpus == 0 && ns.memMB == 0 && len(ns.devices) == 0 {
+			delete(gt.nodes, node)
+		}
+		return nil, false
 	}
+
+	for _, idx := range devices {
+		ns.devices[idx] = jobID
+	}
+	ns.cpus += cpus
+	ns.memMB += memMB
+
+	gt.byJob[jobID] = &allocation{node: node, devices: devices, cpus: cpus, memMB: memMB}
+	return append([]int(nil), devices...), true
+}
+
+// Release frees everything jobID holds. Releasing a job that holds nothing is a no-op, which
+// is what makes the several concurrent end-of-job paths safe to call unconditionally.
+func (gt *gpuTracker) Release(jobID string) {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+
+	alloc, ok := gt.byJob[jobID]
+	if !ok {
+		return
+	}
+	delete(gt.byJob, jobID)
+
+	ns, ok := gt.nodes[alloc.node]
+	if !ok {
+		return
+	}
+	for _, idx := range alloc.devices {
+		if holder, taken := ns.devices[idx]; taken && holder == jobID {
+			delete(ns.devices, idx)
+		}
+	}
+	ns.cpus -= alloc.cpus
+	if ns.cpus < 0 {
+		ns.cpus = 0
+	}
+	ns.memMB -= alloc.memMB
+	if ns.memMB < 0 {
+		ns.memMB = 0
+	}
+	if len(ns.devices) == 0 && ns.cpus == 0 && ns.memMB == 0 {
+		delete(gt.nodes, alloc.node)
+	}
+}
+
+// Reconcile drops allocations for jobs that are no longer running and books any running job
+// that has none, returning the counts of each.
+//
+// The tracker is in-memory only: a master restart resets it to empty while workers keep running
+// their jobs, so the new master believes every node is idle and oversubscribes it. Nothing
+// rebuilt the tracker from the authoritative set of running jobs, so any drift — from a restart
+// or from a missed release — was permanent.
+//
+// totalGPUs reports a node's physical GPU count, used when re-booking a job whose device
+// assignment was lost.
+func (gt *gpuTracker) Reconcile(running []*scheduler.Job, totalGPUs func(node string) int) (dropped, rebooked int) {
+	live := make(map[string]*scheduler.Job, len(running))
+	for _, job := range running {
+		if job.WorkerNode != "" {
+			live[job.ID] = job
+		}
+	}
+
+	gt.mu.Lock()
+	stale := make([]string, 0)
+	for jobID := range gt.byJob {
+		if _, ok := live[jobID]; !ok {
+			stale = append(stale, jobID)
+		}
+	}
+	missing := make([]*scheduler.Job, 0)
+	for jobID, job := range live {
+		if _, ok := gt.byJob[jobID]; !ok {
+			missing = append(missing, job)
+		}
+	}
+	gt.mu.Unlock()
+
+	for _, jobID := range stale {
+		gt.Release(jobID)
+		dropped++
+	}
+	for _, job := range missing {
+		if _, ok := gt.Allocate(job.WorkerNode, job.ID, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB, totalGPUs(job.WorkerNode)); ok {
+			rebooked++
+		}
+	}
+	return dropped, rebooked
+}
+
+// UsageByNode returns the number of GPUs currently allocated on each node.
+func (gt *gpuTracker) UsageByNode() map[string]int {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	out := make(map[string]int, len(gt.nodes))
+	for node, ns := range gt.nodes {
+		out[node] = len(ns.devices)
+	}
+	return out
+}
+
+// DevicesFor returns the GPU indices held by jobID, or nil.
+func (gt *gpuTracker) DevicesFor(jobID string) []int {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	alloc, ok := gt.byJob[jobID]
+	if !ok {
+		return nil
+	}
+	return append([]int(nil), alloc.devices...)
 }
 
 func (gt *gpuTracker) AvailableGPUs(node string, total int) int {
 	gt.mu.Lock()
 	defer gt.mu.Unlock()
-	return total - gt.gpusAllocated[node]
+	if ns, ok := gt.nodes[node]; ok {
+		return total - len(ns.devices)
+	}
+	return total
 }
 
 func (gt *gpuTracker) AvailableCPUs(node string, total int) int {
 	gt.mu.Lock()
 	defer gt.mu.Unlock()
-	return total - gt.cpusAllocated[node]
+	if ns, ok := gt.nodes[node]; ok {
+		return total - ns.cpus
+	}
+	return total
 }
 
 func (gt *gpuTracker) AvailableMemory(node string, total int) int {
 	gt.mu.Lock()
 	defer gt.mu.Unlock()
-	return total - gt.memAllocated[node]
+	if ns, ok := gt.nodes[node]; ok {
+		return total - ns.memMB
+	}
+	return total
 }
 
 // --- Log helpers ---
+
+// maxLogEntriesPerJob bounds the in-memory log ring for a single job. The log store was
+// unbounded and never pruned, so every line of every job ever submitted stayed in master
+// memory for the process lifetime.
+const maxLogEntriesPerJob = 500
 
 func (s *schedulerServer) appendLog(jobID, level, msg string) {
 	entry := &pb.LogMessage{
 		Timestamp: time.Now().UnixMilli(), Level: level, Message: msg, JobId: jobID,
 	}
 	s.logMu.Lock()
-	s.logStore[jobID] = append(s.logStore[jobID], entry)
+	entries := append(s.logStore[jobID], entry)
+	if len(entries) > maxLogEntriesPerJob {
+		// Keep the most recent window; the oldest lines are the least useful for diagnosis.
+		entries = entries[len(entries)-maxLogEntriesPerJob:]
+	}
+	s.logStore[jobID] = entries
 	s.logMu.Unlock()
 
 	s.subMu.Lock()
@@ -216,24 +419,93 @@ func (s *schedulerServer) WorkerStatus(ctx context.Context, req *pb.WorkerStatus
 	return &pb.WorkerStatusResponse{WorkerNodes: nodes}, nil
 }
 
+// Compiled once rather than on every submit.
+var (
+	celCPURegex = regexp.MustCompile(`cpu_cores\s*(?:>=|==|>)\s*(\d+)`)
+	celMemRegex = regexp.MustCompile(`total_memory_mb\s*(?:>=|==|>)\s*(\d+)`)
+)
+
+// schedulerStallThreshold is how long the dispatch loop may go without a tick before /health
+// reports the master unhealthy. The loop ticks once a second.
+const schedulerStallThreshold = 30 * time.Second
+
+// maxGroupNodes caps a distributed job's rank count. num_nodes was only clamped upward, so a
+// single request could create an unbounded number of jobs and log entries.
+const maxGroupNodes = 1024
+
+// principalUser returns the accounting identity for a request: the authenticated principal when
+// auth is on, otherwise the client-supplied name.
+func principalUser(ctx context.Context, requested string) string {
+	if p := auth.FromContext(ctx); p != auth.Anonymous {
+		return p.Name
+	}
+	if requested == "" {
+		return "anonymous"
+	}
+	return requested
+}
+
+// authorizeJob resolves a job and confirms the caller may act on it.
+//
+// A caller that is not the owner gets the same "not found" it would get for a job ID that does
+// not exist, so the API cannot be used to enumerate other principals' job IDs.
+func (s *schedulerServer) authorizeJob(ctx context.Context, jobID string) (*scheduler.Job, error) {
+	job, ok := s.queue.GetJob(jobID)
+	if !ok {
+		return nil, auth.ErrJobForbidden(jobID)
+	}
+	if !auth.CanAccessJob(auth.FromContext(ctx), job.User) {
+		return nil, auth.ErrJobForbidden(jobID)
+	}
+	return job, nil
+}
+
+// resourceRequest determines what a job reserves.
+//
+// Explicit values win. When a client sends none, the reservation falls back to scraping the
+// CEL requirement, which is how it always worked and is kept for older clients — but that
+// scrape only recognises a literal `cpu_cores >= N` shape, so `8 <= ad.cpu_cores`,
+// `ad.cpu_cores in [8,16]`, or any disjunction reserved nothing at all and let jobs pack onto
+// a node without limit. Prefer the explicit fields.
+func resourceRequest(celRequirement string, explicitCPUs, explicitMemMB int) (cpus, memMB int) {
+	inferredCPUs, inferredMem := parseCELRequirement(celRequirement)
+	cpus, memMB = explicitCPUs, explicitMemMB
+	if cpus <= 0 {
+		cpus = inferredCPUs
+	}
+	if memMB <= 0 {
+		memMB = inferredMem
+	}
+	return cpus, memMB
+}
+
 func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobRequest) (*pb.SubmitJobResponse, error) {
 	if s.draining.Load() {
 		return nil, status.Error(codes.Unavailable, "master is draining, not accepting new jobs")
 	}
 
-	jobID := uuid.New().String()[:8]
+	// Validate the requirement now. An expression that fails to compile used to be accepted,
+	// then silently failed to match anything on every scheduling cycle forever — the job sat
+	// QUEUED with no error, no log line, and no way for the submitter to find out why.
+	if err := s.eval.Validate(req.CelRequirement); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid cel_requirement: %v", err)
+	}
+
+	jobID := newJobID()
 	priority := int(req.Priority)
 	if priority == 0 {
 		priority = 10
 	}
-	user := req.User
-	if user == "" {
-		user = "anonymous"
-	}
+	// Identity comes from the authenticated principal, never from the request. The --user flag
+	// was unverified, so a client could evade its fairshare penalty by inventing a new name on
+	// every submit, inflate another user's usage, or blow up Prometheus label cardinality with
+	// unbounded values. When auth is disabled the principal is anonymous and the flag is still
+	// honoured, preserving the previous behaviour.
+	user := principalUser(ctx, req.User)
 	penalty := s.fairshare.CalculatePenalty(user)
 	effectivePriority := priority + penalty
 
-	cpus, mem := parseCELRequirement(req.CelRequirement)
+	cpus, mem := resourceRequest(req.CelRequirement, int(req.CpusRequired), int(req.MemoryRequiredMb))
 	job := &scheduler.Job{
 		ID: jobID, Requirement: req.CelRequirement, Command: req.Command,
 		SubmitTime: time.Now(), Priority: effectivePriority, User: user,
@@ -248,7 +520,7 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 
 	jobsSubmittedTotal.WithLabelValues(user).Inc()
 	s.appendLog(jobID, "INFO", fmt.Sprintf("Job queued | Priority: %d | GPUs: %d | Retries: %d | Expr: '%s'", effectivePriority, req.GpusRequired, s.cfg.MaxRetries, req.CelRequirement))
-	fmt.Printf("Job %s queued | User: %s, Priority: %d, GPUs: %d\n", jobID, user, effectivePriority, req.GpusRequired)
+	logging.Job(jobID).Info("queued", "user", user, "priority", effectivePriority, "gpus", req.GpusRequired)
 	return &pb.SubmitJobResponse{JobId: jobID, Status: "QUEUED"}, nil
 }
 
@@ -257,7 +529,11 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 		return nil, status.Error(codes.Unavailable, "master is draining")
 	}
 
-	groupID := "dj-" + uuid.New().String()[:8]
+	if err := s.eval.Validate(req.CelRequirement); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid cel_requirement: %v", err)
+	}
+
+	groupID := "dj-" + newJobID()
 	masterPort := int(req.MasterPort)
 	if masterPort == 0 {
 		masterPort = 29500
@@ -266,13 +542,17 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 	if priority == 0 {
 		priority = 10
 	}
-	user := req.User
-	if user == "" {
-		user = "anonymous"
-	}
+	user := principalUser(ctx, req.User)
+	// Distributed jobs bypassed fairshare entirely: the penalty was applied only on the single
+	// job path, so a penalised user could submit through this RPC and get full priority.
+	penalty := s.fairshare.CalculatePenalty(user)
+	priority += penalty
 	numNodes := int(req.NumNodes)
 	if numNodes < 1 {
 		numNodes = 1
+	}
+	if numNodes > maxGroupNodes {
+		return nil, status.Errorf(codes.InvalidArgument, "num_nodes %d exceeds the maximum of %d", numNodes, maxGroupNodes)
 	}
 	gpusPerNode := int(req.GpusPerNode)
 
@@ -289,7 +569,7 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 		envVars["LOCAL_RANK"] = "0"
 		envVars["NPROC_PER_NODE"] = strconv.Itoa(gpusPerNode)
 
-		cpus, mem := parseCELRequirement(req.CelRequirement)
+		cpus, mem := resourceRequest(req.CelRequirement, 0, 0)
 		job := &scheduler.Job{
 			ID: jobID, GroupID: groupID, Requirement: req.CelRequirement,
 			Command: req.Command, SubmitTime: time.Now(), Priority: priority,
@@ -310,11 +590,15 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 		CreatedAt: time.Now(),
 	})
 	jobsSubmittedTotal.WithLabelValues(user).Add(float64(numNodes))
-	fmt.Printf("Distributed job %s queued | %d nodes x %d GPUs | User: %s\n", groupID, numNodes, gpusPerNode, user)
+	slog.Info("distributed job queued",
+		"group_id", groupID, "nodes", numNodes, "gpus_per_node", gpusPerNode, "user", user)
 	return &pb.SubmitDistributedJobResponse{GroupId: groupID, JobIds: jobIDs, Status: "QUEUED"}, nil
 }
 
 func (s *schedulerServer) CancelJob(ctx context.Context, req *pb.CancelJobRequest) (*pb.CancelJobResponse, error) {
+	if _, err := s.authorizeJob(ctx, req.JobId); err != nil {
+		return nil, err
+	}
 	job, ok := s.queue.Cancel(req.JobId)
 	if !ok {
 		if job != nil {
@@ -324,23 +608,37 @@ func (s *schedulerServer) CancelJob(ctx context.Context, req *pb.CancelJobReques
 	}
 	// Release resource allocation
 	if job.WorkerNode != "" {
-		s.gpuTracker.Release(job.WorkerNode, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+		s.gpuTracker.Release(job.ID)
 	}
 	if job.WorkerNode != "" {
-		payload := messaging.DispatchPayload{TargetNode: job.WorkerNode, JobID: job.ID, Action: "cancel"}
-		b, _ := json.Marshal(payload)
-		s.pub.Send(string(b))
+		if err := s.bus.Send(job.WorkerNode, &pb.DispatchMessage{
+			JobId: job.ID, Action: "cancel", Attempt: job.Attempt,
+		}); err != nil {
+			// The cancel had no acknowledgement and no retry before either: a dropped one left
+			// the job running on the worker while the master had already released its
+			// resources. At least make the divergence visible.
+			logging.Job(job.ID).Error("could not deliver cancel", "node", job.WorkerNode, "error", err)
+			s.appendLog(job.ID, "WARN", fmt.Sprintf("Cancel could not be delivered to %s: %v", job.WorkerNode, err))
+		}
 	}
 	s.appendLog(req.JobId, "INFO", "Job cancelled by user")
 	return &pb.CancelJobResponse{JobId: req.JobId, Status: "CANCELLED", Message: "Cancelled"}, nil
 }
 
 func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatusRequest) (*pb.GetJobStatusResponse, error) {
+	caller := auth.FromContext(ctx)
+
 	job, ok := s.queue.GetJob(req.JobId)
+	if ok && !auth.CanAccessJob(caller, job.User) {
+		return nil, auth.ErrJobForbidden(req.JobId)
+	}
 	if !ok {
 		if s.store != nil {
 			// Fallback to active/completed jobs in store (e.g. after restart)
 			if j, err := s.store.GetJob(req.JobId); err == nil {
+				if !auth.CanAccessJob(caller, j.User) {
+					return nil, auth.ErrJobForbidden(req.JobId)
+				}
 				resp := &pb.GetJobStatusResponse{
 					JobId: j.ID, State: j.State, WorkerNode: j.WorkerNode,
 					Command: j.Command, Output: j.Output, Error: j.Error,
@@ -356,6 +654,9 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 			}
 			// Fallback to dead letters
 			if j, err := s.store.GetDeadLetter(req.JobId); err == nil {
+				if !auth.CanAccessJob(caller, j.User) {
+					return nil, auth.ErrJobForbidden(req.JobId)
+				}
 				resp := &pb.GetJobStatusResponse{
 					JobId: j.ID, State: j.State, WorkerNode: j.WorkerNode,
 					Command: j.Command, Output: j.Output, Error: j.Error,
@@ -387,6 +688,10 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 }
 
 func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest) (*pb.ListJobsResponse, error) {
+	// Listing is scoped to what the caller owns. An unscoped list handed out every job ID,
+	// user, and command in the cluster, which is both a disclosure and the enumeration step
+	// that made forging results and cancelling other people's work practical.
+	caller := auth.FromContext(ctx)
 	stateFilter := strings.ToUpper(req.StateFilter)
 	var infos []*pb.JobInfo
 
@@ -397,6 +702,9 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 				return nil, status.Errorf(codes.Internal, "failed to load dead letters: %v", err)
 			}
 			for _, j := range deadLetters {
+				if !auth.CanAccessJob(caller, j.User) {
+					continue
+				}
 				infos = append(infos, &pb.JobInfo{
 					JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
 					WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
@@ -409,6 +717,9 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 
 	jobs := s.queue.ListJobs(stateFilter)
 	for _, j := range jobs {
+		if !auth.CanAccessJob(caller, j.User) {
+			continue
+		}
 		infos = append(infos, &pb.JobInfo{
 			JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
 			WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
@@ -419,6 +730,12 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 }
 
 func (s *schedulerServer) StreamLogs(req *pb.LogStreamRequest, stream pb.SchedulerService_StreamLogsServer) error {
+	// Logs carry job output, which routinely contains tokens and presigned URLs, so they follow
+	// the same ownership rule as the job itself.
+	if _, err := s.authorizeJob(stream.Context(), req.JobId); err != nil {
+		return err
+	}
+
 	jobID := req.JobId
 	s.logMu.Lock()
 	for _, entry := range s.logStore[jobID] {
@@ -459,30 +776,132 @@ func (s *schedulerServer) StreamLogs(req *pb.LogStreamRequest, stream pb.Schedul
 	}
 }
 
-func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResultRequest) (*pb.ReportResultResponse, error) {
-	s.queue.MarkCompleted(req.JobId, req.Success, req.Output, req.Error)
+// isUserError reports whether an error came from the job itself rather than the node running
+// it. These must not count against a node's circuit breaker.
+func isUserError(errMsg string) bool {
+	return strings.HasPrefix(errMsg, "exit status") ||
+		errMsg == "cancelled" ||
+		strings.Contains(errMsg, "walltime exceeded")
+}
 
+// isRetryable reports whether a failed job should be re-run.
+//
+// Deliberate stops are never retried: a cancelled job must stay cancelled, and a job killed
+// for exceeding its walltime will simply exceed it again.
+func isRetryable(job *scheduler.Job, errMsg string) bool {
+	if job.State == scheduler.StateCancelled {
+		return false
+	}
+	if errMsg == "cancelled" || strings.Contains(errMsg, "walltime exceeded") {
+		return false
+	}
+	return true
+}
+
+// AcknowledgeStart records that a worker has begun a job, disarming the dispatch-timeout
+// re-queue for it.
+//
+// This is authenticated and authorized like every other RPC, and the worker no longer has to
+// know the master's metrics port to reach it.
+func (s *schedulerServer) AcknowledgeStart(ctx context.Context, req *pb.AcknowledgeStartRequest) (*pb.AcknowledgeStartResponse, error) {
+	if req.JobId == "" {
+		return nil, status.Error(codes.InvalidArgument, "job_id is required")
+	}
+
+	s.dispatchPendingMu.Lock()
+	_, pending := s.dispatchPending[req.JobId]
+	if pending {
+		delete(s.dispatchPending, req.JobId)
+	}
+	s.dispatchPendingMu.Unlock()
+
+	if pending {
+		logging.Job(req.JobId).Debug("start acknowledged", "worker", req.WorkerNode, "attempt", req.Attempt)
+	}
+	// Report success either way: a job that already reported its result, or was cancelled, has
+	// no pending entry left, and that is not the worker's problem to retry.
+	return &pb.AcknowledgeStartResponse{Acknowledged: true}, nil
+}
+
+// WatchDispatch streams the dispatches addressed to one node.
+//
+// Each worker gets only its own work. The bus this replaces published every job to every
+// subscriber and relied on the worker to discard what was not for it, so the dispatch socket
+// handed every job's command and environment variables — API tokens included — to anything
+// that could connect to it.
+func (s *schedulerServer) WatchDispatch(req *pb.WatchDispatchRequest, stream pb.SchedulerService_WatchDispatchServer) error {
+	nodeName := req.NodeName
+	if nodeName == "" {
+		return status.Error(codes.InvalidArgument, "node_name is required")
+	}
+
+	queue, unsubscribe := s.bus.Subscribe(nodeName)
+	defer unsubscribe()
+
+	slog.Info("worker dispatch stream connected", "node", nodeName)
+	defer slog.Info("worker dispatch stream disconnected", "node", nodeName)
+
+	for {
+		select {
+		case msg, ok := <-queue:
+			if !ok {
+				return nil // the master is shutting down
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case <-s.ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResultRequest) (*pb.ReportResultResponse, error) {
+	// Look the job up before recording anything: a result from a superseded dispatch must not
+	// change state at all.
 	job, ok := s.queue.GetJob(req.JobId)
 	if !ok {
 		return &pb.ReportResultResponse{Acknowledged: true}, nil
 	}
 
-	// Release resource allocation
-	if job.WorkerNode != "" {
-		s.gpuTracker.Release(job.WorkerNode, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+	// Fencing check. A worker that lost its acknowledgement keeps running the job while the
+	// master re-dispatches it elsewhere; when the first worker eventually reports, its result
+	// is for an attempt that no longer owns the job. Acting on it released the *current*
+	// node's allocation and overwrote the live result.
+	//
+	// Attempt 0 means a worker predating the field, so it is accepted for compatibility.
+	if req.Attempt != 0 && job.Attempt != 0 && req.Attempt < job.Attempt {
+		staleResultsTotal.Inc()
+		logging.Job(req.JobId).Warn("ignoring stale result from a superseded dispatch",
+			"reported_attempt", req.Attempt, "current_attempt", job.Attempt)
+		return &pb.ReportResultResponse{Acknowledged: true}, nil
 	}
 
-	// Circuit breaker tracking
+	// The job reported in, so it is no longer awaiting a start handshake. Without this the
+	// entry leaked for any job that finished before its acknowledgement was processed.
+	s.dispatchPendingMu.Lock()
+	delete(s.dispatchPending, req.JobId)
+	s.dispatchPendingMu.Unlock()
+
+	s.queue.MarkCompleted(req.JobId, req.Success, req.Output, req.Error)
+
+	// Re-read so the state below reflects the completion just recorded.
+	if updated, stillThere := s.queue.GetJob(req.JobId); stillThere {
+		job = updated
+	}
+
+	// Release resource allocation. Release is keyed by job ID and idempotent, so the several
+	// paths that can end a job cannot compound.
+	s.gpuTracker.Release(job.ID)
+
+	// Circuit breaker tracking. A failure the job itself caused says nothing about the node's
+	// health, so it must not count toward blocking that node.
 	if req.Success {
 		s.cb.RecordSuccess(req.WorkerNode)
-	} else {
-		// Only record failure if it is an infrastructure issue (not exit status, cancelled, or walltime)
-		isUserError := strings.HasPrefix(req.Error, "exit status") ||
-			req.Error == "cancelled" ||
-			strings.Contains(req.Error, "walltime exceeded")
-		if !isUserError {
-			s.cb.RecordFailure(req.WorkerNode, req.JobId)
-		}
+	} else if !isUserError(req.Error) {
+		s.cb.RecordFailure(req.WorkerNode, req.JobId)
 	}
 
 	// Fairshare usage recording
@@ -491,18 +910,24 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 		s.fairshare.RecordUsage(job.User, dur)
 	}
 
-	// Job retry logic
-	if !req.Success && job.GroupID == "" && job.RetryCount < job.MaxRetries {
+	// Job retry logic.
+	//
+	// A cancellation or a walltime kill is a deliberate stop, not a transient failure: retrying
+	// it re-runs a job the user explicitly killed, and in the walltime case burns the whole
+	// limit again on each attempt. Only the circuit breaker used to consult this distinction.
+	if !req.Success && job.GroupID == "" && job.RetryCount < job.MaxRetries && isRetryable(job, req.Error) {
 		nextRetryCount := job.RetryCount + 1
 		backoff := time.Duration(nextRetryCount*nextRetryCount*10) * time.Second
 		s.appendLog(req.JobId, "WARN", fmt.Sprintf("Retry %d/%d in %s", nextRetryCount, job.MaxRetries, backoff))
-		fmt.Printf("Job %s failed, retrying %d/%d in %s\n", req.JobId, nextRetryCount, job.MaxRetries, backoff)
+		retriesTotal.Inc()
+		logging.Job(req.JobId).Warn("scheduling retry",
+			"attempt", nextRetryCount, "max_retries", job.MaxRetries, "backoff", backoff, "error", req.Error)
 		go func(jobID string) {
 			select {
 			case <-time.After(backoff):
 				_, err := s.queue.Requeue(jobID, true)
 				if err != nil {
-					log.Printf("[retry] Failed to requeue job %s: %v", jobID, err)
+					logging.Job(jobID).Error("failed to requeue for retry", "error", err)
 				}
 			case <-s.ctx.Done():
 				// Master is shutting down
@@ -513,7 +938,10 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 
 	// Dead letter queue for exhausted retries
 	if !req.Success && job.RetryCount >= job.MaxRetries && job.MaxRetries > 0 && s.store != nil {
-		s.store.SaveDeadLetter(job)
+		deadLettersTotal.Inc()
+		if err := s.store.SaveDeadLetter(job); err != nil {
+			logging.Job(job.ID).Error("could not record dead letter", "error", err)
+		}
 		s.appendLog(req.JobId, "ERROR", fmt.Sprintf("All %d retries exhausted, moved to dead letter queue", job.MaxRetries))
 	}
 
@@ -535,7 +963,7 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 	if req.Error != "" {
 		s.appendLog(req.JobId, "ERROR", req.Error)
 	}
-	fmt.Printf("Job %s result: %s (worker: %s)\n", req.JobId, resultStatus, req.WorkerNode)
+	logging.Job(req.JobId).Info("result recorded", "status", resultStatus, "worker", req.WorkerNode, "duration_seconds", dur)
 	return &pb.ReportResultResponse{Acknowledged: true}, nil
 }
 
@@ -545,7 +973,7 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 		return
 	}
 	if !success {
-		fmt.Printf("[group] Rank %s failed in group %s — cancelling siblings\n", completedJobID, groupID)
+		slog.Warn("gang rank failed, cancelling siblings", "group_id", groupID, "job_id", completedJobID)
 		for _, jid := range group.JobIDs {
 			if jid == completedJobID {
 				continue
@@ -553,12 +981,14 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 			job, jOk := s.queue.Cancel(jid)
 			if jOk && job != nil {
 				if job.WorkerNode != "" {
-					s.gpuTracker.Release(job.WorkerNode, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+					s.gpuTracker.Release(job.ID)
 				}
 				if job.WorkerNode != "" {
-					payload := messaging.DispatchPayload{TargetNode: job.WorkerNode, JobID: job.ID, Action: "cancel"}
-					b, _ := json.Marshal(payload)
-					s.pub.Send(string(b))
+					if err := s.bus.Send(job.WorkerNode, &pb.DispatchMessage{
+						JobId: job.ID, Action: "cancel", Attempt: job.Attempt,
+					}); err != nil {
+						logging.Job(job.ID).Error("could not deliver cancel", "node", job.WorkerNode, "error", err)
+					}
 				}
 			}
 		}
@@ -578,7 +1008,7 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 	}
 	if allDone {
 		s.queue.SetGroupState(groupID, "COMPLETED")
-		fmt.Printf("[group] All ranks completed for group %s\n", groupID)
+		slog.Info("all gang ranks completed", "group_id", groupID)
 	}
 }
 
@@ -586,31 +1016,13 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 
 const gangTimeout = 5 * time.Minute
 
-func nodeGPUCount(memberMeta []byte) int {
-	var ad map[string]interface{}
-	if json.Unmarshal(memberMeta, &ad) != nil {
-		return 0
-	}
-	count, _ := ad["gpu_count"].(float64)
-	return int(count)
-}
-
-func nodeMatchesGPU(memberMeta []byte, gpusRequired int) bool {
-	if gpusRequired <= 0 {
-		return true
-	}
-	return nodeGPUCount(memberMeta) >= gpusRequired
-}
-
 func parseCELRequirement(celStr string) (cpus int, mem int) {
 	// Look for cpu_cores >= X or cpu_cores == X or cpu_cores > X
-	cpuRegex := regexp.MustCompile(`cpu_cores\s*(?:>=|==|>)\s*(\d+)`)
-	if matches := cpuRegex.FindStringSubmatch(celStr); len(matches) > 1 {
+	if matches := celCPURegex.FindStringSubmatch(celStr); len(matches) > 1 {
 		cpus, _ = strconv.Atoi(matches[1])
 	}
 	// Look for total_memory_mb >= X or total_memory_mb == X or total_memory_mb > X
-	memRegex := regexp.MustCompile(`total_memory_mb\s*(?:>=|==|>)\s*(\d+)`)
-	if matches := memRegex.FindStringSubmatch(celStr); len(matches) > 1 {
+	if matches := celMemRegex.FindStringSubmatch(celStr); len(matches) > 1 {
 		mem, _ = strconv.Atoi(matches[1])
 	}
 	return
@@ -622,82 +1034,145 @@ func dispatchLoop(ctx context.Context, srv *schedulerServer) {
 	for {
 		select {
 		case <-ticker.C:
-			queueDepth.Set(float64(srv.queue.QueueLen()))
-			runningJobs.Set(float64(len(srv.queue.RunningJobs())))
-			clusterNodes.Set(float64(len(srv.disc.Members())))
-			groupsPending.Set(float64(len(srv.queue.PendingGroups())))
-
-			// Phase 0: Gang scheduling with timeout
-			for _, group := range srv.queue.PendingGroups() {
-				if !group.CreatedAt.IsZero() && time.Since(group.CreatedAt) > gangTimeout {
-					fmt.Printf("[gang] Group %s timed out — failing all ranks\n", group.GroupID)
-					for _, jid := range group.JobIDs {
-						srv.queue.Cancel(jid)
-						srv.appendLog(jid, "ERROR", fmt.Sprintf("Gang group timed out waiting for %d nodes", group.NumNodes))
-					}
-					srv.queue.SetGroupState(group.GroupID, "FAILED")
-					continue
-				}
-				tryDispatchGroup(srv, group)
-			}
-
-			// Phase 1: Direct match for top-priority single job
-			topJob := srv.queue.Peek()
-			if topJob == nil {
-				continue
-			}
-			if topJob.GroupID != "" {
-				continue
-			}
-
-			members := srv.disc.Members()
-			var selectedNode string
-			for _, member := range members {
-				if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
-					continue
-				}
-				if !canDispatchResources(srv, member, topJob) {
-					continue
-				}
-				match, evalErr := srv.eval.Match(topJob.Requirement, string(member.Meta))
-				if evalErr == nil && match {
-					selectedNode = member.Name
-					break
-				}
-			}
-			if selectedNode != "" {
-				job := srv.queue.Dequeue()
-				if job != nil {
-					dispatchJob(srv, job, selectedNode)
-				}
-				continue
-			}
-
-			// Phase 2: Backfill
-			for _, member := range members {
-				if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
-					continue
-				}
-				memberMeta := string(member.Meta)
-				memberName := member.Name
-				backfillJob := srv.queue.Backfill(func(j *scheduler.Job) bool {
-					if j.GroupID != "" {
-						return false
-					}
-					if !canDispatchResources(srv, member, j) {
-						return false
-					}
-					match, err := srv.eval.Match(j.Requirement, memberMeta)
-					return err == nil && match
-				})
-				if backfillJob != nil {
-					fmt.Printf("[backfill] Job %s backfilled onto %s\n", backfillJob.ID, memberName)
-					srv.appendLog(backfillJob.ID, "INFO", fmt.Sprintf("Backfilled onto %s", memberName))
-					dispatchJob(srv, backfillJob, memberName)
-					break
-				}
-			}
+			schedulingTick(srv)
 		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// schedulingTick runs one scheduling cycle: gang groups, then the highest-priority single
+// job, then backfill.
+//
+// Each phase is its own function on purpose. The phases previously shared one switch arm, and
+// the early `continue`s meant to skip only the direct-match phase skipped backfill along with
+// it — so a gang rank sitting at the head of the heap stopped the entire cluster from
+// dispatching, permanently if the rank was orphaned by a restart.
+func schedulingTick(srv *schedulerServer) {
+	tickStart := time.Now()
+	defer func() { schedulingTickDuration.Observe(time.Since(tickStart).Seconds()) }()
+
+	srv.lastTick.Store(time.Now().UnixNano())
+	updateSchedulerGauges(srv)
+	dispatchGangGroups(srv)
+
+	members := srv.disc.Members()
+
+	// One dispatch per tick: if the top job went out, leave backfill for the next cycle so a
+	// full queue cannot starve the head.
+	if dispatchTopJob(srv, members) {
+		return
+	}
+	backfillOntoIdleNodes(srv, members)
+}
+
+func updateSchedulerGauges(srv *schedulerServer) {
+	queueDepth.Set(float64(srv.queue.QueueLen()))
+	runningJobs.Set(float64(len(srv.queue.RunningJobs())))
+	clusterNodes.Set(float64(len(srv.disc.Members())))
+	groupsPending.Set(float64(len(srv.queue.PendingGroups())))
+
+	// Per-state counts, so a backlog of failures is visible without querying the API.
+	counts := map[string]int{
+		scheduler.StateQueued:    0,
+		scheduler.StateRunning:   0,
+		scheduler.StateCompleted: 0,
+		scheduler.StateFailed:    0,
+		scheduler.StateCancelled: 0,
+	}
+	for _, job := range srv.queue.ListJobs("") {
+		counts[job.State]++
+	}
+	for state, n := range counts {
+		jobsByState.WithLabelValues(state).Set(float64(n))
+	}
+
+	// Export what the tracker actually holds, so "the cluster is full" can be distinguished
+	// from "the scheduler stopped placing work".
+	for node, used := range srv.gpuTracker.UsageByNode() {
+		gpusAllocated.WithLabelValues(node).Set(float64(used))
+	}
+}
+
+// dispatchGangGroups attempts to co-schedule every pending group, failing those past the
+// gang timeout.
+func dispatchGangGroups(srv *schedulerServer) {
+	for _, group := range srv.queue.PendingGroups() {
+		if !group.CreatedAt.IsZero() && time.Since(group.CreatedAt) > gangTimeout {
+			slog.Warn("gang group timed out, failing all ranks",
+				"group_id", group.GroupID, "num_nodes", group.NumNodes, "timeout", gangTimeout)
+			for _, jid := range group.JobIDs {
+				srv.queue.Cancel(jid)
+				srv.appendLog(jid, "ERROR", fmt.Sprintf("Gang group timed out waiting for %d nodes", group.NumNodes))
+			}
+			srv.queue.SetGroupState(group.GroupID, "FAILED")
+			continue
+		}
+		tryDispatchGroup(srv, group)
+	}
+}
+
+// dispatchTopJob tries to place the highest-priority single job, reporting whether it
+// dispatched one.
+//
+// A gang rank at the head is not dispatchable here — it belongs to dispatchGangGroups — so
+// this reports false and lets backfill proceed rather than stalling the cycle.
+func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
+	var selectedNode string
+
+	// Match and pop atomically. Matching the head, then popping under a separate lock, let a
+	// concurrent submit or cancel change the head in between — so the job that got dispatched
+	// was not the job that had been checked against the node's resources and CEL requirement.
+	job := srv.queue.DequeueIf(func(topJob *scheduler.Job) bool {
+		selectedNode = ""
+		if topJob.GroupID != "" {
+			return false
+		}
+		for _, member := range members {
+			if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
+				continue
+			}
+			if !canDispatchResources(srv, member, topJob) {
+				continue
+			}
+			match, evalErr := srv.eval.Match(topJob.Requirement, string(member.Meta))
+			if evalErr == nil && match {
+				selectedNode = member.Name
+				return true
+			}
+		}
+		return false
+	})
+	if job == nil {
+		return false
+	}
+
+	dispatchJob(srv, job, selectedNode)
+	return true
+}
+
+// backfillOntoIdleNodes places a lower-priority job on the first node that can take one.
+func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
+	for _, member := range members {
+		if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
+			continue
+		}
+		memberMeta := string(member.Meta)
+		memberName := member.Name
+		backfillJob := srv.queue.Backfill(func(j *scheduler.Job) bool {
+			if j.GroupID != "" {
+				return false
+			}
+			if !canDispatchResources(srv, member, j) {
+				return false
+			}
+			match, err := srv.eval.Match(j.Requirement, memberMeta)
+			return err == nil && match
+		})
+		if backfillJob != nil {
+			logging.Job(backfillJob.ID).Info("backfilled", "node", memberName)
+			srv.appendLog(backfillJob.ID, "INFO", fmt.Sprintf("Backfilled onto %s", memberName))
+			dispatchJob(srv, backfillJob, memberName)
 			return
 		}
 	}
@@ -707,7 +1182,12 @@ func dispatchLoop(ctx context.Context, srv *schedulerServer) {
 func canDispatchResources(srv *schedulerServer, member *memberlist.Node, job *scheduler.Job) bool {
 	var ad map[string]interface{}
 	if len(member.Meta) > 0 {
-		json.Unmarshal(member.Meta, &ad)
+		if err := json.Unmarshal(member.Meta, &ad); err != nil {
+			// A node advertising unparseable metadata must not be treated as a node with
+			// unlimited free resources, which is what an all-zero ad amounted to.
+			slog.Warn("ignoring node with unparseable class ad", "node", member.Name, "error", err)
+			return false
+		}
 	}
 
 	// 1. Check GPUs
@@ -785,7 +1265,7 @@ func tryDispatchGroup(srv *schedulerServer, group *scheduler.JobGroup) {
 	}
 
 	rank0Addr := matchedMembers[0].Addr.String()
-	fmt.Printf("[gang] Dispatching group %s: %d nodes, rank-0 at %s\n", group.GroupID, group.NumNodes, rank0Addr)
+	slog.Info("dispatching gang group", "group_id", group.GroupID, "nodes", group.NumNodes, "rank0_addr", rank0Addr)
 
 	for i, job := range queuedJobs {
 		job.EnvVars["MASTER_ADDR"] = rank0Addr
@@ -796,16 +1276,146 @@ func tryDispatchGroup(srv *schedulerServer, group *scheduler.JobGroup) {
 	srv.queue.SetGroupState(group.GroupID, "RUNNING")
 }
 
+// maintenanceLoop periodically reconciles resource accounting and releases memory that would
+// otherwise grow for the lifetime of the process.
+func maintenanceLoop(ctx context.Context, srv *schedulerServer) {
+	const (
+		interval       = 60 * time.Second
+		terminalMaxAge = 30 * time.Minute
+	)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			running := srv.queue.RunningJobs()
+			dropped, rebooked := srv.gpuTracker.Reconcile(running, func(node string) int {
+				_, total := nodeGPUInfo(srv, node)
+				return total
+			})
+			if dropped > 0 || rebooked > 0 {
+				reconcileCorrectionsTotal.WithLabelValues("dropped").Add(float64(dropped))
+				reconcileCorrectionsTotal.WithLabelValues("rebooked").Add(float64(rebooked))
+				slog.Info("resource accounting corrected", "dropped", dropped, "rebooked", rebooked)
+			}
+
+			if pruned := srv.queue.PruneTerminal(terminalMaxAge); pruned > 0 {
+				srv.pruneLogs()
+				slog.Info("released finished jobs from memory", "count", pruned)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// pruneLogs drops log buffers for jobs the scheduler no longer holds in memory.
+func (s *schedulerServer) pruneLogs() {
+	resident := make(map[string]bool)
+	for _, job := range s.queue.ListJobs("") {
+		resident[job.ID] = true
+	}
+
+	s.logMu.Lock()
+	for jobID := range s.logStore {
+		if !resident[jobID] {
+			delete(s.logStore, jobID)
+		}
+	}
+	s.logMu.Unlock()
+}
+
+// nodeGPUInfo reads a node's advertised GPU vendor and physical GPU count from its ClassAd.
+func nodeGPUInfo(srv *schedulerServer, nodeName string) (vendor string, totalGPUs int) {
+	for _, member := range srv.disc.Members() {
+		if member.Name != nodeName || len(member.Meta) == 0 {
+			continue
+		}
+		var ad map[string]interface{}
+		if json.Unmarshal(member.Meta, &ad) == nil {
+			if v, ok := ad["gpu_vendor"].(string); ok {
+				vendor = v
+			}
+			if c, ok := ad["gpu_count"].(float64); ok {
+				totalGPUs = int(c)
+			}
+		}
+		return vendor, totalGPUs
+	}
+	return "", 0
+}
+
+// setGPUVisibility pins the job to the physical GPU indices it was allocated, using the
+// selector variable its vendor understands.
+//
+// The indices come from the tracker, not from a 0..N-1 range: two single-GPU jobs on the same
+// node must see different devices, or they land on GPU 0 together and OOM each other while the
+// rest of the node sits idle.
+//
+// A value the submitter set explicitly always wins, so an operator can still override pinning.
+func setGPUVisibility(envVars map[string]string, vendor string, devices []int) {
+	if len(devices) == 0 {
+		return
+	}
+
+	ids := make([]string, len(devices))
+	for i, d := range devices {
+		ids[i] = strconv.Itoa(d)
+	}
+	list := strings.Join(ids, ",")
+
+	setIfAbsent := func(key, value string) {
+		if _, exists := envVars[key]; !exists {
+			envVars[key] = value
+		}
+	}
+
+	switch vendor {
+	case "intel":
+		selector := "level_zero:" + list
+		setIfAbsent("ONEAPI_DEVICE_SELECTOR", selector)
+		setIfAbsent("SYCL_DEVICE_FILTER", selector)
+	case "apple":
+		setIfAbsent("METAL_DEVICE_INDEX", list)
+	case "amd":
+		setIfAbsent("HIP_VISIBLE_DEVICES", list)
+	default:
+		setIfAbsent("CUDA_VISIBLE_DEVICES", list)
+	}
+}
+
 func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 	dispatchStart := time.Now()
-	srv.queue.MarkRunning(job.ID, nodeName)
+	attempt, runnable := srv.queue.MarkRunning(job.ID, nodeName)
+	if !runnable {
+		// Cancelled between leaving the queue and being dispatched. Sending it now would run a
+		// job the user was already told was cancelled.
+		logging.Job(job.ID).Info("no longer runnable, skipping dispatch")
+		return
+	}
 
 	srv.dispatchPendingMu.Lock()
 	srv.dispatchPending[job.ID] = time.Now()
 	srv.dispatchPendingMu.Unlock()
 
-	// Track resource allocation
-	srv.gpuTracker.Allocate(nodeName, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+	vendor, totalGPUs := nodeGPUInfo(srv, nodeName)
+
+	// Track resource allocation and learn which physical GPUs this job may use.
+	devices, ok := srv.gpuTracker.Allocate(nodeName, job.ID, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB, totalGPUs)
+	if !ok {
+		// The node filled up between matching and dispatch. Put the job back rather than
+		// sending it to a node that cannot run it.
+		dispatchFailuresTotal.WithLabelValues("no_free_gpus").Inc()
+		logging.Job(job.ID).Warn("node has no free GPUs at dispatch, requeueing", "node", nodeName)
+		srv.appendLog(job.ID, "WARN", fmt.Sprintf("Node %s had no free GPUs at dispatch; requeued", nodeName))
+		srv.dispatchPendingMu.Lock()
+		delete(srv.dispatchPending, job.ID)
+		srv.dispatchPendingMu.Unlock()
+		srv.queue.RequeueRunningJob(job.ID)
+		return
+	}
 
 	envVars := make(map[string]string)
 	for k, v := range job.EnvVars {
@@ -813,65 +1423,33 @@ func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 	}
 
 	if job.GPUsRequired > 0 {
-		gpuEnvVar := "CUDA_VISIBLE_DEVICES"
-		var vendor string
-		for _, member := range srv.disc.Members() {
-			if member.Name == nodeName && len(member.Meta) > 0 {
-				var ad map[string]interface{}
-				if json.Unmarshal(member.Meta, &ad) == nil {
-					if v, ok := ad["gpu_vendor"].(string); ok {
-						vendor = v
-					}
-				}
-				break
-			}
-		}
-
-		if vendor == "amd" {
-			gpuEnvVar = "HIP_VISIBLE_DEVICES"
-		}
-
-		if vendor == "intel" {
-			devices := make([]string, job.GPUsRequired)
-			for i := range devices {
-				devices[i] = strconv.Itoa(i)
-			}
-			val := "level_zero:" + strings.Join(devices, ",")
-			if _, exists := envVars["ONEAPI_DEVICE_SELECTOR"]; !exists {
-				envVars["ONEAPI_DEVICE_SELECTOR"] = val
-			}
-			if _, exists := envVars["SYCL_DEVICE_FILTER"]; !exists {
-				envVars["SYCL_DEVICE_FILTER"] = val
-			}
-		} else if vendor == "apple" {
-			if _, exists := envVars["METAL_DEVICE_INDEX"]; !exists {
-				devices := make([]string, job.GPUsRequired)
-				for i := range devices {
-					devices[i] = strconv.Itoa(i)
-				}
-				envVars["METAL_DEVICE_INDEX"] = strings.Join(devices, ",")
-			}
-		} else {
-			if _, exists := envVars[gpuEnvVar]; !exists {
-				devices := make([]string, job.GPUsRequired)
-				for i := range devices {
-					devices[i] = strconv.Itoa(i)
-				}
-				envVars[gpuEnvVar] = strings.Join(devices, ",")
-			}
-		}
+		setGPUVisibility(envVars, vendor, devices)
 	}
 
-	payload := messaging.DispatchPayload{
-		TargetNode: nodeName, JobID: job.ID, Command: job.Command,
-		WalltimeSeconds: job.WalltimeSeconds, Action: "execute", EnvVars: envVars,
+	if err := srv.bus.Send(nodeName, &pb.DispatchMessage{
+		JobId: job.ID, Command: job.Command, WalltimeSeconds: int32(job.WalltimeSeconds),
+		Action: "execute", EnvVars: envVars, Attempt: attempt,
+	}); err != nil {
+		// The worker is gone or wedged. Undo the placement now rather than waiting for the
+		// acknowledgement timeout, so the job goes back to a node that can actually take it.
+		dispatchFailuresTotal.WithLabelValues("undeliverable").Inc()
+		logging.Job(job.ID).Error("could not deliver dispatch", "node", nodeName, "error", err)
+		srv.appendLog(job.ID, "WARN", fmt.Sprintf("Dispatch to %s failed: %v; requeued", nodeName, err))
+		srv.gpuTracker.Release(job.ID)
+		srv.dispatchPendingMu.Lock()
+		delete(srv.dispatchPending, job.ID)
+		srv.dispatchPendingMu.Unlock()
+		srv.queue.RequeueRunningJob(job.ID)
+		return
 	}
-	b, _ := json.Marshal(payload)
-	srv.pub.Send(string(b))
 
 	dispatchDuration.Observe(time.Since(dispatchStart).Seconds())
+	if attempt == 1 && !job.SubmitTime.IsZero() {
+		// Only the first attempt measures true queue wait; a retry's wait is not the same thing.
+		queueWaitDuration.Observe(time.Since(job.SubmitTime).Seconds())
+	}
 	srv.appendLog(job.ID, "INFO", fmt.Sprintf("Dispatched to node %s", nodeName))
-	fmt.Printf("Job %s → %s\n", job.ID, nodeName)
+	logging.Job(job.ID).Info("dispatched", "node", nodeName, "attempt", attempt)
 }
 
 func walltimeEnforcer(ctx context.Context, srv *schedulerServer) {
@@ -885,15 +1463,17 @@ func walltimeEnforcer(ctx context.Context, srv *schedulerServer) {
 					continue
 				}
 				if time.Now().After(job.StartTime.Add(time.Duration(job.WalltimeSeconds) * time.Second)) {
-					fmt.Printf("[walltime] Job %s exceeded %ds — killing\n", job.ID, job.WalltimeSeconds)
+					logging.Job(job.ID).Warn("walltime exceeded, killing", "walltime_seconds", job.WalltimeSeconds)
 					walltimeKillsTotal.Inc()
 					srv.queue.Cancel(job.ID)
 					if job.WorkerNode != "" {
-						srv.gpuTracker.Release(job.WorkerNode, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+						srv.gpuTracker.Release(job.ID)
 					}
-					payload := messaging.DispatchPayload{TargetNode: job.WorkerNode, JobID: job.ID, Action: "cancel"}
-					b, _ := json.Marshal(payload)
-					srv.pub.Send(string(b))
+					if err := srv.bus.Send(job.WorkerNode, &pb.DispatchMessage{
+						JobId: job.ID, Action: "cancel", Attempt: job.Attempt,
+					}); err != nil {
+						logging.Job(job.ID).Error("could not deliver walltime cancel", "node", job.WorkerNode, "error", err)
+					}
 					srv.appendLog(job.ID, "WARN", fmt.Sprintf("Walltime exceeded (%ds)", job.WalltimeSeconds))
 				}
 			}
@@ -927,11 +1507,11 @@ func dispatchTimeoutEnforcer(ctx context.Context, srv *schedulerServer) {
 				if !ok || job.State != scheduler.StateRunning {
 					continue
 				}
-				fmt.Printf("[handshake] Dispatch timeout for job %s — re-queueing\n", jobID)
+				logging.Job(jobID).Warn("dispatch was never acknowledged, re-queueing")
 				srv.appendLog(jobID, "WARN", "Dispatch handshake timed out, re-queueing")
 				if _, requeued := srv.queue.RequeueRunningJob(jobID); requeued {
 					if job.WorkerNode != "" {
-						srv.gpuTracker.Release(job.WorkerNode, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+						srv.gpuTracker.Release(job.ID)
 					}
 				}
 			}
@@ -950,62 +1530,66 @@ func truncate(s string, maxLen int) string {
 
 // --- Health Endpoints ---
 
-func startHealthAndMetrics(srv *schedulerServer, port int) {
+func startHealthAndMetrics(srv *schedulerServer, cfg *config.Config) *http.Server {
+	port := cfg.Ports.Metrics
 	initMetrics()
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"ok"}`))
-	})
-	mux.HandleFunc("/acknowledge_start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		// Liveness reflects the scheduling loop, not just the HTTP server. A constant 200 stayed
+		// green after the dispatch goroutine died, so nothing ever restarted a wedged master.
+		last := srv.lastTick.Load()
+		if last > 0 && time.Since(time.Unix(0, last)) > schedulerStallThreshold {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "unhealthy", "reason": "scheduling loop stalled",
+				"last_tick_seconds_ago": int(time.Since(time.Unix(0, last)).Seconds()),
+			})
 			return
 		}
-		var req struct {
-			JobID string `json:"job_id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JobID == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid request"}`))
-			return
-		}
-		srv.dispatchPendingMu.Lock()
-		_, exists := srv.dispatchPending[req.JobID]
-		if exists {
-			delete(srv.dispatchPending, req.JobID)
-		}
-		srv.dispatchPendingMu.Unlock()
-		if !exists {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte(`{"status":"not_found"}`))
-			return
-		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"acknowledged"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		members := srv.disc.Members()
 		if len(members) == 0 {
 			w.WriteHeader(503)
-			w.Write([]byte(`{"status":"not_ready","reason":"no cluster members"}`))
+			_, _ = w.Write([]byte(`{"status":"not_ready","reason":"no cluster members"}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ready", "members": len(members),
 			"queue_depth": srv.queue.QueueLen(), "draining": srv.draining.Load(),
 		})
 	})
+	bind := cfg.MetricsBind
+	if bind == "" {
+		bind = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", bind, port)
+
+	// Explicit timeouts: the zero-value http.Server has none, so a handful of connections
+	// dribbling headers could exhaust the master's file descriptors.
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
 	go func() {
-		addr := fmt.Sprintf(":%d", port)
-		fmt.Printf("Health + metrics at http://0.0.0.0%s (/health, /ready, /metrics)\n", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			fmt.Printf("Health/metrics server error: %v\n", err)
+		slog.Info("health and metrics listening", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("health/metrics server error", "error", err)
 		}
 	}()
+	return server
 }
 
 // --- Startup ---
@@ -1035,14 +1619,17 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	go func() {
 		defer dbWg.Done()
 		for op := range dbWriteChan {
+			dbWriteQueueDepth.Set(float64(len(dbWriteChan)))
 			if op.job != nil {
 				if err := db.SaveJob(op.job); err != nil {
-					log.Printf("[persist] Failed to save job %s: %v", op.job.ID, err)
+					dbWriteErrorsTotal.Inc()
+					logging.Job(op.job.ID).Error("failed to persist job", "error", err)
 				}
 			}
 			if op.group != nil {
 				if err := db.SaveGroup(op.group); err != nil {
-					log.Printf("[persist] Failed to save group %s: %v", op.group.GroupID, err)
+					dbWriteErrorsTotal.Inc()
+					slog.Error("failed to persist group", "group_id", op.group.GroupID, "error", err)
 				}
 			}
 		}
@@ -1051,7 +1638,7 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	cleanDB := func() {
 		close(dbWriteChan)
 		dbWg.Wait()
-		db.Close()
+		func() { _ = db.Close() }()
 	}
 
 	// Wire persistence hooks
@@ -1068,32 +1655,38 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		for _, job := range jobs {
 			switch job.State {
 			case scheduler.StateQueued:
-				queue.Enqueue(job)
+				if err := queue.Enqueue(job); err != nil {
+					logging.Job(job.ID).Error("could not re-queue on restore", "error", err)
+				}
 				restored++
 			case scheduler.StateRunning:
 				// Mark as failed — worker connections lost after restart
 				job.State = scheduler.StateFailed
 				job.Error = "master restarted"
 				job.EndTime = time.Now()
-				db.SaveJob(job)
+				if err := db.SaveJob(job); err != nil {
+					logging.Job(job.ID).Error("could not persist on restore", "error", err)
+				}
 			}
 		}
 		if restored > 0 {
-			fmt.Printf("[restore] Restored %d queued jobs from disk\n", restored)
+			slog.Info("restored queued jobs from disk", "count", restored)
 		}
 	}
 	if groups, err := db.LoadGroups(); err == nil {
 		for _, g := range groups {
 			if g.State == "PENDING" || g.State == "RUNNING" {
 				g.State = "FAILED" // Can't resume mid-flight groups
-				db.SaveGroup(g)
+				if err := db.SaveGroup(g); err != nil {
+					slog.Error("could not persist group on restore", "group_id", g.GroupID, "error", err)
+				}
 			}
 			queue.RegisterGroup(g)
 		}
 	}
 	if usage, err := db.LoadFairshare(); err == nil && len(usage) > 0 {
-		fairshare.UserUsage = usage
-		fmt.Printf("[restore] Restored fairshare data for %d users\n", len(usage))
+		fairshare.Restore(usage)
+		slog.Info("restored fairshare data", "users", len(usage))
 	}
 
 	cb := newCircuitBreaker()
@@ -1106,9 +1699,9 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 				return
 			}
 			workerLostTotal.Inc()
-			fmt.Printf("[heartbeat] Worker %s left — failing %d job(s)\n", nodeName, len(jobs))
+			slog.Warn("worker left the cluster, failing its jobs", "node", nodeName, "jobs", len(jobs))
 			for _, job := range jobs {
-				gt.Release(nodeName, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB)
+				gt.Release(job.ID)
 				queue.MarkCompleted(job.ID, false, "", "worker node lost")
 				if job.GroupID != "" {
 					if group, ok := queue.GetGroup(job.GroupID); ok && group.State == "RUNNING" {
@@ -1119,7 +1712,22 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		},
 	}
 
-	disc, err := discovery.NewNodeDiscovery("master-node", cfg.Ports.Gossip, nil, "", 0, hooks)
+	gossipKey, err := cfg.GossipKey()
+	if err != nil {
+		return nil, err
+	}
+	// The master's gossip name follows node_name. It was hardcoded to "master-node", so two
+	// masters — or two both-role hosts — collided under one memberlist identity.
+	// The master's gossip identity derives from node_name rather than a hardcoded "master-node",
+	// which made two masters — or two both-role hosts — collide under one memberlist identity.
+	// The "-master" suffix keeps it distinct from the worker running alongside it in "both"
+	// mode, which registers under node_name itself.
+	masterGossipName := "master-node"
+	if cfg.NodeName != "" {
+		masterGossipName = cfg.NodeName + "-master"
+	}
+	disc, err := discovery.NewNodeDiscovery(masterGossipName, cfg.Ports.Gossip, nil, "", 0, hooks,
+		&discovery.Options{EncryptionKey: gossipKey, Profile: cfg.Gossip.Profile})
 	if err != nil {
 		cleanDB()
 		return nil, fmt.Errorf("discovery: %w", err)
@@ -1127,32 +1735,29 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 
 	eval, err := matchmaker.NewEvaluator()
 	if err != nil {
-		disc.Shutdown()
+		_ = disc.Shutdown()
 		cleanDB()
 		return nil, fmt.Errorf("CEL evaluator: %w", err)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
-	pub, err := messaging.NewZMQPublisher(shutdownCtx, fmt.Sprintf("tcp://*:%d", cfg.Ports.ZMQ))
-	if err != nil {
-		shutdownCancel()
-		disc.Shutdown()
-		cleanDB()
-		return nil, fmt.Errorf("ZMQ: %w", err)
-	}
+	// Dispatch rides the authenticated gRPC connection. There is no separate broadcast socket
+	// any more, so cfg.Ports.ZMQ is unused and nothing listens on it.
+	bus := newDispatchBus()
 
 	srv := &schedulerServer{
-		disc: disc, queue: queue, eval: eval, pub: pub, fairshare: fairshare,
+		disc: disc, queue: queue, eval: eval, bus: bus, fairshare: fairshare,
 		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt,
 		dispatchPending: make(map[string]time.Time),
-		logStore: make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
+		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
 		ctx: shutdownCtx,
 	}
 
-	startHealthAndMetrics(srv, cfg.Ports.Metrics)
+	httpServer := startHealthAndMetrics(srv, cfg)
 
 	go dispatchLoop(shutdownCtx, srv)
+	go maintenanceLoop(shutdownCtx, srv)
 	go walltimeEnforcer(shutdownCtx, srv)
 	go dispatchTimeoutEnforcer(shutdownCtx, srv)
 	go func() {
@@ -1162,7 +1767,9 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 			select {
 			case <-ticker.C:
 				fairshare.DecayUsage(0.95)
-				db.SaveFairshare(fairshare.UserUsage)
+				if err := db.SaveFairshare(fairshare.Snapshot()); err != nil {
+					slog.Error("fairshare persist failed", "error", err)
+				}
 			case <-shutdownCtx.Done():
 				return
 			}
@@ -1170,40 +1777,103 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	}()
 
 	// gRPC server with optional TLS
+	authenticator, err := auth.New(cfg)
+	if err != nil {
+		shutdownCancel()
+		_ = disc.Shutdown()
+		bus.Close()
+		cleanDB()
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+	authenticator.OnFailure = func(reason string) { authFailuresTotal.WithLabelValues(reason).Inc() }
+	if !authenticator.Enabled() {
+		slog.Warn("authentication is disabled: any host that can reach the gRPC port can run "+
+			"arbitrary commands on every worker; set auth.enabled in the config",
+			"grpc_port", cfg.Ports.GRPC)
+	}
+	serverOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(authenticator.UnaryInterceptor()),
+		grpc.ChainStreamInterceptor(authenticator.StreamInterceptor()),
+	}
+
 	var grpcServer *grpc.Server
-	if cfg.TLS.Enabled && cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+	if cfg.TLS.Enabled {
+		// Refuse to start rather than silently serving plaintext. A missing cert or key used to
+		// fall through to an unencrypted listener while the startup banner still announced TLS,
+		// so an operator had no way to notice the downgrade.
+		if cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" {
+			shutdownCancel()
+			_ = disc.Shutdown()
+			bus.Close()
+			cleanDB()
+			return nil, fmt.Errorf("tls.enabled is true but tls.cert_file and tls.key_file must both be set")
+		}
 		creds, err := credentials.NewServerTLSFromFile(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		if err != nil {
 			shutdownCancel()
-			disc.Shutdown()
-			pub.Close()
+			_ = disc.Shutdown()
+			bus.Close()
 			cleanDB()
 			return nil, fmt.Errorf("TLS: %w", err)
 		}
-		grpcServer = grpc.NewServer(grpc.Creds(creds))
+		// Require and verify client certificates when a CA is configured. Without this the
+		// connection is encrypted but every client is still anonymous, which is what the docs
+		// called "mTLS" while the master never asked for a certificate at all.
+		if cfg.TLS.CAFile != "" {
+			pool := x509.NewCertPool()
+			caPEM, readErr := os.ReadFile(cfg.TLS.CAFile)
+			if readErr != nil {
+				shutdownCancel()
+				_ = disc.Shutdown()
+				bus.Close()
+				cleanDB()
+				return nil, fmt.Errorf("TLS: cannot read ca_file %s: %w", cfg.TLS.CAFile, readErr)
+			}
+			if !pool.AppendCertsFromPEM(caPEM) {
+				shutdownCancel()
+				_ = disc.Shutdown()
+				bus.Close()
+				cleanDB()
+				return nil, fmt.Errorf("TLS: ca_file %s contains no usable certificates", cfg.TLS.CAFile)
+			}
+			cert, certErr := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+			if certErr != nil {
+				shutdownCancel()
+				_ = disc.Shutdown()
+				bus.Close()
+				cleanDB()
+				return nil, fmt.Errorf("TLS: %w", certErr)
+			}
+			creds = credentials.NewTLS(&tls.Config{
+				Certificates: []tls.Certificate{cert},
+				ClientCAs:    pool,
+				ClientAuth:   tls.RequireAndVerifyClientCert,
+				MinVersion:   tls.VersionTLS12,
+			})
+			slog.Info("mutual TLS enabled: client certificates required and verified", "ca_file", cfg.TLS.CAFile)
+		}
+		serverOpts = append(serverOpts, grpc.Creds(creds))
+		grpcServer = grpc.NewServer(serverOpts...)
 	} else {
-		grpcServer = grpc.NewServer()
+		grpcServer = grpc.NewServer(serverOpts...)
 	}
 	pb.RegisterSchedulerServiceServer(grpcServer, srv)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Ports.GRPC))
 	if err != nil {
 		shutdownCancel()
-		disc.Shutdown()
-		pub.Close()
+		_ = disc.Shutdown()
+		bus.Close()
 		cleanDB()
 		return nil, fmt.Errorf("gRPC listen: %w", err)
 	}
 
 	go func() {
-		tls := ""
-		if cfg.TLS.Enabled {
-			tls = " [TLS]"
-		}
-		fmt.Printf("Master listening on :%d (gRPC%s), :%d (ZMQ), :%d (gossip), :%d (health+metrics)\n",
-			cfg.Ports.GRPC, tls, cfg.Ports.ZMQ, cfg.Ports.Gossip, cfg.Ports.Metrics)
+		slog.Info("master listening",
+			"grpc_port", cfg.Ports.GRPC, "tls", cfg.TLS.Enabled,
+			"gossip_port", cfg.Ports.Gossip, "metrics_port", cfg.Ports.Metrics)
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("gRPC error: %v", err)
+			slog.Error("gRPC server error", "error", err)
 		}
 	}()
 
@@ -1211,8 +1881,16 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		Cancel: func() {
 			shutdownCancel()
 			grpcServer.GracefulStop()
-			pub.Close()
-			disc.Shutdown()
+			// The health/metrics server was never shut down: its goroutine and listener outlived
+			// the master, the port stayed bound so an in-process restart could not rebind, and
+			// /acknowledge_start kept mutating scheduler state after the scheduler was gone.
+			shutdownHTTP, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := httpServer.Shutdown(shutdownHTTP); err != nil {
+				slog.Error("health/metrics server shutdown", "error", err)
+			}
+			cancelHTTP()
+			bus.Close()
+			_ = disc.Shutdown()
 			cleanDB()
 		},
 		Draining: draining,

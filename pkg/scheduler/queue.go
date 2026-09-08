@@ -49,6 +49,12 @@ type Job struct {
 
 	// Internal tracking for heap
 	index int
+
+	// Attempt increments on every dispatch. It is the fencing token: a result carrying an
+	// older attempt belongs to a superseded dispatch and must be ignored, or a late report
+	// from a previously targeted worker releases the allocation of whichever node is running
+	// the job now.
+	Attempt int64 `json:"attempt,omitempty"`
 }
 
 // JobGroup represents a distributed training job spanning multiple nodes.
@@ -157,11 +163,19 @@ func (gs *GlobalScheduler) Enqueue(job *Job) error {
 		gs.mu.Unlock()
 		return fmt.Errorf("queue full (%d jobs)", gs.MaxQueueSize)
 	}
+	// Reject a duplicate ID rather than overwriting. Both gs.jobs and the BoltDB bucket were
+	// last-write-wins, so a collision silently cross-linked two users' jobs: results, logs, and
+	// resource releases landed on the wrong one.
+	if _, exists := gs.jobs[job.ID]; exists {
+		gs.mu.Unlock()
+		return fmt.Errorf("job %s already exists", job.ID)
+	}
 	job.State = StateQueued
 	gs.jobs[job.ID] = job
 	heap.Push(&gs.queue, job)
+	snapshot := job.Copy()
 	gs.mu.Unlock()
-	gs.notifyJobChange(job)
+	gs.notifyJobChange(snapshot)
 	return nil
 }
 
@@ -170,6 +184,26 @@ func (gs *GlobalScheduler) Dequeue() *Job {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	if gs.queue.Len() == 0 {
+		return nil
+	}
+	return heap.Pop(&gs.queue).(*Job).Copy()
+}
+
+// DequeueIf pops the highest-priority job, but only if match reports true for it.
+//
+// The test and the pop happen under one lock. Callers previously did this as a Peek, then some
+// matching work, then a Dequeue — three separate lock acquisitions — so a job submitted or
+// cancelled in between changed the head, and the Dequeue returned a job that had never been
+// matched against the node it was about to be sent to.
+//
+// match runs while the queue lock is held; keep it as short as the matching allows.
+func (gs *GlobalScheduler) DequeueIf(match func(job *Job) bool) *Job {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.queue.Len() == 0 {
+		return nil
+	}
+	if !match(gs.queue[0].Copy()) {
 		return nil
 	}
 	return heap.Pop(&gs.queue).(*Job).Copy()
@@ -237,15 +271,17 @@ func (gs *GlobalScheduler) Cancel(jobID string) (*Job, bool) {
 		}
 		job.State = StateCancelled
 		job.EndTime = time.Now()
+		snapshot := job.Copy()
 		gs.mu.Unlock()
-		gs.notifyJobChange(job)
-		return job.Copy(), true
+		gs.notifyJobChange(snapshot)
+		return snapshot.Copy(), true
 	case StateRunning:
 		job.State = StateCancelled
 		job.EndTime = time.Now()
+		snapshot := job.Copy()
 		gs.mu.Unlock()
-		gs.notifyJobChange(job)
-		return job.Copy(), true
+		gs.notifyJobChange(snapshot)
+		return snapshot.Copy(), true
 	default:
 		gs.mu.Unlock()
 		return job.Copy(), false
@@ -260,6 +296,18 @@ func (gs *GlobalScheduler) Requeue(jobID string, incrementRetry bool) (*Job, err
 		gs.mu.Unlock()
 		return nil, fmt.Errorf("job not found")
 	}
+	// A job already sitting in the heap must not be pushed onto it a second time. Two heap
+	// entries share one *Job, so job.index names only one of them: a later heap.Remove using
+	// that index evicts an unrelated job, which is then silently lost while still marked
+	// QUEUED. Duplicate result reports made this reachable in practice.
+	if job.State == StateQueued {
+		gs.mu.Unlock()
+		return nil, fmt.Errorf("job %s is already queued", jobID)
+	}
+	if job.State == StateCancelled {
+		gs.mu.Unlock()
+		return nil, fmt.Errorf("job %s was cancelled", jobID)
+	}
 	if incrementRetry {
 		job.RetryCount++
 	}
@@ -272,37 +320,59 @@ func (gs *GlobalScheduler) Requeue(jobID string, incrementRetry bool) (*Job, err
 	job.index = -1 // Reset heap index
 
 	heap.Push(&gs.queue, job)
+	snapshot := job.Copy()
 	gs.mu.Unlock()
 
-	gs.notifyJobChange(job)
-	return job.Copy(), nil
+	gs.notifyJobChange(snapshot)
+	return snapshot.Copy(), nil
 }
 
+// notifyJobChange runs the persistence hook. It must be called with a snapshot, never with
+// the live *Job from gs.jobs: the hook hands the value to another goroutine that marshals it
+// while the scheduler keeps mutating the original.
 func (gs *GlobalScheduler) notifyJobChange(job *Job) {
 	if gs.OnJobChange != nil {
 		gs.OnJobChange(job)
 	}
 }
 
+// notifyGroupChange runs the persistence hook. As with notifyJobChange, the argument must be
+// a snapshot rather than the live *JobGroup.
 func (gs *GlobalScheduler) notifyGroupChange(group *JobGroup) {
 	if gs.OnGroupChange != nil {
 		gs.OnGroupChange(group)
 	}
 }
 
-// MarkRunning transitions a job to RUNNING state.
-func (gs *GlobalScheduler) MarkRunning(jobID, workerNode string) {
+// MarkRunning transitions a job to RUNNING state, returning the dispatch attempt number.
+//
+// ok is false for an unknown job and for one that was cancelled after being dequeued; callers
+// must not dispatch in that case. The attempt increments on every successful transition and
+// must be carried through the dispatch and echoed back in the result.
+func (gs *GlobalScheduler) MarkRunning(jobID, workerNode string) (attempt int64, ok bool) {
 	gs.mu.Lock()
 	job, ok := gs.jobs[jobID]
+	// Dequeue pops a job without changing its state, so a cancel can land between the pop and
+	// this call. Overwriting CANCELLED with RUNNING loses the cancellation entirely: the user
+	// is told the job was cancelled, no cancel is ever published to a worker, and the job runs
+	// to completion anyway.
+	if ok && job.State == StateCancelled {
+		ok = false
+	}
+	var snapshot *Job
 	if ok {
 		job.State = StateRunning
 		job.WorkerNode = workerNode
 		job.StartTime = time.Now()
+		job.Attempt++
+		attempt = job.Attempt
+		snapshot = job.Copy()
 	}
 	gs.mu.Unlock()
 	if ok {
-		gs.notifyJobChange(job)
+		gs.notifyJobChange(snapshot)
 	}
+	return attempt, ok
 }
 
 // RequeueRunningJob transitions a RUNNING job back to QUEUED state and pushes it back onto the heap.
@@ -317,9 +387,10 @@ func (gs *GlobalScheduler) RequeueRunningJob(jobID string) (*Job, bool) {
 	job.WorkerNode = ""
 	job.StartTime = time.Time{}
 	heap.Push(&gs.queue, job)
+	snapshot := job.Copy()
 	gs.mu.Unlock()
-	gs.notifyJobChange(job)
-	return job.Copy(), true
+	gs.notifyJobChange(snapshot)
+	return snapshot.Copy(), true
 }
 
 // MarkCompleted transitions a job to COMPLETED or FAILED state.
@@ -342,8 +413,9 @@ func (gs *GlobalScheduler) MarkCompleted(jobID string, success bool, output, err
 	job.Output = output
 	job.Error = errMsg
 	job.EndTime = time.Now()
+	snapshot := job.Copy()
 	gs.mu.Unlock()
-	gs.notifyJobChange(job)
+	gs.notifyJobChange(snapshot)
 }
 
 // GetJob returns a job by ID.
@@ -388,14 +460,50 @@ func (gs *GlobalScheduler) RunningJobsOnNode(nodeName string) []*Job {
 	return result
 }
 
+// IsTerminal reports whether a state is final.
+func IsTerminal(state string) bool {
+	return state == StateCompleted || state == StateFailed || state == StateCancelled
+}
+
+// PruneTerminal drops finished jobs that ended more than maxAge ago, returning how many went.
+//
+// Nothing ever left gs.jobs, so the map grew for the master's lifetime with every job ever
+// submitted — each retaining its full captured output. That is both an unbounded memory leak
+// and a latency problem: RunningJobs and ListJobs walk this map under the global lock, and the
+// dispatch loop calls RunningJobs once a second.
+//
+// Pruning only affects the in-memory view. The database keeps the durable history, and
+// GetJobStatus already falls back to it for a job that is no longer resident.
+func (gs *GlobalScheduler) PruneTerminal(maxAge time.Duration) int {
+	cutoff := time.Now().Add(-maxAge)
+
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	pruned := 0
+	for id, job := range gs.jobs {
+		if !IsTerminal(job.State) {
+			continue
+		}
+		// A terminal job with no end time is malformed; treat it as prunable.
+		if !job.EndTime.IsZero() && job.EndTime.After(cutoff) {
+			continue
+		}
+		delete(gs.jobs, id)
+		pruned++
+	}
+	return pruned
+}
+
 // --- Job Group Management ---
 
 // RegisterGroup registers a new job group for distributed training.
 func (gs *GlobalScheduler) RegisterGroup(g *JobGroup) {
 	gs.mu.Lock()
 	gs.groups[g.GroupID] = g
+	snapshot := g.Copy()
 	gs.mu.Unlock()
-	gs.notifyGroupChange(g)
+	gs.notifyGroupChange(snapshot)
 }
 
 // GetGroup returns a job group by ID.
@@ -426,12 +534,14 @@ func (gs *GlobalScheduler) PendingGroups() []*JobGroup {
 func (gs *GlobalScheduler) SetGroupState(groupID, state string) {
 	gs.mu.Lock()
 	g, ok := gs.groups[groupID]
+	var snapshot *JobGroup
 	if ok {
 		g.State = state
+		snapshot = g.Copy()
 	}
 	gs.mu.Unlock()
 	if ok {
-		gs.notifyGroupChange(g)
+		gs.notifyGroupChange(snapshot)
 	}
 }
 
@@ -455,6 +565,32 @@ func (fc *FairshareCalculator) RecordUsage(user string, units float64) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.UserUsage[user] += units
+}
+
+// Snapshot returns a copy of the usage map, safe to marshal from another goroutine.
+//
+// UserUsage is exported and was previously handed to the persistence layer directly. Because
+// RecordUsage writes it under fc.mu while the 60s persistence tick marshaled it without the
+// lock, any job completing during that tick crashed the master with an unrecoverable
+// "concurrent map read and map write" fatal error.
+func (fc *FairshareCalculator) Snapshot() map[string]float64 {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	out := make(map[string]float64, len(fc.UserUsage))
+	for user, usage := range fc.UserUsage {
+		out[user] = usage
+	}
+	return out
+}
+
+// Restore replaces the usage map, e.g. from persisted state at startup.
+func (fc *FairshareCalculator) Restore(usage map[string]float64) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.UserUsage = make(map[string]float64, len(usage))
+	for user, u := range usage {
+		fc.UserUsage[user] = u
+	}
 }
 
 // CalculatePenalty assigns a numerical penalty to base priority.

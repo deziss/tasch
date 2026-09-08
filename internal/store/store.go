@@ -2,9 +2,12 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/deziss/tasch/pkg/scheduler"
 	bolt "go.etcd.io/bbolt"
@@ -15,7 +18,21 @@ var (
 	bucketGroups      = []byte("groups")
 	bucketFairshare   = []byte("fairshare")
 	bucketDeadLetters = []byte("dead_letters")
+	bucketMeta        = []byte("meta")
 )
+
+// SchemaVersion is the on-disk format this build writes.
+//
+// The database previously carried no version at all, so an upgrade that changed a persisted
+// struct simply failed to unmarshal — and LoadJobs discarded unmarshal errors silently, making
+// jobs vanish with no log line and no metric. Recording the version lets a future change detect
+// what it is reading and refuse rather than corrupt.
+const SchemaVersion = 1
+
+var keySchemaVersion = []byte("schema_version")
+
+// ErrSchemaTooNew reports a database written by a newer build.
+var ErrSchemaTooNew = errors.New("database schema is newer than this build supports")
 
 // Store provides BoltDB persistence for jobs, groups, and fairshare data.
 type Store struct {
@@ -34,21 +51,74 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
-	// Create buckets
+	// Create buckets and establish the schema version.
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters} {
+		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters, bucketMeta} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
 		}
+
+		meta := tx.Bucket(bucketMeta)
+		raw := meta.Get(keySchemaVersion)
+		if raw == nil {
+			// Either a fresh database or one written before versioning existed. Both are
+			// readable as version 1, so stamp it and carry on.
+			return meta.Put(keySchemaVersion, []byte(strconv.Itoa(SchemaVersion)))
+		}
+
+		found, convErr := strconv.Atoi(string(raw))
+		if convErr != nil {
+			return fmt.Errorf("database schema version %q is not a number", raw)
+		}
+		if found > SchemaVersion {
+			// Refuse rather than silently misread a newer layout, which is how a downgrade
+			// would otherwise lose data.
+			return fmt.Errorf("%w: database is version %d, this build supports %d",
+				ErrSchemaTooNew, found, SchemaVersion)
+		}
+		if found < SchemaVersion {
+			if migrateErr := migrate(tx, found, SchemaVersion); migrateErr != nil {
+				return migrateErr
+			}
+			return meta.Put(keySchemaVersion, []byte(strconv.Itoa(SchemaVersion)))
+		}
 		return nil
 	})
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create buckets: %w", err)
+		func() { _ = db.Close() }()
+		return nil, fmt.Errorf("open store %s: %w", path, err)
 	}
 
 	return &Store{db: db}, nil
+}
+
+// migrate upgrades the on-disk layout from one version to the next.
+//
+// Version 1 is the first recorded schema and nothing predates it — an unversioned database is
+// adopted as version 1 by Open — so there is no migration path to implement yet. This exists so
+// the next schema change has an obvious place to go, and so an unexpected older version fails
+// loudly instead of being read with the wrong layout.
+func migrate(tx *bolt.Tx, from, to int) error {
+	return fmt.Errorf("no migration path from schema version %d to %d", from, to)
+}
+
+// SchemaVersion returns the version recorded in the database.
+func (s *Store) SchemaVersion() (int, error) {
+	var version int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketMeta).Get(keySchemaVersion)
+		if raw == nil {
+			return errors.New("no schema version recorded")
+		}
+		v, err := strconv.Atoi(string(raw))
+		if err != nil {
+			return err
+		}
+		version = v
+		return nil
+	})
+	return version, err
 }
 
 // Close closes the database.
@@ -75,14 +145,26 @@ func (s *Store) LoadJobs() ([]*scheduler.Job, error) {
 	var jobs []*scheduler.Job
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketJobs)
-		return b.ForEach(func(k, v []byte) error {
+		corrupt := 0
+		if err := b.ForEach(func(k, v []byte) error {
 			var job scheduler.Job
 			if err := json.Unmarshal(v, &job); err != nil {
-				return nil // skip corrupt entries
+				// Keep going — one bad record must not block recovery of the rest — but say so.
+				// These errors used to be discarded, so a struct change made jobs disappear with
+				// no diagnostic anywhere.
+				corrupt++
+				log.Printf("[store] Skipping unreadable job record %q: %v", k, err)
+				return nil
 			}
 			jobs = append(jobs, &job)
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		if corrupt > 0 {
+			log.Printf("[store] %d job record(s) could not be read and were skipped", corrupt)
+		}
+		return nil
 	})
 	return jobs, err
 }

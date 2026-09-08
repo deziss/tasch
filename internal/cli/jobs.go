@@ -36,7 +36,7 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 			// Bare `tasch jobs` = list all
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			listJobs(client, listStateFilter)
 		},
 	}
@@ -47,6 +47,8 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	var submitUser string
 	var submitWalltime int32
 	var submitGPUs int32
+	var submitCPUs int32
+	var submitMemoryMB int32
 	var submitEnvVars []string
 
 	submitCmd := &cobra.Command{
@@ -56,16 +58,18 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.SubmitJob(context.Background(), &pb.SubmitJobRequest{
-				CelRequirement:  args[0],
-				Command:         args[1],
-				Priority:        submitPriority,
-				User:            submitUser,
-				WalltimeSeconds: submitWalltime,
-				GpusRequired:    submitGPUs,
-				EnvVars:         parseEnvFlags(submitEnvVars),
+				CelRequirement:   args[0],
+				Command:          args[1],
+				Priority:         submitPriority,
+				User:             submitUser,
+				WalltimeSeconds:  submitWalltime,
+				GpusRequired:     submitGPUs,
+				CpusRequired:     submitCPUs,
+				MemoryRequiredMb: submitMemoryMB,
+				EnvVars:          parseEnvFlags(submitEnvVars),
 			})
 			if err != nil {
 				log.Fatalf("Submit failed: %v", err)
@@ -83,6 +87,8 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	submitCmd.Flags().StringVarP(&submitUser, "user", "u", "", "Username for fairshare tracking")
 	submitCmd.Flags().Int32VarP(&submitWalltime, "walltime", "w", 0, "Max execution time in seconds (0 = no limit)")
 	submitCmd.Flags().Int32Var(&submitGPUs, "gpus", 0, "Number of GPUs required")
+	submitCmd.Flags().Int32Var(&submitCPUs, "cpus", 0, "CPU cores to reserve (0 = infer from the CEL requirement)")
+	submitCmd.Flags().Int32Var(&submitMemoryMB, "memory", 0, "Memory to reserve in MB (0 = infer from the CEL requirement)")
 	submitCmd.Flags().StringSliceVarP(&submitEnvVars, "env", "e", nil, "Environment variables (KEY=VALUE)")
 
 	// --- train ---
@@ -104,7 +110,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.SubmitDistributedJob(context.Background(), &pb.SubmitDistributedJobRequest{
 				CelRequirement:  trainRequirement,
@@ -150,7 +156,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.CancelJob(context.Background(), &pb.CancelJobRequest{JobId: args[0]})
 			if err != nil {
@@ -168,7 +174,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.GetJobStatus(context.Background(), &pb.GetJobStatusRequest{JobId: args[0]})
 			if err != nil {
@@ -220,7 +226,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			stream, err := client.StreamLogs(context.Background(), &pb.LogStreamRequest{JobId: args[0]})
 			if err != nil {
@@ -251,7 +257,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.ListJobs(context.Background(), &pb.ListJobsRequest{StateFilter: "DEAD_LETTER"})
 			if err == nil {
@@ -260,14 +266,14 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 					return
 				}
 				fmt.Printf("--- Dead Letter Queue (%d jobs) ---\n", len(resp.Jobs))
-				fmt.Printf("%-14s %-12s %-10s %-15s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "COMMAND")
+				fmt.Printf("%-18s %-12s %-10s %-15s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "COMMAND")
 				fmt.Println(strings.Repeat("-", 70))
 				for _, j := range resp.Jobs {
 					command := j.Command
 					if len(command) > 25 {
 						command = command[:22] + "..."
 					}
-					fmt.Printf("%-14s %-12s %-10s %-15s %s\n", j.JobId, j.State, j.User, j.WorkerNode, command)
+					fmt.Printf("%-18s %-12s %-10s %-15s %s\n", j.JobId, j.State, j.User, j.WorkerNode, command)
 				}
 				return
 			}
@@ -279,7 +285,7 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 				listJobs(client, "FAILED")
 				return
 			}
-			defer storeImport.Close()
+			defer func() { _ = storeImport.Close() }()
 
 			deadLetters, err := storeImport.LoadDeadLetters()
 			if err != nil || len(deadLetters) == 0 {
@@ -288,14 +294,14 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 			}
 
 			fmt.Printf("--- Dead Letter Queue (%d jobs) ---\n", len(deadLetters))
-			fmt.Printf("%-10s %-10s %-6s %s\n", "JOB_ID", "USER", "TRIES", "ERROR")
+			fmt.Printf("%-18s %-10s %-6s %s\n", "JOB_ID", "USER", "TRIES", "ERROR")
 			fmt.Println(strings.Repeat("-", 60))
 			for _, j := range deadLetters {
 				errMsg := j.Error
 				if len(errMsg) > 30 {
 					errMsg = errMsg[:27] + "..."
 				}
-				fmt.Printf("%-10s %-10s %-6d %s\n", j.ID, j.User, j.RetryCount, errMsg)
+				fmt.Printf("%-18s %-10s %-6d %s\n", j.ID, j.User, j.RetryCount, errMsg)
 			}
 		},
 	}
@@ -316,8 +322,8 @@ func listJobs(client pb.SchedulerServiceClient, stateFilter string) {
 		return
 	}
 
-	fmt.Printf("%-14s %-12s %-10s %-15s %-6s %-12s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "PRI", "GROUP", "COMMAND")
-	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-18s %-12s %-10s %-15s %-6s %-14s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "PRI", "GROUP", "COMMAND")
+	fmt.Println(strings.Repeat("-", 110))
 	for _, j := range resp.Jobs {
 		command := j.Command
 		if len(command) > 25 {
@@ -327,7 +333,7 @@ func listJobs(client pb.SchedulerServiceClient, stateFilter string) {
 		if group == "" {
 			group = "-"
 		}
-		fmt.Printf("%-14s %-12s %-10s %-15s %-6d %-12s %s\n",
+		fmt.Printf("%-18s %-12s %-10s %-15s %-6d %-14s %s\n",
 			j.JobId, j.State, j.User, j.WorkerNode, j.Priority, group, command)
 	}
 }

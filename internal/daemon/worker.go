@@ -1,40 +1,52 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/deziss/tasch/api/v1"
+	"github.com/deziss/tasch/internal/auth"
 	"github.com/deziss/tasch/internal/config"
+	"github.com/deziss/tasch/internal/logging"
 	"github.com/deziss/tasch/pkg/discovery"
-	"github.com/deziss/tasch/pkg/messaging"
 	"github.com/deziss/tasch/pkg/profiler"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
-// subscribeWithReconnect creates a ZMQ subscriber with automatic reconnection.
-func subscribeWithReconnect(ctx context.Context, endpoint string) <-chan string {
-	ch := make(chan string, 100)
+// watchDispatchWithReconnect streams dispatches for this node, reconnecting on failure.
+//
+// This replaces a ZeroMQ SUB socket that subscribed to everything and filtered by target node
+// on arrival. Besides handing every worker every job's command and environment variables, that
+// design dropped any dispatch published while a subscriber was mid-reconnect, because PUB has
+// no delivery guarantee and the master discarded its send errors.
+func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceClient, nodeName string) <-chan *pb.DispatchMessage {
+	ch := make(chan *pb.DispatchMessage, 100)
 	go func() {
 		defer close(ch)
 		backoff := 1 * time.Second
 		for {
-			sub, err := messaging.NewZMQSubscriber(ctx, endpoint)
+			if ctx.Err() != nil {
+				return
+			}
+			stream, err := client.WatchDispatch(ctx, &pb.WatchDispatchRequest{NodeName: nodeName})
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				log.Printf("[zmq] Reconnecting to %s in %s: %v", endpoint, backoff, err)
+				slog.Warn("cannot open dispatch stream, retrying", "backoff", backoff, "error", err)
 				select {
 				case <-time.After(backoff):
 				case <-ctx.Done():
@@ -45,19 +57,22 @@ func subscribeWithReconnect(ctx context.Context, endpoint string) <-chan string 
 				}
 				continue
 			}
+
 			backoff = 1 * time.Second
 			for {
-				msg, err := sub.Receive()
+				msg, err := stream.Recv()
 				if err != nil {
 					if ctx.Err() != nil {
-						sub.Close()
 						return
 					}
-					log.Printf("[zmq] Receive error, reconnecting: %v", err)
-					sub.Close()
+					slog.Warn("dispatch stream closed, reconnecting", "error", err)
 					break
 				}
-				ch <- msg
+				select {
+				case ch <- msg:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -76,15 +91,15 @@ func reportWithRetry(ctx context.Context, client pb.SchedulerServiceClient, req 
 		}
 
 		if ctx.Err() != nil {
-			log.Printf("[report] Worker shutdown, discarding result report for job %s: %v", req.JobId, err)
+			logging.Job(req.JobId).Warn("worker shutting down, discarding result report", "error", err)
 			return
 		}
 
-		log.Printf("[report] Report failed for job %s: %v. Retrying in %v...", req.JobId, err, backoff)
+		logging.Job(req.JobId).Warn("result report failed, retrying", "backoff", backoff, "error", err)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			log.Printf("[report] Worker shutdown during backoff, discarding result report for job %s", req.JobId)
+			logging.Job(req.JobId).Warn("worker shut down during backoff, discarding result report")
 			return
 		}
 
@@ -109,14 +124,19 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		advertiseAddr = discovery.GetLocalIP()
 	}
 
-	disc, err := discovery.NewNodeDiscovery(nodeName, 0, []byte(ad), advertiseAddr, 0, nil)
+	gossipKey, err := cfg.GossipKey()
+	if err != nil {
+		return nil, err
+	}
+	disc, err := discovery.NewNodeDiscovery(nodeName, 0, []byte(ad), advertiseAddr, 0, nil,
+		&discovery.Options{EncryptionKey: gossipKey, Profile: cfg.Gossip.Profile})
 	if err != nil {
 		return nil, fmt.Errorf("discovery: %w", err)
 	}
 
 	joinAddr := fmt.Sprintf("%s:%d", masterHost, cfg.Ports.Gossip)
 	if err := disc.Join([]string{joinAddr}); err != nil {
-		disc.Shutdown()
+		_ = disc.Shutdown()
 		return nil, fmt.Errorf("cluster join at %s: %w", joinAddr, err)
 	}
 
@@ -134,57 +154,116 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 		}),
 	}
 	if cfg.TLS.Enabled && cfg.TLS.CAFile != "" {
-		creds, err := credentials.NewClientTLSFromFile(cfg.TLS.CAFile, "")
-		if err != nil {
-			disc.Shutdown()
-			return nil, fmt.Errorf("TLS: %w", err)
+		var creds credentials.TransportCredentials
+		if cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+			// Present a client certificate when one is configured, so a master requiring mutual
+			// TLS accepts this worker.
+			pool := x509.NewCertPool()
+			caPEM, err := os.ReadFile(cfg.TLS.CAFile)
+			if err != nil {
+				_ = disc.Shutdown()
+				return nil, fmt.Errorf("TLS: cannot read ca_file: %w", err)
+			}
+			if !pool.AppendCertsFromPEM(caPEM) {
+				_ = disc.Shutdown()
+				return nil, fmt.Errorf("TLS: ca_file %s contains no usable certificates", cfg.TLS.CAFile)
+			}
+			cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+			if err != nil {
+				_ = disc.Shutdown()
+				return nil, fmt.Errorf("TLS: %w", err)
+			}
+			creds = credentials.NewTLS(&tls.Config{
+				Certificates: []tls.Certificate{cert},
+				RootCAs:      pool,
+				MinVersion:   tls.VersionTLS12,
+			})
+		} else {
+			var err error
+			creds, err = credentials.NewClientTLSFromFile(cfg.TLS.CAFile, "")
+			if err != nil {
+				_ = disc.Shutdown()
+				return nil, fmt.Errorf("TLS: %w", err)
+			}
 		}
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(creds))
 	} else {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
+	if cfg.ClientToken != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(auth.TokenCredentials{
+			Token:    cfg.ClientToken,
+			Insecure: !cfg.TLS.Enabled,
+		}))
+	}
 
 	grpcConn, err := grpc.NewClient(grpcAddr, dialOpts...)
 	if err != nil {
-		disc.Shutdown()
+		_ = disc.Shutdown()
 		return nil, fmt.Errorf("gRPC connect: %w", err)
 	}
 	masterClient := pb.NewSchedulerServiceClient(grpcConn)
 
 	subCtx, cancelSub := context.WithCancel(context.Background())
-	subEndpoint := fmt.Sprintf("tcp://%s:%d", masterHost, cfg.Ports.ZMQ)
 
-	// ZMQ with auto-reconnection
-	msgCh := subscribeWithReconnect(subCtx, subEndpoint)
+	// Dispatch arrives over the same authenticated gRPC connection as everything else.
+	msgCh := watchDispatchWithReconnect(subCtx, masterClient, nodeName)
 
-	fmt.Printf("Worker '%s' joined cluster (master: %s)\n", nodeName, masterHost)
-	fmt.Println("Listening for tasks...")
+	slog.Info("worker joined cluster", "node", nodeName, "master", masterHost)
+
+	// Jobs currently executing on this node, reported by /ready.
+	var runningJobCount atomic.Int64
+
+	// A worker-only node exported nothing: no /metrics, no /health, no /ready. The machines
+	// actually running the workloads were invisible to Prometheus and to any load balancer.
+	// In "both" mode the master already owns this port, so skip it there.
+	var workerHTTP *http.Server
+	if cfg.Role == "worker" {
+		workerHTTP = startWorkerHealth(cfg, nodeName, &runningJobCount)
+	}
 
 	var cancelMu sync.Mutex
 	cancelFuncs := make(map[string]context.CancelFunc)
+	// Attempt currently running for each job, so a re-delivered dispatch — a stream reconnect,
+	// or the master re-dispatching after a lost acknowledgement — does not start a second copy
+	// of a job this worker is already running.
+	runningAttempts := make(map[string]int64)
+
+	// Bound concurrent jobs. Every dispatch used to spawn an unbounded goroutine, so a burst of
+	// submissions could fork a worker to death with nothing to stop it. A nil channel means
+	// unlimited, preserving the previous behaviour when max_concurrent_jobs is unset.
+	var jobSlots chan struct{}
+	if cfg.MaxConcurrentJobs > 0 {
+		jobSlots = make(chan struct{}, cfg.MaxConcurrentJobs)
+	}
 
 	go func() {
 		for msg := range msgCh {
-			var payload messaging.DispatchPayload
-			if err := json.Unmarshal([]byte(msg), &payload); err != nil {
-				continue
-			}
-			if payload.TargetNode != nodeName {
-				continue
-			}
+			// The stream only carries this node's work, so there is nothing to filter.
+			payload := msg
 
 			switch payload.Action {
 			case "cancel":
 				cancelMu.Lock()
-				if cf, ok := cancelFuncs[payload.JobID]; ok {
-					fmt.Printf("Cancelling job %s...\n", payload.JobID)
+				if cf, ok := cancelFuncs[payload.JobId]; ok {
+					logging.Job(payload.JobId).Info("cancelling")
 					cf()
 				}
 				cancelMu.Unlock()
 
 			case "execute", "":
-				go func(p messaging.DispatchPayload) {
-					acknowledgeStart(masterHost, cfg.Ports.Metrics, p.JobID)
+				cancelMu.Lock()
+				if running, busy := runningAttempts[payload.JobId]; busy && running >= payload.Attempt {
+					cancelMu.Unlock()
+					logging.Job(payload.JobId).Info("already running, ignoring duplicate dispatch",
+						"running_attempt", running, "offered_attempt", payload.Attempt)
+					continue
+				}
+				runningAttempts[payload.JobId] = payload.Attempt
+				cancelMu.Unlock()
+
+				go func(p *pb.DispatchMessage) {
+					acknowledgeStart(subCtx, masterClient, nodeName, p)
 					var ctx context.Context
 					var cf context.CancelFunc
 					if p.WalltimeSeconds > 0 {
@@ -194,23 +273,44 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					}
 
 					cancelMu.Lock()
-					cancelFuncs[p.JobID] = cf
+					cancelFuncs[p.JobId] = cf
 					cancelMu.Unlock()
 
 					defer func() {
 						cf()
 						cancelMu.Lock()
-						delete(cancelFuncs, p.JobID)
+						delete(cancelFuncs, p.JobId)
+						if runningAttempts[p.JobId] == p.Attempt {
+							delete(runningAttempts, p.JobId)
+						}
 						cancelMu.Unlock()
 					}()
 
-					fmt.Printf("Job %s: executing '%s'...\n", p.JobID, p.Command)
+					if jobSlots != nil {
+						jobSlots <- struct{}{}
+						defer func() { <-jobSlots }()
+					}
+
+					runningJobCount.Add(1)
+					defer runningJobCount.Add(-1)
+
+					logging.Job(p.JobId).Info("executing", "command", p.Command, "attempt", p.Attempt)
 					startTime := time.Now()
 
-					var stdout, stderr bytes.Buffer
+					// Cap captured output. It was buffered without limit — a chatty job could OOM
+					// the worker and every job sharing it — and then, if the job survived, the
+					// oversized result was rejected by gRPC's 4 MiB receive limit, leaving
+					// reportWithRetry looping forever on a permanent error.
+					outputLimit := cfg.MaxOutputBytes
+					if outputLimit <= 0 {
+						outputLimit = defaultMaxOutputBytes
+					}
+					stdout := newCappedBuffer(outputLimit)
+					stderr := newCappedBuffer(outputLimit)
+
 					cmd := prepareCommand(ctx, p.Command)
-					cmd.Stdout = &stdout
-					cmd.Stderr = &stderr
+					cmd.Stdout = stdout
+					cmd.Stderr = stderr
 
 					if len(p.EnvVars) > 0 {
 						env := os.Environ()
@@ -239,15 +339,16 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 						} else if ctx.Err() == context.Canceled {
 							errMsg = "cancelled"
 						}
-						fmt.Printf("Job %s error: %s\n", p.JobID, errMsg)
+						logging.Job(p.JobId).Warn("job failed", "error", errMsg)
 					} else {
-						fmt.Printf("Job %s completed.\n", p.JobID)
+						logging.Job(p.JobId).Info("completed", "duration", endTime.Sub(startTime))
 					}
 
 					reportWithRetry(subCtx, masterClient, &pb.ReportResultRequest{
-						JobId: p.JobID, WorkerNode: nodeName, Success: success,
+						JobId: p.JobId, WorkerNode: nodeName, Success: success,
 						Output: stdout.String(), Error: errMsg,
 						StartTime: startTime.Unix(), EndTime: endTime.Unix(),
+						Attempt: p.Attempt,
 					})
 				}(payload)
 			}
@@ -255,27 +356,84 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	}()
 
 	return func() {
+		if workerHTTP != nil {
+			shutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := workerHTTP.Shutdown(shutdownCtx); err != nil {
+				slog.Error("worker health server shutdown", "error", err)
+			}
+			cancelHTTP()
+		}
 		cancelSub()
-		grpcConn.Close()
-		disc.Shutdown()
+		func() { _ = grpcConn.Close() }()
+		_ = disc.Shutdown()
 	}, nil
 }
 
-func acknowledgeStart(masterHost string, port int, jobID string) {
-	url := fmt.Sprintf("http://%s:%d/acknowledge_start", masterHost, port)
-	payload := map[string]string{"job_id": jobID}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	for i := 0; i < 3; i++ {
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(b))
+// acknowledgeStart tells the master this worker has begun a job.
+//
+// This used to be an unauthenticated HTTP POST to the master's metrics port, with the port
+// taken from the worker's own config — so the handshake silently failed whenever the master's
+// metrics port differed, and the master then re-dispatched a job that was already running.
+func acknowledgeStart(ctx context.Context, client pb.SchedulerServiceClient, nodeName string, p *pb.DispatchMessage) {
+	for attempt := 0; attempt < 3; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := client.AcknowledgeStart(callCtx, &pb.AcknowledgeStartRequest{
+			JobId: p.JobId, WorkerNode: nodeName, Attempt: p.Attempt,
+		})
+		cancel()
 		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return
-			}
+			return
 		}
-		time.Sleep(500 * time.Millisecond)
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			return
+		}
 	}
+	logging.Job(p.JobId).Warn("could not acknowledge start; the master may re-dispatch this job")
+}
+
+// startWorkerHealth serves liveness, readiness, and metrics for a worker-only node.
+func startWorkerHealth(cfg *config.Config, nodeName string, running *atomic.Int64) *http.Server {
+	initMetrics()
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ready", "node": nodeName, "running_jobs": running.Load(),
+		})
+	})
+
+	bind := cfg.MetricsBind
+	if bind == "" {
+		bind = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", bind, cfg.Ports.Metrics)
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		slog.Info("worker health and metrics listening", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("worker health server error", "error", err)
+		}
+	}()
+	return server
 }

@@ -11,16 +11,36 @@ import (
 // metaDelegate implements memberlist.Delegate to attach dynamic ClassAd payload.
 type metaDelegate struct {
 	meta []byte
+
+	// oversizeLogged keeps the once-per-process warning from repeating: memberlist calls
+	// NodeMeta on every gossip round.
+	oversizeLogged bool
 }
 
+// NodeMeta returns the node's gossip metadata, never exceeding limit.
+//
+// memberlist panics — it does not return an error — when a delegate hands back metadata
+// longer than MetaMaxSize, so honoring limit here is load-bearing. Callers are expected to
+// have sized the payload already (see profiler.MaxMetaBytes); this is the backstop that
+// turns a would-be panic into a degraded node. Dropping the metadata entirely is deliberate:
+// truncating JSON mid-document would produce a payload that parses to an all-zero ClassAd,
+// which reads as a node with no resources and silently matches jobs it cannot run.
 func (m *metaDelegate) NodeMeta(limit int) []byte {
-	return m.meta
+	if len(m.meta) <= limit {
+		return m.meta
+	}
+	if !m.oversizeLogged {
+		m.oversizeLogged = true
+		log.Printf("class ad is %d bytes, over the %d byte gossip limit — advertising no metadata; "+
+			"this node will not match any job", len(m.meta), limit)
+	}
+	return nil
 }
 
-func (m *metaDelegate) NotifyMsg(b []byte) {}
+func (m *metaDelegate) NotifyMsg(b []byte)                         {}
 func (m *metaDelegate) GetBroadcasts(overhead, limit int) [][]byte { return nil }
-func (m *metaDelegate) LocalState(join bool) []byte { return nil }
-func (m *metaDelegate) MergeRemoteState(buf []byte, join bool) {}
+func (m *metaDelegate) LocalState(join bool) []byte                { return nil }
+func (m *metaDelegate) MergeRemoteState(buf []byte, join bool)     {}
 
 // eventDelegate implements memberlist.EventDelegate to detect node join/leave.
 type eventDelegate struct {
@@ -57,10 +77,48 @@ type EventHooks struct {
 // advertiseAddr/advertisePort allow remote workers to advertise their real IP
 // to the cluster instead of 127.0.0.1. Pass empty string / 0 to skip.
 // hooks is optional — pass nil if no event callbacks are needed.
-func NewNodeDiscovery(nodeName string, bindPort int, meta []byte, advertiseAddr string, advertisePort int, hooks *EventHooks) (*NodeDiscovery, error) {
-	config := memberlist.DefaultLocalConfig()
+// Options configures gossip beyond the basics.
+type Options struct {
+	// EncryptionKey enables authenticated encryption of gossip traffic when set (16, 24, or 32
+	// bytes). Without it, membership is open: any host can join, declare its own name, and
+	// advertise fabricated resources to attract every job in the cluster. It also lets anyone
+	// on the path forge failure messages that evict healthy nodes.
+	EncryptionKey []byte
+
+	// Profile selects memberlist timing: "lan" (default), "wan", or "local".
+	Profile string
+}
+
+// profileConfig returns memberlist timings for a named profile.
+//
+// The default used to be DefaultLocalConfig, which is tuned for loopback: sub-second probe
+// timeouts produce false failure detections on any real network, and each one marks every job
+// on the wrongly-declared-dead node as failed.
+func profileConfig(profile string) *memberlist.Config {
+	switch profile {
+	case "wan":
+		return memberlist.DefaultWANConfig()
+	case "local":
+		return memberlist.DefaultLocalConfig()
+	default:
+		return memberlist.DefaultLANConfig()
+	}
+}
+
+func NewNodeDiscovery(nodeName string, bindPort int, meta []byte, advertiseAddr string, advertisePort int, hooks *EventHooks, opts *Options) (*NodeDiscovery, error) {
+	if opts == nil {
+		opts = &Options{}
+	}
+	config := profileConfig(opts.Profile)
 	config.Name = nodeName
 	config.BindPort = bindPort
+
+	if len(opts.EncryptionKey) > 0 {
+		config.SecretKey = opts.EncryptionKey
+	} else {
+		log.Printf("WARNING: gossip is unencrypted and unauthenticated on port %d — any host "+
+			"that can reach it can join the cluster. Set gossip.encryption_key in the config.", bindPort)
+	}
 
 	if advertiseAddr != "" {
 		config.AdvertiseAddr = advertiseAddr

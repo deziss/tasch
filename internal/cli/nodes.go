@@ -19,7 +19,7 @@ func NodesCmd(cfgLoader func() *config.Config) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := cfgLoader()
 			client, conn := GetClient(cfg)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := client.WorkerStatus(context.Background(), &pb.WorkerStatusRequest{})
 			if err != nil {

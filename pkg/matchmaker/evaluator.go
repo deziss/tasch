@@ -8,6 +8,14 @@ import (
 	"github.com/google/cel-go/cel"
 )
 
+// maxCachedPrograms bounds the compiled-program cache.
+//
+// The cache is keyed on the raw requirement string, which comes from job submissions, and was
+// never evicted: a stream of jobs with distinct requirements retained a compiled AST for each
+// one for the master's lifetime. The bound is generous — real clusters reuse a handful of
+// expressions — so the cache still hits in every normal workload.
+const maxCachedPrograms = 1024
+
 // Evaluator compiles Job requirement expressions and evaluates them against worker advertisements.
 type Evaluator struct {
 	env   *cel.Env
@@ -50,6 +58,11 @@ func (e *Evaluator) Match(expression string, adJSON string) (bool, error) {
 		}
 
 		e.mu.Lock()
+		// Drop the whole cache rather than tracking recency. Requirements repeat heavily in
+		// practice, so the cache refills immediately; the point is only to cap the ceiling.
+		if len(e.cache) >= maxCachedPrograms {
+			e.cache = make(map[string]cel.Program, maxCachedPrograms)
+		}
 		e.cache[expression] = prg
 		e.mu.Unlock()
 	}
@@ -75,4 +88,20 @@ func (e *Evaluator) Match(expression string, adJSON string) (bool, error) {
 	}
 
 	return out.Value().(bool), nil
+}
+
+// Validate compiles an expression without evaluating it, so a malformed requirement can be
+// rejected when the job is submitted rather than leaving it queued forever with no diagnostic.
+func (e *Evaluator) Validate(expression string) error {
+	if expression == "" {
+		return fmt.Errorf("requirement is empty")
+	}
+	ast, issues := e.env.Compile(expression)
+	if issues != nil && issues.Err() != nil {
+		return fmt.Errorf("compile error: %w", issues.Err())
+	}
+	if ast.OutputType() != cel.BoolType {
+		return fmt.Errorf("requirement must evaluate to a boolean, got %s", ast.OutputType())
+	}
+	return nil
 }

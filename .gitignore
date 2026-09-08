@@ -1,7 +1,56 @@
+# --- Build output ---
 bin/
 dist/
-*.log
+*.exe
+*.deb
+*.rpm
+*.tar.gz
+coverage.out
+coverage.txt
+*.test
+*.prof
+
+# --- Runtime state ---
+# Never commit a scheduler database: it holds every job's captured output and environment
+# variables, which routinely include API tokens.
+*.db
 *.pid
+*.log
 .tasch/
+
+# --- Credentials and keys ---
+# Tasch config can carry auth tokens and points at TLS material. Keep all of it out of git.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+config.local.yaml
+principals.yaml
+secrets/
+.env
+.env.*
+!.env.example
+
+# --- Go ---
 vendor/
+
+# --- Agent and editor tooling ---
+# Local assistant configuration, not part of the project.
+.claude/
+.agents/
+.agent/
+.specify/
 graphify-out/
+CLAUDE.md
+AGENTS.md
+.cursor/
+.aider*
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db

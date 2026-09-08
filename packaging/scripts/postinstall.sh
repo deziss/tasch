@@ -11,10 +11,18 @@ mkdir -p /var/lib/tasch
 chown -R tasch:tasch /var/lib/tasch
 chmod 750 /var/lib/tasch
 
-# Ensure /etc/tasch exists
+# Ensure /etc/tasch exists.
+#
+# 0750 and root-owned: the config names TLS key paths and can hold authentication tokens, and
+# the daemon only needs to read it. Leaving it writable by the tasch user meant anyone who
+# reached code execution as that account could rewrite its own configuration.
 mkdir -p /etc/tasch
-chown tasch:tasch /etc/tasch
-chmod 755 /etc/tasch
+chown root:tasch /etc/tasch
+chmod 750 /etc/tasch
+if [ -f /etc/tasch/config.yaml ]; then
+    chown root:tasch /etc/tasch/config.yaml
+    chmod 640 /etc/tasch/config.yaml
+fi
 
 # Reload systemd if available
 if command -v systemctl > /dev/null; then

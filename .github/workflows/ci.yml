@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Must stay at or above the toolchain pinned in go.mod: earlier patch releases carry
+  # known standard-library vulnerabilities that govulncheck reports against this code.
+  GO_VERSION: "1.25.13"
+
+jobs:
+  verify:
+    name: Vet, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Test with race detector
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Enforce scheduler coverage floor
+        # The scheduling core had no tests at all. This keeps it from regressing to zero.
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          for pkg in pkg/scheduler internal/daemon internal/auth internal/config; do
+            pct=$(go tool cover -func=coverage.out | grep "tasch/$pkg/" | \
+              awk '{gsub("%","",$NF); s+=$NF; n++} END {if (n>0) printf "%.1f", s/n; else print "0"}')
+            echo "$pkg: ${pct}%"
+            if [ "$(echo "$pct < 5" | bc -l)" = "1" ]; then
+              echo "::error::$pkg coverage ${pct}% is below the 5% floor"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Every target must compile: the platform-specific profiler and exec files are behind
+      # build tags, so a change to one of them breaks only that GOOS and nothing else catches it.
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath ./...
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...

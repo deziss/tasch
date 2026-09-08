@@ -1,15 +1,57 @@
 [Unit]
 Description=Tasch — Distributed Task Scheduler
-After=network.target
+Documentation=https://github.com/deziss/tasch
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=tasch
 Group=tasch
 ExecStart=/usr/bin/tasch start --config /etc/tasch/config.yaml
+ExecStop=/usr/bin/tasch stop --config /etc/tasch/config.yaml
 Restart=on-failure
 RestartSec=5s
+
+# Must outlast the daemon's own drain (drain_timeout, default 60s) plus the stop command's
+# margin, or systemd kills the master mid-drain with database writes still in flight.
+TimeoutStopSec=120
+
 LimitNOFILE=65535
+
+# State and runtime directories, created and owned by systemd.
+StateDirectory=tasch
+StateDirectoryMode=0750
+
+# --- Hardening ---
+#
+# Note the inherent limit: a Tasch worker's job is to run arbitrary user commands as this
+# service account, so anything that would confine the *job* also confines the scheduler. These
+# settings therefore protect the host from the daemon, not the host from a submitted job. Job
+# isolation needs per-job cgroups or containers, which Tasch does not yet implement — see
+# SECURITY.md before exposing this to anyone you do not fully trust.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# PrivateDevices is left off and /dev access preserved so GPU device nodes remain visible to
+# jobs. Narrow this with DeviceAllow if the node has no GPUs.
 
 [Install]
 WantedBy=multi-user.target

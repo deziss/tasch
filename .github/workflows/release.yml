@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write   # required for keyless cosign signing
+
+env:
+  GO_VERSION: "1.25.13"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # so the Makefile can stamp the commit
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Never publish a build that has not passed the gate.
+      - name: Verify
+        run: |
+          make fmt-check
+          go vet ./...
+          go test ./... -race
+
+      - name: Check the tag matches the VERSION file
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          file="$(cat VERSION)"
+          if [ "$tag" != "$file" ]; then
+            echo "::error::tag v$tag does not match VERSION ($file)"
+            exit 1
+          fi
+
+      - name: Cross-compile
+        run: ./build.sh
+
+      - name: Package .deb and .rpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          make package
+
+      - name: Checksums
+        run: |
+          cd dist
+          find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the signature is bound to this workflow's identity, so a downloader can
+      # verify the artifacts were produced by this repository's release job and not substituted.
+      - name: Sign the checksum file
+        run: cosign sign-blob --yes --output-signature dist/SHA256SUMS.sig --output-certificate dist/SHA256SUMS.pem dist/SHA256SUMS
+
+      - name: Generate SBOM
+        run: |
+          go install github.com/anchore/syft/cmd/syft@latest
+          syft . -o spdx-json=dist/sbom.spdx.json
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            dist/bin/*
+            dist/*.deb
+            dist/*.rpm
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
+            dist/sbom.spdx.json
+          generate_release_notes: true

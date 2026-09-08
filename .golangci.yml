@@ -1,0 +1,33 @@
+version: "2"
+
+# Linters for Tasch.
+#
+# The set is deliberately close to the defaults plus the checks that would have caught the
+# classes of defect this codebase actually shipped: ignored errors on writes that mattered,
+# unchecked assertions, and dead code.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unconvert
+    - unused
+
+  exclusions:
+    rules:
+      # Generated protobuf code is not ours to lint.
+      - path: 'api/v1/.*\.pb\.go'
+        linters: [errcheck, govet, staticcheck, unused, unconvert]
+      # Test helpers legitimately ignore errors on setup writes.
+      - path: '_test\.go'
+        linters: [errcheck]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

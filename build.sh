@@ -16,6 +16,11 @@ PLATFORMS=(
 OUTPUT_DIR="dist/bin"
 mkdir -p "$OUTPUT_DIR"
 
+MODULE="github.com/deziss/tasch"
+VERSION="$(cat VERSION)"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 echo "=== Starting Tasch Cross-Compilation ==="
 echo "Output directory: $OUTPUT_DIR"
 echo ""
@@ -37,9 +42,12 @@ for platform in "${PLATFORMS[@]}"; do
     
     echo "Building for OS=${GOOS} ARCH=${GOARCH}..."
     
-    # Compile with flags to strip symbols and debug information (-s -w) to reduce binary size
+    # Same flags as `make build`, so the cross-compiled artifacts and the packaged binary are
+    # the same build. They used to differ: build.sh stripped and disabled cgo while the Makefile
+    # did neither, and it was the Makefile's output that shipped in the .deb and .rpm.
     CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
-        -ldflags="-s -w" \
+        -trimpath \
+        -ldflags="-s -w -X '${MODULE}/internal/version.Version=${VERSION}' -X '${MODULE}/internal/version.Commit=${COMMIT}' -X '${MODULE}/internal/version.BuildDate=${BUILD_DATE}'" \
         -o "$output_path" \
         ./cmd/tasch
         
@@ -49,3 +57,9 @@ done
 echo ""
 echo "=== Build Complete ==="
 ls -lh "$OUTPUT_DIR"
+
+# Publish these alongside the binaries. Without them a downloader has no way to check that the
+# binary they are about to run on every node is the one that was built here.
+( cd "$OUTPUT_DIR" && sha256sum ./* > SHA256SUMS )
+echo ""
+echo "Checksums: $OUTPUT_DIR/SHA256SUMS"

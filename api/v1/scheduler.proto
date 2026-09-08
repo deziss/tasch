@@ -195,10 +195,18 @@ message NodeSchedulingState {
 
 message ListJobsRequest {
   string state_filter = 1; // Optional: filter by state
+
+  // Pagination. The response previously carried every job in one message, which on a busy
+  // cluster is both an unbounded allocation on the master and a response that can exceed gRPC's
+  // receive limit, making the call fail outright rather than return a large result.
+  int32 page_size = 2;     // 0 uses the server default; capped by the server maximum
+  string page_token = 3;   // next_page_token from a previous response
 }
 
 message ListJobsResponse {
   repeated JobInfo jobs = 1;
+  string next_page_token = 2;  // empty when this is the last page
+  int32 total_matching = 3;    // jobs matching the filter, across all pages
 }
 
 message JobInfo {

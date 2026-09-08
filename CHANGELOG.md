@@ -51,6 +51,13 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Added — API
+
+- **`ListJobs` is paginated.** It previously returned every job in one message: an unbounded
+  allocation on the master, and on a busy cluster a response large enough to exceed gRPC's
+  receive limit and fail the call outright rather than return a large result. The CLI follows
+  pages transparently, and `tasch jobs --limit` bounds what it prints, reporting what it omitted.
+
 ### Added — node maintenance
 
 - **`tasch nodes cordon`, `uncordon` and `drain`.** There was no way to take a node out of

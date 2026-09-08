@@ -25,6 +25,13 @@ func parseEnvFlags(envFlags []string) map[string]string {
 	return result
 }
 
+// defaultListLimit bounds what a bare `tasch jobs` prints. A busy cluster holds far more jobs
+// than anyone wants scrolling past; the count of what was omitted is shown at the end.
+const defaultListLimit = 200
+
+// jobsLimit is set by the --limit flag.
+var jobsLimit = defaultListLimit
+
 // JobsCmd returns the `tasch jobs` command tree.
 func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	var listStateFilter string
@@ -41,6 +48,7 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 		},
 	}
 	jobsCmd.Flags().StringVarP(&listStateFilter, "state", "s", "", "Filter by state (QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED)")
+	jobsCmd.Flags().IntVar(&jobsLimit, "limit", defaultListLimit, "Maximum jobs to show; 0 for all")
 
 	// --- submit ---
 	var submitPriority int32
@@ -312,19 +320,47 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 	return jobsCmd
 }
 
-func listJobs(client pb.SchedulerServiceClient, stateFilter string) {
-	resp, err := client.ListJobs(context.Background(), &pb.ListJobsRequest{StateFilter: stateFilter})
-	if err != nil {
-		log.Fatalf("Failed to list jobs: %v", err)
+// fetchJobs follows pagination so callers see a complete list.
+//
+// limit caps the number of jobs returned; 0 means every page. The server pages responses
+// because an unpaged listing on a busy cluster can exceed gRPC's receive limit and fail
+// outright, so the client has to walk them.
+func fetchJobs(client pb.SchedulerServiceClient, stateFilter string, limit int) ([]*pb.JobInfo, int32) {
+	var (
+		all   []*pb.JobInfo
+		token string
+		total int32
+	)
+	for {
+		resp, err := client.ListJobs(context.Background(), &pb.ListJobsRequest{
+			StateFilter: stateFilter, PageToken: token,
+		})
+		if err != nil {
+			log.Fatalf("Failed to list jobs: %v", err)
+		}
+		total = resp.TotalMatching
+		all = append(all, resp.Jobs...)
+
+		if limit > 0 && len(all) >= limit {
+			return all[:limit], total
+		}
+		if resp.NextPageToken == "" {
+			return all, total
+		}
+		token = resp.NextPageToken
 	}
-	if len(resp.Jobs) == 0 {
+}
+
+func listJobs(client pb.SchedulerServiceClient, stateFilter string) {
+	jobs, total := fetchJobs(client, stateFilter, jobsLimit)
+	if len(jobs) == 0 {
 		fmt.Println("No jobs found.")
 		return
 	}
 
 	fmt.Printf("%-18s %-12s %-10s %-15s %-6s %-14s %s\n", "JOB_ID", "STATE", "USER", "WORKER", "PRI", "GROUP", "COMMAND")
 	fmt.Println(strings.Repeat("-", 110))
-	for _, j := range resp.Jobs {
+	for _, j := range jobs {
 		command := j.Command
 		if len(command) > 25 {
 			command = command[:22] + "..."
@@ -335,5 +371,8 @@ func listJobs(client pb.SchedulerServiceClient, stateFilter string) {
 		}
 		fmt.Printf("%-18s %-12s %-10s %-15s %-6d %-14s %s\n",
 			j.JobId, j.State, j.User, j.WorkerNode, j.Priority, group, command)
+	}
+	if int32(len(jobs)) < total {
+		fmt.Printf("\nShowing %d of %d jobs. Use --limit 0 for all.\n", len(jobs), total)
 	}
 }

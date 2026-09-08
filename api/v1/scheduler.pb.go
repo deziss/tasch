@@ -1283,8 +1283,13 @@ func (x *NodeSchedulingState) GetGpusAllocated() int32 {
 }
 
 type ListJobsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StateFilter   string                 `protobuf:"bytes,1,opt,name=state_filter,json=stateFilter,proto3" json:"state_filter,omitempty"` // Optional: filter by state
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	StateFilter string                 `protobuf:"bytes,1,opt,name=state_filter,json=stateFilter,proto3" json:"state_filter,omitempty"` // Optional: filter by state
+	// Pagination. The response previously carried every job in one message, which on a busy
+	// cluster is both an unbounded allocation on the master and a response that can exceed gRPC's
+	// receive limit, making the call fail outright rather than return a large result.
+	PageSize      int32  `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`   // 0 uses the server default; capped by the server maximum
+	PageToken     string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"` // next_page_token from a previous response
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1326,9 +1331,25 @@ func (x *ListJobsRequest) GetStateFilter() string {
 	return ""
 }
 
+func (x *ListJobsRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListJobsRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
 type ListJobsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Jobs          []*JobInfo             `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	NextPageToken string                 `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"` // empty when this is the last page
+	TotalMatching int32                  `protobuf:"varint,3,opt,name=total_matching,json=totalMatching,proto3" json:"total_matching,omitempty"`  // jobs matching the filter, across all pages
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1368,6 +1389,20 @@ func (x *ListJobsResponse) GetJobs() []*JobInfo {
 		return x.Jobs
 	}
 	return nil
+}
+
+func (x *ListJobsResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
+}
+
+func (x *ListJobsResponse) GetTotalMatching() int32 {
+	if x != nil {
+		return x.TotalMatching
+	}
+	return 0
 }
 
 type JobInfo struct {
@@ -1743,11 +1778,16 @@ const file_scheduler_proto_rawDesc = "" +
 	"\rcordon_reason\x18\x02 \x01(\tR\fcordonReason\x12%\n" +
 	"\x0ecircuit_broken\x18\x03 \x01(\bR\rcircuitBroken\x12!\n" +
 	"\frunning_jobs\x18\x04 \x01(\x05R\vrunningJobs\x12%\n" +
-	"\x0egpus_allocated\x18\x05 \x01(\x05R\rgpusAllocated\"4\n" +
+	"\x0egpus_allocated\x18\x05 \x01(\x05R\rgpusAllocated\"p\n" +
 	"\x0fListJobsRequest\x12!\n" +
-	"\fstate_filter\x18\x01 \x01(\tR\vstateFilter\"3\n" +
+	"\fstate_filter\x18\x01 \x01(\tR\vstateFilter\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\"\x82\x01\n" +
 	"\x10ListJobsResponse\x12\x1f\n" +
-	"\x04jobs\x18\x01 \x03(\v2\v.v1.JobInfoR\x04jobs\"\xff\x01\n" +
+	"\x04jobs\x18\x01 \x03(\v2\v.v1.JobInfoR\x04jobs\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12%\n" +
+	"\x0etotal_matching\x18\x03 \x01(\x05R\rtotalMatching\"\xff\x01\n" +
 	"\aJobInfo\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x18\n" +

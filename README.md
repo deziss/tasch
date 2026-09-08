@@ -104,6 +104,7 @@ tasch stop                     # graceful drain + shutdown
 | **Encrypted gossip** | `gossip.encryption_key` authenticates and encrypts membership traffic, so arbitrary hosts cannot join |
 | **Per-node dispatch** | Each worker receives only its own jobs, over the authenticated gRPC connection — commands and env vars are never broadcast |
 | **Queue limits** | Max 10,000 jobs (configurable). Rejects when full |
+| **Paginated listing** | `ListJobs` pages server-side; the CLI follows pages, and `--limit` bounds what it prints |
 | **CEL matchmaking** | `ad.gpu_count >= 2 && ad.gpu_vendor == "nvidia" && ad.os == "linux"` |
 | **Backfill scheduling** | Lower-priority jobs fill idle nodes while big jobs wait |
 | **Fairshare** | Heavy users get priority penalties (auto-decaying) |

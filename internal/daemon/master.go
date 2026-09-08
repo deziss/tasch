@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -445,6 +446,45 @@ var (
 // reports the master unhealthy. The loop ticks once a second.
 const schedulerStallThreshold = 30 * time.Second
 
+// Page sizing for list responses. The response used to carry every job in one message, which
+// is an unbounded allocation on the master and can exceed gRPC's receive limit outright.
+const (
+	defaultPageSize = 100
+	maxPageSize     = 1000
+)
+
+// paginate returns one page of jobs and the token for the next, if any.
+//
+// The token is the offset. That is simple and adequate here: the ordering is stable, and a job
+// submitted between two calls shifts the window by one rather than corrupting it. A cursor keyed
+// on the last item would be sturdier if the ordering ever becomes user-selectable.
+func paginate(jobs []*scheduler.Job, token string, size int) ([]*scheduler.Job, string, error) {
+	if size <= 0 {
+		size = defaultPageSize
+	}
+	if size > maxPageSize {
+		size = maxPageSize
+	}
+
+	offset := 0
+	if token != "" {
+		parsed, err := strconv.Atoi(token)
+		if err != nil || parsed < 0 {
+			return nil, "", status.Errorf(codes.InvalidArgument, "invalid page_token %q", token)
+		}
+		offset = parsed
+	}
+	if offset >= len(jobs) {
+		return nil, "", nil
+	}
+
+	end := offset + size
+	if end >= len(jobs) {
+		return jobs[offset:], "", nil
+	}
+	return jobs[offset:end], strconv.Itoa(end), nil
+}
+
 // maxGroupNodes caps a distributed job's rank count. num_nodes was only clamped upward, so a
 // single request could create an unbounded number of jobs and log entries.
 const maxGroupNodes = 1024
@@ -717,32 +757,69 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to load dead letters: %v", err)
 			}
+			visible := deadLetters[:0]
 			for _, j := range deadLetters {
-				if !auth.CanAccessJob(caller, j.User) {
-					continue
+				if auth.CanAccessJob(caller, j.User) {
+					visible = append(visible, j)
 				}
+			}
+			sort.Slice(visible, func(a, b int) bool {
+				if !visible[a].SubmitTime.Equal(visible[b].SubmitTime) {
+					return visible[a].SubmitTime.After(visible[b].SubmitTime)
+				}
+				return visible[a].ID < visible[b].ID
+			})
+
+			page, nextToken, err := paginate(visible, req.PageToken, int(req.PageSize))
+			if err != nil {
+				return nil, err
+			}
+			for _, j := range page {
 				infos = append(infos, &pb.JobInfo{
 					JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
 					WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
 					SubmitTime: j.SubmitTime.Unix(), GroupId: j.GroupID,
 				})
 			}
+			return &pb.ListJobsResponse{
+				Jobs: infos, NextPageToken: nextToken, TotalMatching: int32(len(visible)),
+			}, nil
 		}
 		return &pb.ListJobsResponse{Jobs: infos}, nil
 	}
 
 	jobs := s.queue.ListJobs(stateFilter)
+
+	visible := jobs[:0]
 	for _, j := range jobs {
-		if !auth.CanAccessJob(caller, j.User) {
-			continue
+		if auth.CanAccessJob(caller, j.User) {
+			visible = append(visible, j)
 		}
+	}
+
+	// Jobs live in a map, so impose a deterministic order before paging. Newest first, with the
+	// ID breaking ties, so a token stays meaningful between calls.
+	sort.Slice(visible, func(a, b int) bool {
+		if !visible[a].SubmitTime.Equal(visible[b].SubmitTime) {
+			return visible[a].SubmitTime.After(visible[b].SubmitTime)
+		}
+		return visible[a].ID < visible[b].ID
+	})
+
+	page, nextToken, err := paginate(visible, req.PageToken, int(req.PageSize))
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range page {
 		infos = append(infos, &pb.JobInfo{
 			JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
 			WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
 			SubmitTime: j.SubmitTime.Unix(), GroupId: j.GroupID,
 		})
 	}
-	return &pb.ListJobsResponse{Jobs: infos}, nil
+	return &pb.ListJobsResponse{
+		Jobs: infos, NextPageToken: nextToken, TotalMatching: int32(len(visible)),
+	}, nil
 }
 
 func (s *schedulerServer) StreamLogs(req *pb.LogStreamRequest, stream pb.SchedulerService_StreamLogsServer) error {

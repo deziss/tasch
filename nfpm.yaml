@@ -1,14 +1,14 @@
 name: "tasch"
 arch: "amd64"
 platform: "linux"
-version: "0.1.0"
+version: "${VERSION}"
 section: "default"
 priority: "extra"
 maintainer: "Tasch Maintainers <info@tasch.io>"
 description: "Tasch — Distributed Task Scheduler"
 vendor: "Tasch"
 homepage: "https://github.com/deziss/tasch"
-license: "MIT"
+license: "AGPL-3.0-or-later"
 
 contents:
   - src: "bin/tasch"

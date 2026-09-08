@@ -78,15 +78,22 @@ type DispatchPayload struct {
 | `/health` | GET | Liveness (200 always) |
 | `/ready` | GET | Readiness (members, queue_depth, draining) |
 | `/metrics` | GET | Prometheus metrics |
-| `/acknowledge_start` | POST | Worker → master job start handshake |
 
-### `/acknowledge_start` Request
+### `AcknowledgeStart`
 
-```json
-{ "job_id": "a3f2b1c0" }
+Worker → master job start handshake, over the authenticated gRPC connection.
+
+```protobuf
+message AcknowledgeStartRequest {
+  string job_id = 1;
+  string worker_node = 2;
+  int64 attempt = 3;      // Fencing token from the dispatch
+}
 ```
 
-Response: `200 {"status":"acknowledged"}` or `404 {"status":"not_found"}` if job not in pending map (already timed out or re-queued).
+It replaced an unauthenticated HTTP POST on the metrics port, which both allowed forged
+acknowledgements and required the worker to guess the master's metrics port from its own config.
+
 
 ### Prometheus Metrics
 

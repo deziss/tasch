@@ -203,7 +203,7 @@ Missing fields → `false` (non-match), not error.
 Failed jobs auto-retry up to `max_retries` (default 3) with exponential backoff. After all retries, moved to dead letter queue. Distributed training jobs do NOT retry — if one rank fails, all siblings are cancelled.
 
 ### Dispatch Handshake
-After receiving a job via ZMQ, workers send an HTTP acknowledgement to the master's `/acknowledge_start` endpoint. If the master doesn't receive acknowledgement within 10 seconds, the job is automatically re-queued. This prevents silent job loss due to network issues.
+After receiving a job on its dispatch stream, a worker calls the `AcknowledgeStart` RPC. If the master receives no acknowledgement within 10 seconds, the job is automatically re-queued. This prevents silent job loss due to network issues.
 
 ### Persistence
 All jobs persisted to `tasch.db`.
@@ -251,7 +251,7 @@ Max `max_queue_size` jobs in queue (default 10,000). New submissions rejected wi
 `tasch stop` → master stops accepting new jobs → waits up to `drain_timeout` seconds for running jobs to finish → then shuts down.
 
 ### Health Checks
-- `/health` — liveness (always 200)
+- `/health` — liveness (503 if the scheduling loop has stalled)
 - `/ready` — readiness (member count, queue depth, drain status)
 - `/metrics` — Prometheus metrics
 

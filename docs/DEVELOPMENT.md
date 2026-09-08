@@ -9,7 +9,7 @@ make rpm         # → build .rpm package
 make package     # → build both
 make clean       # remove binary and dist/
 make proto       # regenerate gRPC stubs
-make test        # unit tests (13 tests)
+make test        # unit tests (the test suite)
 make run-test    # build + integration test (13 scenarios)
 ```
 
@@ -19,7 +19,7 @@ make run-test    # build + integration test (13 scenarios)
 chmod +x build.sh && ./build.sh
 ```
 
-Outputs to `dist/`:
+Outputs to `dist/bin/`:
 
 | Binary | OS | Arch |
 |--------|----|------|
@@ -43,7 +43,7 @@ internal/
   daemon/
     master.go                  # Scheduler, gRPC handlers, circuit breaker, multi-resource tracker,
                                # retry, async persistence, dispatch handshake, walltime enforcer
-    worker.go                  # Executor, ZMQ auto-reconnect, gRPC keepalive, start acknowledgement
+    worker.go                  # Executor, dispatch stream reconnect, gRPC keepalive, start acknowledgement
     exec_unix.go               # Unix sh -c command builder  (//go:build !windows)
     exec_windows.go            # Windows cmd.exe command builder (//go:build windows)
     metrics.go                 # 10 Prometheus metrics
@@ -54,7 +54,7 @@ internal/
     connect.go                 # gRPC client from config
 pkg/
   profiler/
-    profiler.go                # Shared Host struct + top-level profiling
+    profiler.go                # Shared ClassAd struct + profiling + gossip size fitting
     profiler_linux.go          # NVIDIA + AMD + Jetson (//go:build linux)
     profiler_windows.go        # WMI/PowerShell + NVIDIA fallback (//go:build windows)
     profiler_darwin.go         # Apple Metal + Unified Memory (//go:build darwin)
@@ -62,7 +62,6 @@ pkg/
   scheduler/queue.go           # Min-heap, Job/JobGroup, OnJobChange/OnGroupChange hooks, fairshare
   matchmaker/evaluator.go      # CEL evaluation
   discovery/discovery.go       # Memberlist + EventHooks (OnJoin, OnLeave)
-  messaging/                   # ZMQ PUB/SUB + DispatchPayload
 ```
 
 ## Tests
@@ -132,7 +131,6 @@ Modify the `shouldCountAsFailure()` function in `master.go`. Currently excludes:
 | `go.etcd.io/bbolt` | BoltDB embedded database |
 | `prometheus/client_golang` | Metrics |
 | `hashicorp/memberlist` | SWIM gossip |
-| `go-zeromq/zmq4` | Pure-Go ZMQ |
 | `google/cel-go` | CEL expressions |
 | `shirou/gopsutil/v3` | CPU/memory profiling |
 | `spf13/cobra` | CLI framework |

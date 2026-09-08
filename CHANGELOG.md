@@ -1,5 +1,98 @@
 # Changelog
 
+## [v0.9.0] — 2026-09-08
+
+Correctness, security, and release-engineering release. Four crash- or wedge-class defects are
+fixed, the API is no longer open to anonymous callers, and the project now has CI.
+
+**Licence change:** Tasch is now under the **GNU Affero General Public License v3.0**
+(previously MIT). Running a modified version as a network service obliges you to offer its
+source to the users of that service.
+
+### Fixed — crashes and stalls
+
+- **8-GPU nodes could not join a cluster.** The gossip delegate ignored memberlist's 512-byte
+  metadata limit, and memberlist panics rather than erroring above it. A realistic 8×A100
+  ClassAd serialises to 553 bytes, so the worker panicked at startup on exactly the hardware
+  Tasch targets. The ClassAd is now fitted to the limit, preserving every field reachable from
+  a CEL requirement.
+- **The master died with an unrecoverable fatal error.** The 60-second fairshare persistence
+  tick marshalled the live usage map without holding its lock while job completions wrote to
+  it, producing `concurrent map read and map write` — which `recover()` cannot catch.
+- **The scheduler wedged whenever a gang rank reached the head of the queue.** An early
+  `continue` meant to skip the direct-match phase skipped backfill too, so no single job
+  dispatched anywhere in the cluster — permanently, if a restart had orphaned the rank.
+- **Every GPU job was pinned to device 0.** Device indices were computed as `0..N-1` without
+  consulting what was already allocated, so concurrent jobs collided on one card while the
+  rest of the node idled.
+
+### Fixed — correctness
+
+- Resource release is idempotent and keyed by job ID; the six paths that can end a job can no
+  longer compound into a node reporting more free GPUs than it has.
+- A reconciliation loop rebuilds resource accounting from the live job set every 60 seconds,
+  so drift from a restart or a missed release is corrected rather than permanent.
+- Matching and dequeuing are now atomic, closing a window where a job was dispatched to a node
+  that had been matched against a different job.
+- Dispatches carry a fencing token; results from a superseded attempt are discarded instead of
+  releasing the current node's resources.
+- Cancelled and walltime-killed jobs are no longer retried.
+- `Requeue` refuses a job already in the heap, which used to corrupt the heap index and
+  silently evict an unrelated job.
+- A cancel landing between dequeue and dispatch is no longer overwritten by `MarkRunning`.
+- Job IDs are 64-bit, and a duplicate is rejected rather than overwriting another job.
+- Resource reservations can be stated explicitly (`--cpus`, `--memory`) instead of being
+  scraped out of the CEL requirement with a regex that most expressions did not match.
+- Walltime and cancel kill the whole process group, so backgrounded grandchildren no longer
+  survive and hold their GPUs.
+- CEL requirements are validated at submit time instead of failing to match forever in silence.
+- In-memory job records, log buffers, and the CEL program cache are all bounded.
+- A stale PID file no longer permanently prevents startup; `tasch stop` waits for the
+  configured drain instead of a hardcoded 15 seconds.
+- The dispatch handshake no longer depends on the worker guessing the master's metrics port.
+
+### Added — security
+
+- **Token authentication** with `user`, `admin`, and `worker` roles. Job ownership is enforced
+  on cancel, status, and logs, and listings are scoped to the caller. Identity comes from the
+  verified principal, so `--user` can no longer be used to evade a fairshare penalty or
+  impersonate another user. Off by default; see `SECURITY.md`.
+- **Mutual TLS** — setting `tls.ca_file` on the master now genuinely requires and verifies
+  client certificates. Previously the documentation claimed mTLS while the master never asked
+  for a certificate.
+- **Gossip encryption** via `gossip.encryption_key`, closing open cluster membership.
+- **Per-node dispatch.** The ZeroMQ PUB/SUB bus is gone. It broadcast every job's command and
+  environment variables in cleartext to every subscriber, with targeting enforced only by the
+  receiving worker — anything that could reach port 5555 could harvest every credential the
+  cluster dispatched. Dispatch now rides the authenticated gRPC connection, and nothing listens
+  on 5555.
+- The dispatch acknowledgement is an authenticated RPC rather than an unauthenticated HTTP
+  endpoint that could be used to forge acknowledgements for guessed job IDs.
+- HTTP timeouts on the metrics server, a configurable `metrics_bind`, worker-side concurrency
+  and output caps, and a hardened systemd unit.
+
+### Added — operations
+
+- **CI**: build matrix across all six targets, `gofmt`, `go vet`, staticcheck, golangci-lint,
+  race-enabled tests with a coverage floor, `govulncheck`, and dependabot.
+- **Release workflow** producing checksums, cosign signatures, and an SBOM.
+- `tasch version` and `tasch config validate`, with warnings for insecure settings.
+- Structured JSON logging with a `job_id` field correlating master and worker.
+- Thirteen new metrics, including queue-wait and scheduling-loop histograms, per-state job
+  gauges, and GPU utilisation. Worker-only nodes now serve `/metrics`, `/health`, and `/ready`.
+- `/health` reflects the scheduling loop instead of returning a constant 200.
+- BoltDB schema versioning with a migration path; unreadable records are reported rather than
+  silently skipped.
+- Config validation at startup: role, ports, TLS files, and auth principals.
+
+### Changed
+
+- Go 1.25 is now required — `google.golang.org/grpc` v1.82.1 is the first release without
+  GO-2026-6061, a vulnerability in the HTTP/2 server the master runs.
+- `ports.zmq` is unused and nothing binds it.
+- Documentation now matches the implementation; several claims that did not (mTLS,
+  Intel-on-Linux GPU detection, "always 200" health, output paths) have been corrected.
+
 ## [v0.8.0] — 2026-06-26
 
 Cross-platform multi-GPU support, OS-aware GPU binding, platform-agnostic worker execution, and enhanced test coverage.

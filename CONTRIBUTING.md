@@ -17,7 +17,7 @@ make build && make test && make run-test
 | CLI command | `internal/cli/` |
 | gRPC RPC | `api/v1/scheduler.proto` → `make proto` → `internal/daemon/master.go` |
 | ClassAd field | `pkg/profiler/profiler.go` (shared) + OS-specific profiler file |
-| GPU vendor (Linux) | `pkg/profiler/profiler_linux.go` → `detectNvidiaGPUs()` / `detectAMDGPUs()` pattern |
+| GPU vendor (Linux) | `pkg/profiler/profiler_linux.go` → `detectNVIDIAGPUs()` / `detectAMDGPUs()` pattern |
 | GPU vendor (Windows) | `pkg/profiler/profiler_windows.go` → WMI query or binary probe |
 | GPU vendor (macOS) | `pkg/profiler/profiler_darwin.go` → `system_profiler` or `sysctl` |
 | GPU env binding | `internal/daemon/master.go` → `dispatchJob()` vendor switch |
@@ -31,7 +31,7 @@ make build && make test && make run-test
 
 ## Testing
 
-- Unit: `make test` (13 tests)
+- Unit: `make test` (the test suite)
 - Integration: `make run-test` (13 scenarios)
 - All tests must pass before merging
 

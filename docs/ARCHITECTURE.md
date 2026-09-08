@@ -19,10 +19,10 @@ Single `tasch` binary operates as master, worker, or both based on config. Runs 
 │  Gang Scheduler          ·  Multi-Resource Tracker         │
 │  Walltime Enforcer       ·  Job Retry + Dead Letters       │
 │  Dispatch Handshake      ·  Prometheus Metrics             │
-│  ZMQ Publisher           ·  Health: /health /ready        │
+│  Dispatch streams        ·  Health: /health /ready        │
 │  Gossip Discovery + Worker Loss Detection                  │
 └──────────────────────────┬────────────────────────────────┘
-                           │ ZMQ PUB/SUB (auto-reconnect) + Gossip
+                           │ gRPC dispatch stream (auto-reconnect) + Gossip
               ┌────────────┼────────────┬───────────────┐
               ▼            ▼            ▼               ▼
          ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐
@@ -38,7 +38,7 @@ Single `tasch` binary operates as master, worker, or both based on config. Runs 
 | Protocol | Default Port | Purpose |
 |----------|-------------|---------|
 | Memberlist (SWIM) | 7946 | Node discovery + ClassAd broadcast + failure detection |
-| ZeroMQ PUB/SUB | 5555 | Job dispatch + cancel signals (auto-reconnect) |
+| gRPC dispatch stream | 50051 | Per-node job dispatch + cancel signals (auto-reconnect, authenticated) |
 | gRPC (HTTP/2) | 50051 | CLI commands + worker result reporting (keepalive + TLS) |
 | HTTP | 9090 | Health checks + Prometheus metrics + dispatch handshake |
 
@@ -54,7 +54,7 @@ Each cycle updates Prometheus gauges: queue depth, running jobs, cluster nodes, 
 
 ## Dispatch Handshake
 
-After a job is dispatched via ZMQ, the master registers it in `dispatchPending`. When the worker receives the job and begins execution, it sends an HTTP POST to `/acknowledge_start`. If no acknowledgement arrives within **10 seconds**, the `dispatchTimeoutEnforcer` loop re-queues the job as `QUEUED`.
+After a job is dispatched, the master registers it in `dispatchPending`. When the worker receives the job and begins execution, it calls the `AcknowledgeStart` RPC. If no acknowledgement arrives within **10 seconds**, the `dispatchTimeoutEnforcer` loop re-queues the job as `QUEUED`.
 
 This prevents silent job loss when a worker receives a dispatch message but fails to start execution (e.g., crash, network partition, resource exhaustion).
 
@@ -82,7 +82,7 @@ At dispatch time, the master injects the correct GPU visibility env var into the
 |--------|-----------------|
 | NVIDIA | `CUDA_VISIBLE_DEVICES=0,1,...` |
 | AMD | `HIP_VISIBLE_DEVICES=0,1,...` |
-| Intel | `ONEAPI_DEVICE_SELECTOR=gpu:0,gpu:1,...` + `SYCL_DEVICE_FILTER` |
+| Intel | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1,...` + `SYCL_DEVICE_FILTER` |
 | Apple | `METAL_DEVICE_INDEX=0` |
 
 ## Platform-Agnostic Worker Execution
@@ -98,7 +98,7 @@ The `gpuTracker` struct tracks 3 resource dimensions per worker node:
 ```
 Allocate(node, gpus, cpus, memoryMB)
 Release(node, gpus, cpus, memoryMB)
-Available(node, totalGPUs) → bool
+AvailableGPUs(node, total) → int
 AvailableCPUs(node, totalCores) → int
 AvailableMemory(node, totalMB) → int
 ```
@@ -152,7 +152,7 @@ SIGTERM received
   → draining = true (reject new submissions)
   → wait up to drain_timeout for running jobs
   → cancel worker
-  → cancel master (gRPC graceful stop + close ZMQ + drain+close BoltDB)
+  → cancel master (gRPC graceful stop + close dispatch streams + shut down HTTP + drain+close BoltDB)
   → remove PID file
 
 tasch stop:
@@ -169,7 +169,7 @@ internal/
   store/store.go               # BoltDB persistence (4 buckets)
   daemon/
     master.go                  # All scheduler logic + gRPC handlers
-    worker.go                  # Executor + ZMQ reconnect + gRPC keepalive + handshake
+    worker.go                  # Executor + dispatch stream reconnect + gRPC keepalive + handshake
     exec_unix.go               # sh -c command builder (linux/darwin/etc.)
     exec_windows.go            # cmd.exe /d /c builder (hidden window)
     metrics.go                 # Prometheus metric definitions
@@ -180,7 +180,7 @@ internal/
     connect.go                 # gRPC client from config
 pkg/
   profiler/
-    profiler.go                # Shared Host struct + profiling entry point
+    profiler.go                # Shared ClassAd struct + profiling + gossip size fitting
     profiler_linux.go          # NVIDIA + AMD + Jetson detection
     profiler_windows.go        # WMI/PowerShell detection
     profiler_darwin.go         # Apple Metal + Unified Memory detection

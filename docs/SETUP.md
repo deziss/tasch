@@ -8,7 +8,7 @@
 - **GPU (optional):**
   - NVIDIA — `nvidia-smi` in PATH
   - AMD — `rocm-smi` in PATH
-  - Intel — detected via WMI (Windows) or sysfs (Linux)
+  - Intel — detected via WMI on Windows only (there is no Linux Intel probe)
   - Apple — detected automatically on macOS (Metal)
   - Jetson/Tegra — detected via sysfs on Linux/arm64
 
@@ -24,9 +24,9 @@ sudo cp bin/tasch /usr/local/bin/
 ### Cross-Platform Build
 ```bash
 chmod +x build.sh && ./build.sh
-# Outputs: dist/tasch-linux-amd64, dist/tasch-linux-arm64,
-#          dist/tasch-windows-amd64.exe, dist/tasch-windows-arm64.exe,
-#          dist/tasch-darwin-amd64, dist/tasch-darwin-arm64
+# Outputs: dist/bin/tasch-linux-amd64, dist/bin/tasch-linux-arm64,
+#          dist/bin/tasch-windows-amd64.exe, dist/bin/tasch-windows-arm64.exe,
+#          dist/bin/tasch-darwin-amd64, dist/bin/tasch-darwin-arm64
 ```
 
 ### From Package (.deb / .rpm)
@@ -65,7 +65,6 @@ drain_timeout: 60           # seconds to wait during graceful shutdown
 ports:
   gossip: 7946
   grpc: 50051
-  zmq: 5555
   metrics: 9090
 tls:
   enabled: false
@@ -78,7 +77,7 @@ tls:
 
 ```bash
 tasch start    # starts master/worker/both based on config
-tasch stop     # graceful drain → SIGTERM → 15s wait → SIGKILL if stuck
+tasch stop     # graceful drain → SIGTERM → waits drain_timeout+15s → SIGKILL if stuck
 ```
 
 ## Deployment Examples
@@ -153,7 +152,6 @@ WantedBy=multi-user.target
 | Port | Protocol | Service |
 |------|----------|---------|
 | 7946 | UDP + TCP | Gossip (cluster discovery) |
-| 5555 | TCP | ZMQ (job dispatch) |
 | 50051 | TCP | gRPC (CLI + result reporting) |
 | 9090 | TCP | Health checks + Prometheus metrics + dispatch handshake |
 
@@ -174,9 +172,51 @@ GPU vendor env vars auto-injected at dispatch:
 | Intel | `ONEAPI_DEVICE_SELECTOR`, `SYCL_DEVICE_FILTER` |
 | Apple | `METAL_DEVICE_INDEX` |
 
+## Authentication
+
+Off by default. Turn it on for any cluster that is not fully trusted — without it, anyone who
+can reach the gRPC port can run arbitrary commands on every worker.
+
+```yaml
+auth:
+  enabled: true
+  principals:
+    - name: alice
+      token: "<openssl rand -hex 32>"
+      role: user       # submit jobs; may only act on its own jobs
+    - name: root
+      token: "<openssl rand -hex 32>"
+      role: admin      # may act on any job
+    - name: gpu-node-1
+      token: "<openssl rand -hex 32>"
+      role: worker     # may only report results and receive dispatches
+```
+
+Each node and CLI user presents its own token via `client_token` in the config or, preferably,
+`TASCH_AUTH_TOKEN` in the environment. To keep tokens out of the config file entirely, put the
+principal list in its own 0600 file and point `auth.principals_file` at it.
+
+Job ownership follows the authenticated principal: `--user` is a label only and is ignored when
+auth is enabled.
+
+## Gossip Encryption
+
+Also off by default. Without a key, any host that can reach port 7946 can join the cluster and
+advertise fabricated resources to attract jobs.
+
+```yaml
+gossip:
+  encryption_key: "<openssl rand -base64 32>"   # identical on every node
+  profile: lan                                   # lan | wan | local
+```
+
+Use `wan` for nodes across a high-latency link. The old `local` profile is tuned for loopback
+and will produce false node-failure detections on a real network — each of which fails every
+job on the node it wrongly declared dead.
+
 ## TLS Configuration
 
-Enable mTLS for gRPC communication:
+Enables TLS for gRPC, which carries job submissions, results, and dispatches.
 
 ```yaml
 tls:
@@ -186,21 +226,32 @@ tls:
   ca_file: /etc/tasch/ca.pem           # Worker: CA cert to verify master.
 ```
 
+Setting `ca_file` **on the master** additionally turns on mutual TLS: client certificates are
+required and verified. Workers and the CLI then present their own `cert_file`/`key_file`.
+
+> **Not covered by TLS:** the metrics/health HTTP server on 9090. Bind it to localhost with
+> `metrics_bind: 127.0.0.1` if it should not be reachable from the network. Gossip is protected
+> separately by `gossip.encryption_key`.
+
 ## Persistence
 
 Jobs and state are persisted to `~/.tasch/tasch.db` (BoltDB). On master restart:
 - QUEUED jobs are re-enqueued
-- RUNNING jobs are marked FAILED ("master restarted")
+- RUNNING jobs are marked FAILED ("master restarted") — the worker is not contacted, so any
+  process it is still running keeps going until its walltime
 - Fairshare usage data is restored
+
+The database holds every job's captured output and environment variables in plaintext. It is
+mode 0600, but every job runs as the same service account that owns it — so treat any submitted
+job as able to read every other job's stored secrets.
 
 ## Health Endpoints
 
 | Endpoint | Port | Description |
 |----------|------|-------------|
-| `/health` | 9090 | Liveness — always 200 |
+| `/health` | 9090 | Liveness — 503 if the scheduling loop has stalled |
 | `/ready` | 9090 | Readiness — 200 with member count, queue depth, drain status |
 | `/metrics` | 9090 | Prometheus metrics |
-| `/acknowledge_start` | 9090 | Internal: worker → master job start handshake (POST) |
 
 ```bash
 curl http://localhost:9090/health
@@ -214,7 +265,6 @@ curl http://localhost:9090/ready
 | `TASCH_MASTER_ADDR` | `master_addr` |
 | `TASCH_GOSSIP_PORT` | `ports.gossip` |
 | `TASCH_GRPC_PORT` | `ports.grpc` |
-| `TASCH_ZMQ_PORT` | `ports.zmq` |
 | `TASCH_METRICS_PORT` | `ports.metrics` |
 | `TASCH_ADVERTISE_ADDR` | Worker's advertised IP |
 
@@ -222,7 +272,7 @@ curl http://localhost:9090/ready
 
 **"Tasch may already be running"** — A PID file exists. Run `tasch stop` or delete `~/.tasch/tasch.pid`.
 
-**Workers can't join** — Check firewall: ports 7946 (UDP+TCP), 5555, 50051. Verify `master_addr` in worker config.
+**Workers can't join** — Check firewall: ports 7946 (UDP+TCP) and 50051. Verify `master_addr`, and that every node shares the same `gossip.encryption_key`.
 
 **GPUs not detected (NVIDIA/AMD)** — Verify `nvidia-smi` or `rocm-smi` is in PATH and returns output.
 

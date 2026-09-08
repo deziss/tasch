@@ -69,6 +69,12 @@ message DispatchMessage {
   string action = 4;                 // "execute" or "cancel"
   map<string, string> env_vars = 5;
   int64 attempt = 6;                 // Fencing token, echoed back in ReportResult
+
+  // Resource reservations, so the worker can enforce them rather than leaving them as
+  // bookkeeping on the master. A job that reserved one core could previously consume the whole
+  // machine, because nothing on the worker ever applied a limit.
+  int32 cpus_required = 7;
+  int32 memory_required_mb = 8;
 }
 
 message SubmitJobRequest {

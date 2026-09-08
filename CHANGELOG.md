@@ -51,6 +51,23 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Added — resource enforcement
+
+- **Job reservations are now real limits on Linux.** `--cpus` and `--memory` are applied as
+  cgroup v2 `cpu.max` and `memory.max`, and every job gets a process cap whether or not it
+  reserved anything. Previously the master's resource tracking was pure bookkeeping: it decided
+  where a job fit and nothing on the worker enforced that decision, so a job reserving one core
+  could consume the whole machine and a fork bomb could take a worker down with every job on it.
+- Exceeding a memory reservation reports "out of memory: exceeded the N MB reservation" instead
+  of an opaque "signal: killed", and peak memory is logged on completion.
+- The child is placed into its cgroup at clone time, so there is no window in which it runs
+  unconfined.
+- Enforcement is best-effort: a worker that cannot obtain a delegated cgroup warns at startup
+  and runs jobs without limits, rather than refusing to work. The packaged systemd unit sets
+  `Delegate=cpu memory pids`, which is required for any of this to engage.
+- This confines resource usage; it is not isolation. Jobs still share the service account's
+  filesystem and network, and GPUs remain advisory since cgroup v2 has no GPU controller.
+
 ### Added — security
 
 - **Token authentication** with `user`, `admin`, and `worker` roles. Job ownership is enforced

@@ -211,6 +211,13 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 
 	slog.Info("worker joined cluster", "node", nodeName, "master", masterHost)
 
+	if cgroupsSupported() {
+		slog.Info("job resource limits are enforced via cgroup v2")
+	} else {
+		slog.Warn("job resource limits cannot be enforced; jobs may use the whole machine",
+			"reason", cgroupUnavailableReason())
+	}
+
 	// Jobs currently executing on this node, reported by /ready.
 	var runningJobCount atomic.Int64
 
@@ -308,7 +315,16 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					stdout := newCappedBuffer(outputLimit)
 					stderr := newCappedBuffer(outputLimit)
 
-					cmd := prepareCommand(ctx, p.Command)
+					// Confine the job to what it reserved. Failure here is not fatal: many hosts
+					// cannot delegate a cgroup subtree, and a worker that cannot enforce limits
+					// must still be able to run work.
+					cg, cgErr := newJobCgroup(p.JobId, int(p.CpusRequired), int(p.MemoryRequiredMb), cfg.MaxPIDsPerJob)
+					if cgErr != nil {
+						logging.Job(p.JobId).Warn("running without resource limits", "error", cgErr)
+					}
+					defer func() { _ = cg.Close() }()
+
+					cmd := prepareCommand(ctx, p.Command, cg)
 					cmd.Stdout = stdout
 					cmd.Stderr = stderr
 
@@ -334,14 +350,19 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					errMsg := ""
 					if execErr != nil {
 						errMsg = execErr.Error()
-						if ctx.Err() == context.DeadlineExceeded {
+						switch {
+						case ctx.Err() == context.DeadlineExceeded:
 							errMsg = fmt.Sprintf("walltime exceeded (%ds)", p.WalltimeSeconds)
-						} else if ctx.Err() == context.Canceled {
+						case ctx.Err() == context.Canceled:
 							errMsg = "cancelled"
+						case cg.WasOOMKilled():
+							// Turn an opaque "signal: killed" into the actual reason.
+							errMsg = fmt.Sprintf("out of memory: exceeded the %d MB reservation", p.MemoryRequiredMb)
 						}
 						logging.Job(p.JobId).Warn("job failed", "error", errMsg)
 					} else {
-						logging.Job(p.JobId).Info("completed", "duration", endTime.Sub(startTime))
+						logging.Job(p.JobId).Info("completed",
+							"duration", endTime.Sub(startTime), "peak_memory_bytes", cg.PeakMemoryBytes())
 					}
 
 					reportWithRetry(subCtx, masterClient, &pb.ReportResultRequest{

@@ -1429,6 +1429,7 @@ func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 	if err := srv.bus.Send(nodeName, &pb.DispatchMessage{
 		JobId: job.ID, Command: job.Command, WalltimeSeconds: int32(job.WalltimeSeconds),
 		Action: "execute", EnvVars: envVars, Attempt: attempt,
+		CpusRequired: int32(job.CPUsRequired), MemoryRequiredMb: int32(job.MemoryRequiredMB),
 	}); err != nil {
 		// The worker is gone or wedged. Undo the placement now rather than waiting for the
 		// acknowledgement timeout, so the job goes back to a node that can actually take it.

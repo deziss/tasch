@@ -40,6 +40,10 @@ type Config struct {
 	LogFormat string `yaml:"log_format"`
 	LogLevel  string `yaml:"log_level"`
 
+	// MaxPIDsPerJob caps the processes a single job may create, which is the cheapest guard
+	// against a fork bomb taking a worker down. 0 uses the built-in default.
+	MaxPIDsPerJob int `yaml:"max_pids_per_job"`
+
 	// ClientToken is the token this node presents when calling the master. Set it via
 	// TASCH_AUTH_TOKEN or client_token; it is what the CLI and the worker authenticate with.
 	ClientToken string `yaml:"client_token"`
@@ -249,6 +253,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxConcurrentJobs < 0 {
 		return fmt.Errorf("max_concurrent_jobs cannot be negative (got %d)", c.MaxConcurrentJobs)
+	}
+	if c.MaxPIDsPerJob < 0 {
+		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
 	}
 
 	switch c.Gossip.Profile {

@@ -2,9 +2,9 @@
 
 **Tasch** is a distributed task scheduler with multi-GPU and cross-platform support. One binary, one setup command, and your cluster is ready.
 
-> **Status: alpha.** Authentication is available but **off by default**, and jobs are not
-> sandboxed — a submitted job runs as the `tasch` service account with no cgroup or namespace
-> confinement. Set `auth.enabled` and `gossip.encryption_key`, and read
+> **Status: alpha.** Authentication and gossip encryption exist but are **off by default**, and
+> jobs are resource-limited rather than isolated — they share the service account's filesystem
+> and network. Set `auth.enabled` and `gossip.encryption_key`, and read
 > [SECURITY.md](SECURITY.md), before running this anywhere but a trusted network.
 
 ```
@@ -92,6 +92,7 @@ tasch stop                     # graceful drain + shutdown
 | **Prometheus metrics** | 10 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
 | **Circuit breaker** | 3 consecutive failures → worker blocked 5 minutes |
 | **Multi-resource tracking** | Prevents GPU, CPU, and memory oversubscription across concurrent dispatches |
+| **Enforced limits** | On Linux, `--cpus` and `--memory` become real cgroup v2 limits, not just bookkeeping. Every job gets a process cap, so a fork bomb cannot take the worker down. Requires the systemd unit's `Delegate=` |
 | **Dispatch handshake** | Worker acknowledges job start; master re-queues unacknowledged jobs after 10s |
 | **Fencing tokens** | Every dispatch carries an attempt number; results from a superseded dispatch are discarded, so a job cannot be double-counted or release another node's resources |
 | **Graceful drain** | `tasch stop` → stop accepting → wait for running jobs → shutdown |
@@ -186,6 +187,7 @@ ports:
 metrics_bind: 0.0.0.0        # set 127.0.0.1 to keep metrics off the network
 max_concurrent_jobs: 0       # per worker; 0 = unlimited
 max_output_bytes: 3145728    # captured stdout+stderr cap per job
+max_pids_per_job: 4096       # process cap per job (fork-bomb guard)
 tls:
   enabled: false
   cert_file: ""

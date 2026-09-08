@@ -233,6 +233,25 @@ required and verified. Workers and the CLI then present their own `cert_file`/`k
 > `metrics_bind: 127.0.0.1` if it should not be reachable from the network. Gossip is protected
 > separately by `gossip.encryption_key`.
 
+## Resource Limits
+
+On Linux, a job's `--cpus` and `--memory` reservations are enforced through a cgroup v2 subtree,
+not merely tracked by the master. Exceeding the memory reservation kills the job and reports why.
+Every job also gets a process cap, so a fork bomb cannot take the worker and its co-tenant jobs
+down with it.
+
+```yaml
+max_pids_per_job: 4096   # 0 uses the built-in default
+```
+
+This needs the daemon to own a delegated cgroup. The packaged systemd unit sets
+`Delegate=cpu memory pids`. If you run `tasch start` outside systemd, or inside a container with
+no delegated subtree, the worker logs a warning at startup and runs jobs **without limits** —
+look for that line rather than assuming limits apply.
+
+GPUs are not covered: cgroup v2 has no GPU controller, so the injected `CUDA_VISIBLE_DEVICES`
+remains advisory and a job can unset it.
+
 ## Persistence
 
 Jobs and state are persisted to `~/.tasch/tasch.db` (BoltDB). On master restart:

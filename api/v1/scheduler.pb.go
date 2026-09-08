@@ -177,8 +177,13 @@ type DispatchMessage struct {
 	Action          string                 `protobuf:"bytes,4,opt,name=action,proto3" json:"action,omitempty"` // "execute" or "cancel"
 	EnvVars         map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Attempt         int64                  `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"` // Fencing token, echoed back in ReportResult
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Resource reservations, so the worker can enforce them rather than leaving them as
+	// bookkeeping on the master. A job that reserved one core could previously consume the whole
+	// machine, because nothing on the worker ever applied a limit.
+	CpusRequired     int32 `protobuf:"varint,7,opt,name=cpus_required,json=cpusRequired,proto3" json:"cpus_required,omitempty"`
+	MemoryRequiredMb int32 `protobuf:"varint,8,opt,name=memory_required_mb,json=memoryRequiredMb,proto3" json:"memory_required_mb,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *DispatchMessage) Reset() {
@@ -249,6 +254,20 @@ func (x *DispatchMessage) GetEnvVars() map[string]string {
 func (x *DispatchMessage) GetAttempt() int64 {
 	if x != nil {
 		return x.Attempt
+	}
+	return 0
+}
+
+func (x *DispatchMessage) GetCpusRequired() int32 {
+	if x != nil {
+		return x.CpusRequired
+	}
+	return 0
+}
+
+func (x *DispatchMessage) GetMemoryRequiredMb() int32 {
+	if x != nil {
+		return x.MemoryRequiredMb
 	}
 	return 0
 }
@@ -1399,14 +1418,16 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x18AcknowledgeStartResponse\x12\"\n" +
 	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"3\n" +
 	"\x14WatchDispatchRequest\x12\x1b\n" +
-	"\tnode_name\x18\x01 \x01(\tR\bnodeName\"\x98\x02\n" +
+	"\tnode_name\x18\x01 \x01(\tR\bnodeName\"\xeb\x02\n" +
 	"\x0fDispatchMessage\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12)\n" +
 	"\x10walltime_seconds\x18\x03 \x01(\x05R\x0fwalltimeSeconds\x12\x16\n" +
 	"\x06action\x18\x04 \x01(\tR\x06action\x12;\n" +
 	"\benv_vars\x18\x05 \x03(\v2 .v1.DispatchMessage.EnvVarsEntryR\aenvVars\x12\x18\n" +
-	"\aattempt\x18\x06 \x01(\x03R\aattempt\x1a:\n" +
+	"\aattempt\x18\x06 \x01(\x03R\aattempt\x12#\n" +
+	"\rcpus_required\x18\a \x01(\x05R\fcpusRequired\x12,\n" +
+	"\x12memory_required_mb\x18\b \x01(\x05R\x10memoryRequiredMb\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa2\x03\n" +

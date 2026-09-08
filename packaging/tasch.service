@@ -23,13 +23,18 @@ LimitNOFILE=65535
 StateDirectory=tasch
 StateDirectoryMode=0750
 
+# Give the service its own cgroup subtree. Without this, the daemon cannot create per-job
+# cgroups — cgroup v2 refuses to delegate controllers to the children of a cgroup that holds
+# other processes — and every job runs with no CPU, memory, or process limit at all.
+Delegate=cpu memory pids
+
 # --- Hardening ---
 #
 # Note the inherent limit: a Tasch worker's job is to run arbitrary user commands as this
 # service account, so anything that would confine the *job* also confines the scheduler. These
-# settings therefore protect the host from the daemon, not the host from a submitted job. Job
-# isolation needs per-job cgroups or containers, which Tasch does not yet implement — see
-# SECURITY.md before exposing this to anyone you do not fully trust.
+# settings therefore protect the host from the daemon. Per-job CPU, memory, and process limits
+# are enforced separately via the delegated cgroup above; what remains missing is filesystem and
+# network isolation, which needs namespaces or containers. See SECURITY.md.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=no

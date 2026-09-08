@@ -21,9 +21,13 @@ const processGroupGrace = 10 * time.Second
 // per-rank children — was reparented to init and kept running after a walltime kill or a
 // cancel, holding the GPUs the scheduler had just marked free. Signalling the whole group
 // reclaims them.
-func prepareCommand(ctx context.Context, cmdStr string) *exec.Cmd {
+func prepareCommand(ctx context.Context, cmdStr string, cg *jobCgroup) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Place the child into its cgroup at clone time. Writing the pid to cgroup.procs after
+	// Start would leave a window in which the job runs unconfined.
+	cg.apply(cmd.SysProcAttr)
 
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {

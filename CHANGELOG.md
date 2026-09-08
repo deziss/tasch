@@ -51,6 +51,18 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Added — node maintenance
+
+- **`tasch nodes cordon`, `uncordon` and `drain`.** There was no way to take a node out of
+  service: an operator's only options were to kill the worker, failing every job on it, or to
+  wait. Cordoning stops new dispatches and lets running jobs finish; draining also cancels them.
+- Cordons are persisted, because a node taken out of service for maintenance that silently
+  returns to rotation after a master restart is worse than never having cordoned it.
+- `tasch nodes` now reports each node's scheduling state — ready, cordoned with a reason, or
+  circuit-broken — plus its running jobs and GPU usage, so a full queue against an idle cluster
+  can be diagnosed without reading the master's logs.
+- Cordoning requires an admin principal, since it affects everyone's work.
+
 ### Added — resource enforcement
 
 - **Job reservations are now real limits on Linux.** `--cpus` and `--memory` are applied as

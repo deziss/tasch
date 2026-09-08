@@ -61,6 +61,9 @@ type schedulerServer struct {
 	// GPU resource tracking
 	gpuTracker *gpuTracker
 
+	// Nodes an operator has taken out of scheduling rotation.
+	cordons *cordonRegistry
+
 	// Dispatch acknowledgement tracking
 	dispatchPendingMu sync.Mutex
 	dispatchPending   map[string]time.Time
@@ -411,12 +414,25 @@ func (s *schedulerServer) appendLog(jobID, level, msg string) {
 func (s *schedulerServer) WorkerStatus(ctx context.Context, req *pb.WorkerStatusRequest) (*pb.WorkerStatusResponse, error) {
 	members := s.disc.Members()
 	nodes := make(map[string]string)
+	states := make(map[string]*pb.NodeSchedulingState)
+	usage := s.gpuTracker.UsageByNode()
+
 	for _, member := range members {
-		if len(member.Meta) > 0 {
-			nodes[member.Name] = string(member.Meta)
+		if len(member.Meta) == 0 {
+			continue
+		}
+		nodes[member.Name] = string(member.Meta)
+		// Report why a node is or is not taking work, so an idle cluster with a full queue is
+		// diagnosable without reading the master's logs.
+		states[member.Name] = &pb.NodeSchedulingState{
+			Cordoned:      s.cordons.IsCordoned(member.Name),
+			CordonReason:  s.cordons.Reason(member.Name),
+			CircuitBroken: s.cb.IsBlocked(member.Name),
+			RunningJobs:   int32(len(s.queue.RunningJobsOnNode(member.Name))),
+			GpusAllocated: int32(usage[member.Name]),
 		}
 	}
-	return &pb.WorkerStatusResponse{WorkerNodes: nodes}, nil
+	return &pb.WorkerStatusResponse{WorkerNodes: nodes, NodeState: states}, nil
 }
 
 // Compiled once rather than on every submit.
@@ -798,6 +814,83 @@ func isRetryable(job *scheduler.Job, errMsg string) bool {
 	return true
 }
 
+// CordonNode takes a node out of scheduling rotation, or returns it to service.
+//
+// Cordoning stops new dispatches while letting the jobs already running finish. Draining
+// additionally cancels them, which is what an operator wants before rebooting a machine.
+func (s *schedulerServer) CordonNode(ctx context.Context, req *pb.CordonNodeRequest) (*pb.CordonNodeResponse, error) {
+	if req.NodeName == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_name is required")
+	}
+	// Taking a node out of service affects everyone's work, not just the caller's.
+	if auth.FromContext(ctx).Role != auth.RoleAdmin {
+		return nil, status.Error(codes.PermissionDenied, "cordoning a node requires an admin principal")
+	}
+
+	if !req.Cordon {
+		was := s.cordons.Uncordon(req.NodeName)
+		s.persistCordons()
+		msg := "node returned to service"
+		if !was {
+			msg = "node was not cordoned"
+		}
+		slog.Info("node uncordoned", "node", req.NodeName)
+		return &pb.CordonNodeResponse{NodeName: req.NodeName, Cordoned: false, Message: msg}, nil
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "cordoned by operator"
+	}
+	s.cordons.Cordon(req.NodeName, reason)
+	s.persistCordons()
+	slog.Warn("node cordoned", "node", req.NodeName, "reason", reason, "drain", req.Drain)
+
+	var cancelled int32
+	if req.Drain {
+		for _, job := range s.queue.RunningJobsOnNode(req.NodeName) {
+			if _, ok := s.queue.Cancel(job.ID); ok {
+				cancelled++
+				s.gpuTracker.Release(job.ID)
+				if err := s.bus.Send(req.NodeName, &pb.DispatchMessage{
+					JobId: job.ID, Action: "cancel", Attempt: job.Attempt,
+				}); err != nil {
+					logging.Job(job.ID).Error("could not deliver drain cancel",
+						"node", req.NodeName, "error", err)
+				}
+				s.appendLog(job.ID, "WARN", fmt.Sprintf("Cancelled: node %s drained (%s)", req.NodeName, reason))
+			}
+		}
+		slog.Warn("node drained", "node", req.NodeName, "jobs_cancelled", cancelled)
+	}
+
+	message := "node cordoned; running jobs will finish"
+	if req.Drain {
+		message = fmt.Sprintf("node drained; %d running job(s) cancelled", cancelled)
+	}
+	return &pb.CordonNodeResponse{
+		NodeName: req.NodeName, Cordoned: true, JobsCancelled: cancelled, Message: message,
+	}, nil
+}
+
+// persistCordons writes the cordon set so it survives a restart.
+func (s *schedulerServer) persistCordons() {
+	if s.store == nil {
+		return
+	}
+	encoded := make(map[string][]byte)
+	for node, entry := range s.cordons.Snapshot() {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		encoded[node] = data
+	}
+	if err := s.store.SaveCordons(encoded); err != nil {
+		slog.Error("could not persist cordons", "error", err)
+	}
+}
+
 // AcknowledgeStart records that a worker has begun a job, disarming the dispatch-timeout
 // re-queue for it.
 //
@@ -1129,7 +1222,7 @@ func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
 			return false
 		}
 		for _, member := range members {
-			if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
+			if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) || srv.cordons.IsCordoned(member.Name) {
 				continue
 			}
 			if !canDispatchResources(srv, member, topJob) {
@@ -1154,7 +1247,7 @@ func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
 // backfillOntoIdleNodes places a lower-priority job on the first node that can take one.
 func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
 	for _, member := range members {
-		if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) {
+		if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) || srv.cordons.IsCordoned(member.Name) {
 			continue
 		}
 		memberMeta := string(member.Meta)
@@ -1691,6 +1784,22 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	}
 
 	cb := newCircuitBreaker()
+
+	cordons := newCordonRegistry()
+	if saved, err := db.LoadCordons(); err == nil && len(saved) > 0 {
+		restored := make(map[string]cordonEntry, len(saved))
+		for node, data := range saved {
+			var entry cordonEntry
+			if err := json.Unmarshal(data, &entry); err != nil {
+				slog.Warn("could not read persisted cordon", "node", node, "error", err)
+				continue
+			}
+			restored[node] = entry
+		}
+		cordons.Restore(restored)
+		slog.Info("restored cordoned nodes", "count", len(restored))
+	}
+
 	gt := newGPUTracker()
 
 	hooks := &discovery.EventHooks{
@@ -1749,7 +1858,7 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 
 	srv := &schedulerServer{
 		disc: disc, queue: queue, eval: eval, bus: bus, fairshare: fairshare,
-		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt,
+		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt, cordons: cordons,
 		dispatchPending: make(map[string]time.Time),
 		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
 		ctx: shutdownCtx,

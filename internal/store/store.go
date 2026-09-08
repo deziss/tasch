@@ -11,6 +11,7 @@ import (
 
 	"github.com/deziss/tasch/pkg/scheduler"
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 var (
@@ -19,6 +20,7 @@ var (
 	bucketFairshare   = []byte("fairshare")
 	bucketDeadLetters = []byte("dead_letters")
 	bucketMeta        = []byte("meta")
+	bucketCordons     = []byte("cordons")
 )
 
 // SchemaVersion is the on-disk format this build writes.
@@ -53,7 +55,7 @@ func Open(path string) (*Store, error) {
 
 	// Create buckets and establish the schema version.
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters, bucketMeta} {
+		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters, bucketMeta, bucketCordons} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -298,4 +300,48 @@ func (s *Store) GetDeadLetter(jobID string) (*scheduler.Job, error) {
 		return nil, err
 	}
 	return &job, nil
+}
+
+// --- Cordons ---
+
+// SaveCordons persists the set of nodes taken out of scheduling rotation.
+//
+// These must survive a master restart. A node cordoned for maintenance that silently returns to
+// service because the master was restarted is worse than not having cordoned it at all.
+func (s *Store) SaveCordons(entries map[string][]byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		// Replace wholesale so an uncordon is not left behind as a stale entry.
+		if err := tx.DeleteBucket(bucketCordons); err != nil && !errors.Is(err, bolterrors.ErrBucketNotFound) {
+			return err
+		}
+		b, err := tx.CreateBucket(bucketCordons)
+		if err != nil {
+			return err
+		}
+		for node, data := range entries {
+			if err := b.Put([]byte(node), data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// LoadCordons reads the persisted cordon set.
+func (s *Store) LoadCordons() (map[string][]byte, error) {
+	out := make(map[string][]byte)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketCordons)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			// Bolt's values are only valid for the life of the transaction.
+			data := make([]byte, len(v))
+			copy(data, v)
+			out[string(k)] = data
+			return nil
+		})
+	})
+	return out, err
 }

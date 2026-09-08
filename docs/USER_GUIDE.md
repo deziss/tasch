@@ -268,3 +268,31 @@ Max `max_queue_size` jobs in queue (default 10,000). New submissions rejected wi
 | `tasch_groups_pending` | Gauge |
 | `tasch_walltime_kills_total` | Counter |
 | `tasch_worker_lost_total` | Counter |
+
+## Node Maintenance
+
+Take a node out of scheduling rotation without killing its worker:
+
+```bash
+tasch nodes cordon gpu-node-1 --reason "kernel upgrade"   # no new jobs; running jobs finish
+tasch nodes drain  gpu-node-1 --reason "reboot"           # also cancel what is running
+tasch nodes uncordon gpu-node-1                           # back into service
+```
+
+`tasch nodes` shows each node's scheduling state, so a full queue against an idle cluster is
+diagnosable without reading the master's logs:
+
+```
+Node: gpu-node-1  [CORDONED]
+  OS: linux | Arch: amd64 | Cores: 128 | Memory: 1031000MB | GPUs: 8
+  Running: 2 job(s) | GPUs in use: 4/8
+  Cordoned: kernel upgrade
+```
+
+A node may also show `[CIRCUIT-BROKEN]`, which is automatic and temporary — the scheduler
+blocks a node after repeated infrastructure failures and retries it on its own. A cordon is
+deliberate and lasts until you lift it, surviving master restarts.
+
+Cordoning requires an `admin` principal, since it affects everyone's work rather than the
+caller's own. Draining cancels running jobs without retrying them, so it deliberately loses
+their work — prefer `cordon` when you can wait.

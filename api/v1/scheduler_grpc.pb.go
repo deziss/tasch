@@ -27,6 +27,7 @@ const (
 	SchedulerService_WorkerStatus_FullMethodName         = "/v1.SchedulerService/WorkerStatus"
 	SchedulerService_ListJobs_FullMethodName             = "/v1.SchedulerService/ListJobs"
 	SchedulerService_ReportResult_FullMethodName         = "/v1.SchedulerService/ReportResult"
+	SchedulerService_CordonNode_FullMethodName           = "/v1.SchedulerService/CordonNode"
 	SchedulerService_AcknowledgeStart_FullMethodName     = "/v1.SchedulerService/AcknowledgeStart"
 	SchedulerService_WatchDispatch_FullMethodName        = "/v1.SchedulerService/WatchDispatch"
 )
@@ -51,6 +52,12 @@ type SchedulerServiceClient interface {
 	ListJobs(ctx context.Context, in *ListJobsRequest, opts ...grpc.CallOption) (*ListJobsResponse, error)
 	// Worker reports job completion/failure back to master
 	ReportResult(ctx context.Context, in *ReportResultRequest, opts ...grpc.CallOption) (*ReportResultResponse, error)
+	// Take a node out of, or back into, scheduling rotation.
+	//
+	// There was no way to stop a node receiving work for maintenance: an operator's only options
+	// were to kill the worker, which fails every job running on it, or to wait. Cordoning stops
+	// new dispatches while letting running jobs finish; draining additionally cancels them.
+	CordonNode(ctx context.Context, in *CordonNodeRequest, opts ...grpc.CallOption) (*CordonNodeResponse, error)
 	// Worker confirms it has started a job.
 	//
 	// This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -166,6 +173,16 @@ func (c *schedulerServiceClient) ReportResult(ctx context.Context, in *ReportRes
 	return out, nil
 }
 
+func (c *schedulerServiceClient) CordonNode(ctx context.Context, in *CordonNodeRequest, opts ...grpc.CallOption) (*CordonNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CordonNodeResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_CordonNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *schedulerServiceClient) AcknowledgeStart(ctx context.Context, in *AcknowledgeStartRequest, opts ...grpc.CallOption) (*AcknowledgeStartResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AcknowledgeStartResponse)
@@ -215,6 +232,12 @@ type SchedulerServiceServer interface {
 	ListJobs(context.Context, *ListJobsRequest) (*ListJobsResponse, error)
 	// Worker reports job completion/failure back to master
 	ReportResult(context.Context, *ReportResultRequest) (*ReportResultResponse, error)
+	// Take a node out of, or back into, scheduling rotation.
+	//
+	// There was no way to stop a node receiving work for maintenance: an operator's only options
+	// were to kill the worker, which fails every job running on it, or to wait. Cordoning stops
+	// new dispatches while letting running jobs finish; draining additionally cancels them.
+	CordonNode(context.Context, *CordonNodeRequest) (*CordonNodeResponse, error)
 	// Worker confirms it has started a job.
 	//
 	// This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -264,6 +287,9 @@ func (UnimplementedSchedulerServiceServer) ListJobs(context.Context, *ListJobsRe
 }
 func (UnimplementedSchedulerServiceServer) ReportResult(context.Context, *ReportResultRequest) (*ReportResultResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportResult not implemented")
+}
+func (UnimplementedSchedulerServiceServer) CordonNode(context.Context, *CordonNodeRequest) (*CordonNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CordonNode not implemented")
 }
 func (UnimplementedSchedulerServiceServer) AcknowledgeStart(context.Context, *AcknowledgeStartRequest) (*AcknowledgeStartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeStart not implemented")
@@ -429,6 +455,24 @@ func _SchedulerService_ReportResult_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SchedulerService_CordonNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CordonNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).CordonNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_CordonNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).CordonNode(ctx, req.(*CordonNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SchedulerService_AcknowledgeStart_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AcknowledgeStartRequest)
 	if err := dec(in); err != nil {
@@ -492,6 +536,10 @@ var SchedulerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportResult",
 			Handler:    _SchedulerService_ReportResult_Handler,
+		},
+		{
+			MethodName: "CordonNode",
+			Handler:    _SchedulerService_CordonNode_Handler,
 		},
 		{
 			MethodName: "AcknowledgeStart",

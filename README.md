@@ -91,6 +91,7 @@ tasch stop                     # graceful drain + shutdown
 | **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
 | **Prometheus metrics** | 10 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
 | **Circuit breaker** | 3 consecutive failures → worker blocked 5 minutes |
+| **Cordon / drain** | Take a node out of rotation for maintenance. Cordons survive a master restart, and `tasch nodes` shows why a node is not taking work |
 | **Multi-resource tracking** | Prevents GPU, CPU, and memory oversubscription across concurrent dispatches |
 | **Enforced limits** | On Linux, `--cpus` and `--memory` become real cgroup v2 limits, not just bookkeeping. Every job gets a process cap, so a fork bomb cannot take the worker down. Requires the systemd unit's `Delegate=` |
 | **Dispatch handshake** | Worker acknowledges job start; master re-queues unacknowledged jobs after 10s |
@@ -120,7 +121,10 @@ tasch setup                          # Interactive setup wizard
 tasch start                          # Start based on config
 tasch stop                           # Graceful drain + shutdown
 
-tasch nodes                          # Cluster nodes + GPU/OS/arch info
+tasch nodes                          # Cluster nodes + GPU/OS/arch + scheduling state
+tasch nodes cordon <node>            # Stop scheduling new jobs onto a node
+tasch nodes uncordon <node>          # Return a node to service
+tasch nodes drain <node>             # Cordon and cancel the jobs running on it
 
 tasch jobs                           # List all jobs
 tasch jobs submit <expr> <cmd>       # Submit single job

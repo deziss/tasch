@@ -13,6 +13,14 @@ import (
 
 // NodesCmd returns the `tasch nodes` command.
 func NodesCmd(cfgLoader func() *config.Config) *cobra.Command {
+	cmd := nodesListCmd(cfgLoader)
+	cmd.AddCommand(cordonCmd(cfgLoader, true))
+	cmd.AddCommand(cordonCmd(cfgLoader, false))
+	cmd.AddCommand(drainCmd(cfgLoader))
+	return cmd
+}
+
+func nodesListCmd(cfgLoader func() *config.Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "nodes",
 		Short: "Show cluster nodes and hardware",
@@ -44,9 +52,28 @@ func NodesCmd(cfgLoader func() *config.Config) *cobra.Command {
 					gpuCount = int(gc)
 				}
 
-				fmt.Printf("Node: %s\n", nodeID)
+				// Say plainly whether the node is taking work. An idle cluster with a full queue
+				// was previously only diagnosable by reading the master's logs.
+				state := resp.NodeState[nodeID]
+				status := "READY"
+				switch {
+				case state.GetCordoned():
+					status = "CORDONED"
+				case state.GetCircuitBroken():
+					status = "CIRCUIT-BROKEN"
+				}
+
+				fmt.Printf("Node: %s  [%s]\n", nodeID, status)
 				fmt.Printf("  OS: %v | Arch: %v | Cores: %v | Memory: %vMB | GPUs: %d\n",
 					p["os"], p["architecture"], p["cpu_cores"], p["total_memory_mb"], gpuCount)
+				fmt.Printf("  Running: %d job(s) | GPUs in use: %d/%d\n",
+					state.GetRunningJobs(), state.GetGpusAllocated(), gpuCount)
+				if state.GetCordoned() {
+					fmt.Printf("  Cordoned: %s\n", state.GetCordonReason())
+				}
+				if state.GetCircuitBroken() {
+					fmt.Printf("  Circuit breaker tripped after repeated failures; will retry automatically\n")
+				}
 
 				if gpuCount > 0 {
 					vendor := ""
@@ -75,4 +102,67 @@ func NodesCmd(cfgLoader func() *config.Config) *cobra.Command {
 			}
 		},
 	}
+}
+
+// cordonCmd builds `tasch nodes cordon` and `tasch nodes uncordon`.
+func cordonCmd(cfgLoader func() *config.Config, cordon bool) *cobra.Command {
+	use, short := "uncordon <node>", "Return a node to scheduling rotation"
+	if cordon {
+		use, short = "cordon <node>", "Stop scheduling new jobs onto a node"
+	}
+
+	var reason string
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Long: short + ".\n\n" +
+			"Cordoning stops new dispatches but lets the jobs already running finish. Use\n" +
+			"`tasch nodes drain` to cancel them as well. Cordons survive a master restart.",
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			cfg := cfgLoader()
+			client, conn := GetClient(cfg)
+			defer func() { _ = conn.Close() }()
+
+			resp, err := client.CordonNode(context.Background(), &pb.CordonNodeRequest{
+				NodeName: args[0], Cordon: cordon, Reason: reason,
+			})
+			if err != nil {
+				log.Fatalf("Failed: %v", err)
+			}
+			fmt.Printf("%s: %s\n", resp.NodeName, resp.Message)
+		},
+	}
+	if cordon {
+		cmd.Flags().StringVar(&reason, "reason", "", "Why the node is being taken out of service")
+	}
+	return cmd
+}
+
+// drainCmd builds `tasch nodes drain`.
+func drainCmd(cfgLoader func() *config.Config) *cobra.Command {
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "drain <node>",
+		Short: "Cordon a node and cancel the jobs running on it",
+		Long: "Cordon a node and cancel the jobs running on it.\n\n" +
+			"Use before rebooting or decommissioning a machine. Cancelled jobs are not retried,\n" +
+			"so drain deliberately loses their work; cordon alone if you can wait for them.",
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			cfg := cfgLoader()
+			client, conn := GetClient(cfg)
+			defer func() { _ = conn.Close() }()
+
+			resp, err := client.CordonNode(context.Background(), &pb.CordonNodeRequest{
+				NodeName: args[0], Cordon: true, Drain: true, Reason: reason,
+			})
+			if err != nil {
+				log.Fatalf("Failed: %v", err)
+			}
+			fmt.Printf("%s: %s\n", resp.NodeName, resp.Message)
+		},
+	}
+	cmd.Flags().StringVar(&reason, "reason", "", "Why the node is being drained")
+	return cmd
 }

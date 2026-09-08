@@ -29,6 +29,13 @@ service SchedulerService {
   // Worker reports job completion/failure back to master
   rpc ReportResult (ReportResultRequest) returns (ReportResultResponse);
 
+  // Take a node out of, or back into, scheduling rotation.
+  //
+  // There was no way to stop a node receiving work for maintenance: an operator's only options
+  // were to kill the worker, which fails every job running on it, or to wait. Cordoning stops
+  // new dispatches while letting running jobs finish; draining additionally cancels them.
+  rpc CordonNode (CordonNodeRequest) returns (CordonNodeResponse);
+
   // Worker confirms it has started a job.
   //
   // This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -46,6 +53,20 @@ service SchedulerService {
   // every credential the cluster dispatched. This stream carries only the calling node's work
   // and rides the same authenticated, optionally TLS-protected connection as everything else.
   rpc WatchDispatch (WatchDispatchRequest) returns (stream DispatchMessage);
+}
+
+message CordonNodeRequest {
+  string node_name = 1;
+  bool cordon = 2;        // true to cordon, false to return the node to service
+  bool drain = 3;         // also cancel the jobs currently running on the node
+  string reason = 4;      // recorded and shown in `tasch nodes`
+}
+
+message CordonNodeResponse {
+  string node_name = 1;
+  bool cordoned = 2;
+  int32 jobs_cancelled = 3;
+  string message = 4;
 }
 
 message AcknowledgeStartRequest {
@@ -159,7 +180,17 @@ message LogMessage {
 message WorkerStatusRequest {}
 
 message WorkerStatusResponse {
-  map<string, string> worker_nodes = 1;
+  map<string, string> worker_nodes = 1;          // node name -> ClassAd JSON
+  map<string, NodeSchedulingState> node_state = 2;
+}
+
+// NodeSchedulingState describes why a node is or is not receiving work.
+message NodeSchedulingState {
+  bool cordoned = 1;
+  string cordon_reason = 2;
+  bool circuit_broken = 3;     // temporarily blocked after consecutive failures
+  int32 running_jobs = 4;
+  int32 gpus_allocated = 5;
 }
 
 message ListJobsRequest {

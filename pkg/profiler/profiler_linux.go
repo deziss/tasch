@@ -10,70 +10,98 @@ import (
 	"strings"
 )
 
-// DetectGPUs tries NVIDIA first, then AMD. Returns zero-values if no GPU found.
-func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
-	count, models, memoryMB, version = detectNVIDIAGPUs()
-	if count > 0 {
-		return count, models, memoryMB, version, "nvidia"
+// DetectGPUDetail reports the accelerators on this node, and which vendor supplied them.
+func DetectGPUDetail() (GPUInventory, string) {
+	if inv, ok := detectNVIDIAGPUs(); ok {
+		return inv, "nvidia"
 	}
-
-	count, models, memoryMB, version = detectAMDGPUs()
-	if count > 0 {
-		return count, models, memoryMB, version, "amd"
+	if inv, ok := detectAMDGPUs(); ok {
+		return inv, "amd"
 	}
-
-	// Fallback for ARM64 Jetson devices on Linux
-	count, models, memoryMB, version = detectJetsonGPUS()
-	if count > 0 {
-		return count, models, memoryMB, version, "nvidia"
+	// ARM64 Jetson boards carry an integrated GPU that nvidia-smi does not report.
+	if inv, ok := detectJetsonGPUS(); ok {
+		return inv, "nvidia"
 	}
-
-	return 0, nil, nil, "", ""
+	return GPUInventory{}, ""
 }
 
-// detectNVIDIAGPUs queries nvidia-smi for GPU information.
-func detectNVIDIAGPUs() (count int, models []string, memoryMB []int, cudaVersion string) {
+// detectNVIDIAGPUs reads the driver's own inventory through nvidia-smi.
+//
+// The XML form is asked for first because it is an interface: it carries the CUDA version,
+// per-device free memory and utilisation, and MIG instances, and it either parses or reports an
+// error. The CSV query is kept as a fallback for drivers too old to support `-q -x`, and it
+// still beats the previous approach of scraping the human-readable banner with a regular
+// expression — that banner is layout, it has changed between releases, and a miss produced an
+// empty CUDA version silently.
+func detectNVIDIAGPUs() (GPUInventory, bool) {
 	smiPath, err := exec.LookPath("nvidia-smi")
 	if err != nil {
-		return 0, nil, nil, ""
+		return GPUInventory{}, false
 	}
 
-	out, err := probe(smiPath, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
+	if out, err := probe(smiPath, "-q", "-x"); err == nil {
+		if inv, err := parseNvidiaSMIXML(out); err == nil {
+			return inv, true
+		}
+	}
+	return detectNVIDIAGPUsCSV(smiPath)
+}
+
+// detectNVIDIAGPUsCSV is the fallback for drivers without XML output.
+func detectNVIDIAGPUsCSV(smiPath string) (GPUInventory, bool) {
+	out, err := probe(smiPath,
+		"--query-gpu=name,memory.total,memory.free,utilization.gpu",
+		"--format=csv,noheader,nounits")
 	if err != nil {
-		return 0, nil, nil, ""
+		return GPUInventory{}, false
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
+	var inv GPUInventory
+	freeMB := -1
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, ", ", 2)
-		if len(parts) == 2 {
-			models = append(models, strings.TrimSpace(parts[0]))
-			mem, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
-			memoryMB = append(memoryMB, mem)
+		fields := strings.Split(line, ",")
+		if len(fields) < 2 {
+			continue
+		}
+		inv.Models = append(inv.Models, strings.TrimSpace(fields[0]))
+		mem, _ := strconv.Atoi(strings.TrimSpace(fields[1]))
+		inv.MemoryMB = append(inv.MemoryMB, mem)
+
+		if len(fields) >= 3 {
+			if free, err := strconv.Atoi(strings.TrimSpace(fields[2])); err == nil {
+				if freeMB < 0 || free < freeMB {
+					freeMB = free
+				}
+			}
+		}
+		if len(fields) >= 4 {
+			if util, err := strconv.Atoi(strings.TrimSpace(fields[3])); err == nil && util > inv.UtilPct {
+				inv.UtilPct = util
+			}
 		}
 	}
-	count = len(models)
-
-	out2, err := probe(smiPath)
-	if err == nil {
-		re := regexp.MustCompile(`CUDA Version:\s+([\d.]+)`)
-		if matches := re.FindSubmatch(out2); len(matches) > 1 {
-			cudaVersion = string(matches[1])
-		}
+	if len(inv.Models) == 0 {
+		return GPUInventory{}, false
+	}
+	if freeMB >= 0 {
+		inv.FreeMB = freeMB
 	}
 
-	return count, models, memoryMB, cudaVersion
+	// The CUDA version has no --query-gpu field, so this path simply does not report it rather
+	// than going back to scraping the banner for it.
+	return inv, true
 }
 
 // detectAMDGPUs queries rocm-smi for AMD GPU information.
-func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion string) {
+func detectAMDGPUs() (GPUInventory, bool) {
+	var inv GPUInventory
 	smiPath, err := exec.LookPath("rocm-smi")
 	if err != nil {
-		return 0, nil, nil, ""
+		return inv, false
 	}
 
 	out, err := probe(smiPath, "--showproductname", "--csv")
@@ -81,6 +109,8 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 		return detectAMDGPUsFallback(smiPath)
 	}
 
+	var models []string
+	var memoryMB []int
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	for i, line := range lines {
 		if i == 0 {
@@ -97,7 +127,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 			}
 		}
 	}
-	count = len(models)
+	count := len(models)
 
 	out2, err := probe(smiPath, "--showmeminfo", "vram", "--csv")
 	if err == nil {
@@ -118,7 +148,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 	if err == nil {
 		re := regexp.MustCompile(`(?i)driver version:\s+([\d.]+)`)
 		if matches := re.FindSubmatch(out3); len(matches) > 1 {
-			rocmVersion = string(matches[1])
+			inv.Version = string(matches[1])
 		}
 	}
 
@@ -126,16 +156,20 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 		memoryMB = append(memoryMB, 0)
 	}
 
-	return count, models, memoryMB, rocmVersion
+	inv.Models = models
+	inv.MemoryMB = memoryMB
+	return inv, count > 0
 }
 
 // detectAMDGPUsFallback uses rocm-smi without --csv flags.
-func detectAMDGPUsFallback(smiPath string) (count int, models []string, memoryMB []int, rocmVersion string) {
+func detectAMDGPUsFallback(smiPath string) (GPUInventory, bool) {
+	var inv GPUInventory
 	out, err := probe(smiPath)
 	if err != nil {
-		return 0, nil, nil, ""
+		return inv, false
 	}
 
+	count := 0
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
 		if strings.Contains(line, "GPU[") || strings.Contains(strings.ToLower(line), "gpu") && strings.Contains(line, ":") {
@@ -144,15 +178,15 @@ func detectAMDGPUsFallback(smiPath string) (count int, models []string, memoryMB
 	}
 
 	for i := 0; i < count; i++ {
-		models = append(models, "AMD GPU")
-		memoryMB = append(memoryMB, 0)
+		inv.Models = append(inv.Models, "AMD GPU")
+		inv.MemoryMB = append(inv.MemoryMB, 0)
 	}
 
-	return count, models, memoryMB, ""
+	return inv, count > 0
 }
 
 // detectJetsonGPUS queries tegrastats or sysfs for Nvidia Jetson embedded hardware.
-func detectJetsonGPUS() (count int, models []string, memoryMB []int, version string) {
+func detectJetsonGPUS() (GPUInventory, bool) {
 	// Look for Tegra/Jetson GPU signature in sysfs
 	if _, err := os.Stat("/sys/devices/gpu.0/dma_mask"); err == nil {
 		// Read system memory as unified memory size fallback
@@ -175,7 +209,11 @@ func detectJetsonGPUS() (count int, models []string, memoryMB []int, version str
 			modelName = strings.TrimSpace(strings.ReplaceAll(string(data), "\x00", ""))
 		}
 
-		return 1, []string{modelName}, []int{vramMB}, "Jetson Unified"
+		return GPUInventory{
+			Models:   []string{modelName},
+			MemoryMB: []int{vramMB},
+			Version:  "Jetson Unified",
+		}, true
 	}
-	return 0, nil, nil, ""
+	return GPUInventory{}, false
 }

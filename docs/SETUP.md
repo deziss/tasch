@@ -248,6 +248,40 @@ look for that line rather than assuming limits apply.
 GPUs are not covered: cgroup v2 has no GPU controller, so the injected `CUDA_VISIBLE_DEVICES`
 remains advisory and a job can unset it.
 
+## GPU Detection
+
+NVIDIA hardware is read from `nvidia-smi -q -x`, the driver's own structured output. That gives
+per-device memory, live free memory and utilisation, MIG instances, and the driver and CUDA
+versions, in a schema that either parses or reports an error.
+
+Two consequences worth knowing:
+
+**A partitioned card is reported as its MIG instances, not as one GPU.** An instance is what a
+job can actually be given, and advertising the whole card's memory would promise capacity no
+single instance has.
+
+**Live GPU state is matchable.** The class ad carries `gpu_free_mb` and `gpu_util_pct`, so a
+requirement can ask for a node with a genuinely idle accelerator:
+
+```
+tasch jobs submit 'ad.gpu_count > 0 && ad.gpu_free_mb > 20000 && ad.gpu_util_pct < 10' ./train.sh
+```
+
+Both are aggregates: `gpu_free_mb` is the *least* free memory across devices and `gpu_util_pct`
+the *busiest* device's utilisation. That way a requirement written against them holds for at
+least one device, and an idle-node requirement is not satisfied by an average across a card that
+is pinned. The class ad is capped at 512 bytes by the gossip protocol, which is why these are
+aggregates rather than per-device arrays.
+
+> **Why not NVML directly?** NVML is a C library, so binding it means cgo — and cgo means giving
+> up the property this project is built around: one static binary that cross-compiles to six
+> targets from any machine. A cgo build needs a C toolchain per target and links against a
+> driver library absent from most of them. `nvidia-smi -q -x` *is* NVML's output, serialized, so
+> reading that gets the data without the trade.
+
+AMD is read from `rocm-smi`, and Jetson boards from sysfs, since neither is covered by
+`nvidia-smi`.
+
 ## Partitions, Accounts and Quotas
 
 Without these, every job competes for every node and the only ordering is priority plus

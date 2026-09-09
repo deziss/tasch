@@ -8,7 +8,16 @@ import (
 )
 
 // DetectGPUs detects Apple Silicon / AMD / Intel GPUs on macOS.
-func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
+// DetectGPUDetail reports the accelerators on this node, and which vendor supplied them.
+//
+// Live utilisation and free memory are Linux-only for now: they come from the NVIDIA driver's
+// structured output, which is where the scheduler's GPU pressure information originates.
+func DetectGPUDetail() (GPUInventory, string) {
+	_, models, memoryMB, version, vendor := detectGPUsPlatform()
+	return GPUInventory{Models: models, MemoryMB: memoryMB, Version: version}, vendor
+}
+
+func detectGPUsPlatform() (count int, models []string, memoryMB []int, version string, vendor string) {
 	out, err := probe("system_profiler", "SPDisplaysDataType")
 	if err != nil {
 		return 0, nil, nil, "", ""

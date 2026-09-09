@@ -30,7 +30,16 @@ Get-CimInstance Win32_VideoController | ForEach-Object {
 } | ConvertTo-Json`
 
 // DetectGPUs tries to identify any GPUs present on Windows.
-func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
+// DetectGPUDetail reports the accelerators on this node, and which vendor supplied them.
+//
+// Live utilisation and free memory are Linux-only for now: they come from the NVIDIA driver's
+// structured output, which is where the scheduler's GPU pressure information originates.
+func DetectGPUDetail() (GPUInventory, string) {
+	_, models, memoryMB, version, vendor := detectGPUsPlatform()
+	return GPUInventory{Models: models, MemoryMB: memoryMB, Version: version}, vendor
+}
+
+func detectGPUsPlatform() (count int, models []string, memoryMB []int, version string, vendor string) {
 	// 1. Try WMI query via PowerShell first to capture all GPU types (NVIDIA, AMD, Intel, Qualcomm)
 	out, err := probe("powershell", "-NoProfile", "-NonInteractive", "-Command", windowsGPUQuery)
 	if err == nil {

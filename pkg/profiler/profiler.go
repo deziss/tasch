@@ -29,6 +29,24 @@ type ClassAd struct {
 	GPUMemoryMB []int    `json:"gpu_memory_mb"`
 	CUDAVersion string   `json:"cuda_version"`
 	ROCmVersion string   `json:"rocm_version"`
+
+	// Live GPU state, as aggregates rather than per-device values: the ad is capped at 512
+	// bytes, and a scheduling requirement is almost always "is there a device with room" rather
+	// than a statement about a particular card. GPUFreeMB is the least free memory across
+	// devices and GPUUtilPct the busiest device's utilisation, so a requirement written against
+	// them holds for at least one device and no more than it should.
+	GPUFreeMB   int  `json:"gpu_free_mb,omitempty"`
+	GPUUtilPct  int  `json:"gpu_util_pct,omitempty"`
+	GPUMIGSplit bool `json:"gpu_mig,omitempty"`
+}
+
+// DetectGPUs reports the accelerators on this node in the flattened form most callers want.
+//
+// DetectGPUDetail is the real detector; this is the adapter kept for callers that only need the
+// inventory and not the live state.
+func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
+	inv, vendor := DetectGPUDetail()
+	return inv.Count(), inv.Models, inv.MemoryMB, inv.Version, vendor
 }
 
 // MaxMetaBytes is the hard ceiling on a serialized ClassAd.
@@ -57,7 +75,8 @@ func GenerateClassAd() (string, error) {
 		modelName = cpuInfo[0].ModelName
 	}
 
-	gpuCount, gpuModels, gpuMemory, gpuVersion, gpuVendor := DetectGPUs()
+	gpu, gpuVendor := DetectGPUDetail()
+	gpuCount, gpuModels, gpuMemory, gpuVersion := gpu.Count(), gpu.Models, gpu.MemoryMB, gpu.Version
 
 	ad := ClassAd{
 		Timestamp:      time.Now().Unix(),
@@ -72,6 +91,9 @@ func GenerateClassAd() (string, error) {
 		GPUVendor:      gpuVendor,
 		GPUModels:      gpuModels,
 		GPUMemoryMB:    gpuMemory,
+		GPUFreeMB:      gpu.FreeMB,
+		GPUUtilPct:     gpu.UtilPct,
+		GPUMIGSplit:    gpu.MIGEnabled,
 	}
 
 	switch gpuVendor {

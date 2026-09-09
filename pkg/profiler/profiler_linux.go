@@ -38,8 +38,7 @@ func detectNVIDIAGPUs() (count int, models []string, memoryMB []int, cudaVersion
 		return 0, nil, nil, ""
 	}
 
-	cmd := exec.Command(smiPath, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
-	out, err := cmd.Output()
+	out, err := probe(smiPath, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
 	if err != nil {
 		return 0, nil, nil, ""
 	}
@@ -59,8 +58,7 @@ func detectNVIDIAGPUs() (count int, models []string, memoryMB []int, cudaVersion
 	}
 	count = len(models)
 
-	cmd2 := exec.Command(smiPath)
-	out2, err := cmd2.Output()
+	out2, err := probe(smiPath)
 	if err == nil {
 		re := regexp.MustCompile(`CUDA Version:\s+([\d.]+)`)
 		if matches := re.FindSubmatch(out2); len(matches) > 1 {
@@ -78,8 +76,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 		return 0, nil, nil, ""
 	}
 
-	cmd := exec.Command(smiPath, "--showproductname", "--csv")
-	out, err := cmd.Output()
+	out, err := probe(smiPath, "--showproductname", "--csv")
 	if err != nil {
 		return detectAMDGPUsFallback(smiPath)
 	}
@@ -102,8 +99,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 	}
 	count = len(models)
 
-	cmd2 := exec.Command(smiPath, "--showmeminfo", "vram", "--csv")
-	out2, err := cmd2.Output()
+	out2, err := probe(smiPath, "--showmeminfo", "vram", "--csv")
 	if err == nil {
 		lines2 := strings.Split(strings.TrimSpace(string(out2)), "\n")
 		for i, line := range lines2 {
@@ -118,8 +114,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 		}
 	}
 
-	cmd3 := exec.Command(smiPath, "--showdriverversion")
-	out3, err := cmd3.Output()
+	out3, err := probe(smiPath, "--showdriverversion")
 	if err == nil {
 		re := regexp.MustCompile(`(?i)driver version:\s+([\d.]+)`)
 		if matches := re.FindSubmatch(out3); len(matches) > 1 {
@@ -136,8 +131,7 @@ func detectAMDGPUs() (count int, models []string, memoryMB []int, rocmVersion st
 
 // detectAMDGPUsFallback uses rocm-smi without --csv flags.
 func detectAMDGPUsFallback(smiPath string) (count int, models []string, memoryMB []int, rocmVersion string) {
-	cmd := exec.Command(smiPath)
-	out, err := cmd.Output()
+	out, err := probe(smiPath)
 	if err != nil {
 		return 0, nil, nil, ""
 	}

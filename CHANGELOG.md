@@ -51,6 +51,15 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Fixed — hardware detection
+
+- **GPU probes can no longer hang startup.** All twelve vendor-tool invocations used plain
+  `exec.Command` with no deadline. An `nvidia-smi` stuck in uninterruptible sleep — the routine
+  outcome when a GPU falls off the bus, which is exactly when you want the node to still report
+  in — blocked ClassAd generation indefinitely, so `StartWorker` never returned and `tasch start`
+  hung with no message and no watchdog. Every probe now has a 10-second budget and the hung
+  process is killed rather than left behind.
+
 ### Changed — fairshare
 
 Fairshare was advertised as a feature but barely functioned. Three defects, all fixed:

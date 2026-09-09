@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 type winGPU struct {
@@ -20,11 +19,8 @@ type winGPU struct {
 // DetectGPUs tries to identify any GPUs present on Windows.
 func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
 	// 1. Try WMI query via PowerShell first to capture all GPU types (NVIDIA, AMD, Intel, Qualcomm)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	out, err := probe("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		"Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
-	out, err := cmd.Output()
 	if err == nil {
 		var gpus []winGPU
 		trimmed := strings.TrimSpace(string(out))
@@ -100,9 +96,7 @@ func detectWindowsNVIDIAGPUs() (count int, models []string, memoryMB []int, cuda
 		}
 	}
 
-	cmd := exec.Command(smiPath, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := cmd.Output()
+	out, err := probe(smiPath, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
 	if err != nil {
 		return 0, nil, nil, ""
 	}
@@ -122,9 +116,7 @@ func detectWindowsNVIDIAGPUs() (count int, models []string, memoryMB []int, cuda
 	}
 	count = len(models)
 
-	cmd2 := exec.Command(smiPath)
-	cmd2.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out2, err := cmd2.Output()
+	out2, err := probe(smiPath)
 	if err == nil {
 		re := regexp.MustCompile(`CUDA Version:\s+([\d.]+)`)
 		if matches := re.FindSubmatch(out2); len(matches) > 1 {
@@ -143,9 +135,7 @@ func getWindowsCUDAVersion() string {
 			return ""
 		}
 	}
-	cmd := exec.Command(smiPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := cmd.Output()
+	out, err := probe(smiPath)
 	if err == nil {
 		re := regexp.MustCompile(`CUDA Version:\s+([\d.]+)`)
 		if matches := re.FindSubmatch(out); len(matches) > 1 {

@@ -3,15 +3,13 @@
 package profiler
 
 import (
-	"os/exec"
 	"strconv"
 	"strings"
 )
 
 // DetectGPUs detects Apple Silicon / AMD / Intel GPUs on macOS.
 func DetectGPUs() (count int, models []string, memoryMB []int, version string, vendor string) {
-	cmd := exec.Command("system_profiler", "SPDisplaysDataType")
-	out, err := cmd.Output()
+	out, err := probe("system_profiler", "SPDisplaysDataType")
 	if err != nil {
 		return 0, nil, nil, "", ""
 	}
@@ -26,8 +24,7 @@ func DetectGPUs() (count int, models []string, memoryMB []int, version string, v
 	}
 
 	var vramMB int
-	cmd2 := exec.Command("sysctl", "-n", "hw.memsize")
-	out2, err := cmd2.Output()
+	out2, err := probe("sysctl", "-n", "hw.memsize")
 	if err == nil {
 		bytes, _ := strconv.ParseInt(strings.TrimSpace(string(out2)), 10, 64)
 		if bytes > 0 {

@@ -44,10 +44,10 @@ chmod +x build.sh && ./build.sh
 Download the latest release from GitHub and install via your package manager:
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i tasch_0.1.0_amd64.deb
+sudo dpkg -i tasch_0.9.0_amd64.deb
 
 # RHEL/CentOS/Fedora
-sudo rpm -i tasch-0.1.0-1.x86_64.rpm
+sudo rpm -i tasch-0.9.0-1.x86_64.rpm
 ```
 After installation, the binary is at `/usr/bin/tasch`, and the configuration is at `/etc/tasch/config.yaml`.
 
@@ -89,7 +89,7 @@ tasch stop                     # graceful drain + shutdown
 | **BoltDB persistence** | Jobs, groups, fairshare survive master restart (`~/.tasch/tasch.db`) |
 | **Job retry** | Auto-retry failed jobs (default 3×) with exponential backoff. Dead letter queue for exhausted retries |
 | **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
-| **Prometheus metrics** | 10 metrics: queue depth, running jobs, dispatch duration, job duration, walltime kills, worker loss |
+| **Prometheus metrics** | 22 metrics including queue-wait and scheduling-loop histograms, per-state job gauges, GPU utilisation, and delivery, retry and persistence counters. Workers export their own |
 | **Circuit breaker** | 3 consecutive failures → worker blocked 5 minutes |
 | **Cordon / drain** | Take a node out of rotation for maintenance. Cordons survive a master restart, and `tasch nodes` shows why a node is not taking work |
 | **Multi-resource tracking** | Prevents GPU, CPU, and memory oversubscription across concurrent dispatches |

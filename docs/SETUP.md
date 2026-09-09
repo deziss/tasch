@@ -4,7 +4,7 @@
 
 - **OS:** Linux, macOS, or Windows (native — no WSL required)
 - **Arch:** amd64 or arm64 (32-bit not supported)
-- **Go:** 1.21+ (only for building from source)
+- **Go:** 1.25+ (only for building from source)
 - **GPU (optional):**
   - NVIDIA — `nvidia-smi` in PATH
   - AMD — `rocm-smi` in PATH
@@ -32,10 +32,10 @@ chmod +x build.sh && ./build.sh
 ### From Package (.deb / .rpm)
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i tasch_0.1.0_amd64.deb
+sudo dpkg -i tasch_0.9.0_amd64.deb
 
 # RHEL/CentOS/Fedora
-sudo rpm -i tasch-0.1.0-1.x86_64.rpm
+sudo rpm -i tasch-0.9.0-1.x86_64.rpm
 ```
 Binary at `/usr/bin/tasch`, config at `/etc/tasch/config.yaml`.
 
@@ -131,20 +131,15 @@ tasch jobs submit "ad.os == 'windows' && ad.gpu_vendor == 'intel'" "my_oneapi_ap
 
 ### Systemd service
 
-```ini
-[Unit]
-Description=Tasch Scheduler
-After=network.target
+Use the unit shipped in the `.deb`/`.rpm`, or copy `packaging/tasch.service` from the repository.
+Do not hand-write a minimal one: the packaged unit carries the sandboxing settings and, more
+importantly, `Delegate=cpu memory pids`, without which per-job resource limits silently do not
+apply.
 
-[Service]
-Type=simple
-User=tasch
-ExecStart=/usr/local/bin/tasch start
-ExecStop=/usr/local/bin/tasch stop
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo cp packaging/tasch.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tasch
 ```
 
 ## Network Ports

@@ -88,6 +88,7 @@ tasch stop                     # graceful drain + shutdown
 | **Distributed training** | `tasch jobs train` — gang scheduling + auto DDP env vars (`RANK`, `WORLD_SIZE`, `MASTER_ADDR`) |
 | **BoltDB persistence** | Jobs, groups, fairshare, and cordons survive master restart (`~/.tasch/tasch.db`) |
 | **Restart adoption** | Workers report their in-flight jobs on reconnect; a restarted master adopts them instead of failing them, keeping their fencing token so results are still accepted |
+| **High availability** | Optional. Run 3+ masters with Raft-replicated state; losing the leader elects a new one that already holds the queue. Clients and workers follow the leader automatically |
 | **Job retry** | Auto-retry failed jobs (default 3×) with exponential backoff. Dead letter queue for exhausted retries |
 | **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
 | **Prometheus metrics** | 22 metrics including queue-wait and scheduling-loop histograms, per-state job gauges, GPU utilisation, and delivery, retry and persistence counters. Workers export their own |
@@ -136,6 +137,7 @@ tasch jobs status <id>               # Job detail + output
 tasch jobs logs <id> [--follow]      # Stream logs
 tasch jobs failed                    # Dead letter queue
 
+tasch cluster status                 # Which master is the leader (HA)
 tasch config validate                # Check config, warn on insecure settings
 tasch version                        # Build version, commit, toolchain
 ```
@@ -208,6 +210,8 @@ auth:
 gossip:
   encryption_key: ""         # base64, 16/24/32 bytes: openssl rand -base64 32
   profile: lan               # lan | wan | local
+ha:
+  enabled: false             # 3+ masters with automatic failover; see docs/SETUP.md
 fairshare:
   enabled: true
   half_life_hours: 24        # how fast recorded usage ages out

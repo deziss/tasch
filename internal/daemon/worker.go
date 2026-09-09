@@ -32,21 +32,33 @@ import (
 // on arrival. Besides handing every worker every job's command and environment variables, that
 // design dropped any dispatch published while a subscriber was mid-reconnect, because PUB has
 // no delivery guarantee and the master discarded its send errors.
-func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceClient, nodeName string, running func() []*pb.RunningJob) <-chan *pb.DispatchMessage {
+// leaderResolver returns a client for the master currently accepting writes.
+type leaderResolver func(ctx context.Context) (pb.SchedulerServiceClient, error)
+
+// watchDispatchWithReconnect streams dispatches for this node, following the leader.
+//
+// The leader is re-resolved on every connection attempt. Only the leader dispatches, and which
+// master holds that role changes on failover, so a worker pinned to the address it started with
+// would sit idle against a follower indefinitely.
+//
+// This replaces a ZeroMQ SUB socket that subscribed to everything and filtered by target node on
+// arrival. Besides handing every worker every job's command and environment variables, that
+// design silently dropped any dispatch published while a subscriber was mid-reconnect.
+func watchDispatchWithReconnect(ctx context.Context, resolve leaderResolver, nodeName string, running func() []*pb.RunningJob) <-chan *pb.DispatchMessage {
 	ch := make(chan *pb.DispatchMessage, 100)
+
 	go func() {
 		defer close(ch)
-		backoff := 1 * time.Second
+		backoff := time.Second
+
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			// Report what is executing on every connect. After a master restart this is the only
-			// way the master learns these jobs survived; without it they are declared failed
-			// while the processes keep running and holding the node's resources.
-			stream, err := client.WatchDispatch(ctx, &pb.WatchDispatchRequest{
-				NodeName: nodeName, RunningJobs: running(),
-			})
+
+			// Reporting in-flight jobs on every connect is how a restarted master learns they
+			// survived; without it they are declared failed while the processes keep running.
+			stream, err := openDispatchStream(ctx, resolve, nodeName, running())
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -62,15 +74,15 @@ func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceC
 				}
 				continue
 			}
+			backoff = time.Second
 
-			backoff = 1 * time.Second
 			for {
-				msg, err := stream.Recv()
-				if err != nil {
+				msg, recvErr := stream.Recv()
+				if recvErr != nil {
 					if ctx.Err() != nil {
 						return
 					}
-					slog.Warn("dispatch stream closed, reconnecting", "error", err)
+					slog.Info("dispatch stream closed, reconnecting", "error", recvErr)
 					break
 				}
 				select {
@@ -81,16 +93,36 @@ func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceC
 			}
 		}
 	}()
+
 	return ch
 }
 
-// reportWithRetry reports job result to master with exponential backoff.
-func reportWithRetry(ctx context.Context, client pb.SchedulerServiceClient, req *pb.ReportResultRequest) {
+// openDispatchStream resolves the leader and subscribes to its dispatches.
+func openDispatchStream(ctx context.Context, resolve leaderResolver, nodeName string, running []*pb.RunningJob) (grpc.ServerStreamingClient[pb.DispatchMessage], error) {
+	client, err := resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return client.WatchDispatch(ctx, &pb.WatchDispatchRequest{
+		NodeName: nodeName, RunningJobs: running,
+	})
+}
+
+// reportWithRetry reports a job result to the master, with exponential backoff.
+//
+// The leader is re-resolved on every attempt rather than reusing the connection the job arrived
+// on. Results are writes, so only the leader accepts them; a worker that kept reporting to the
+// master it started with would, after a failover, retry forever against a dead or demoted node
+// while its job sat RUNNING on the cluster indefinitely.
+func reportWithRetry(ctx context.Context, resolve leaderResolver, req *pb.ReportResultRequest) {
 	backoff := 1 * time.Second
 	for {
-		reportCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := client.ReportResult(reportCtx, req)
-		cancel()
+		client, err := resolve(ctx)
+		if err == nil {
+			reportCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_, err = client.ReportResult(reportCtx, req)
+			cancel()
+		}
 		if err == nil {
 			return // Success
 		}
@@ -140,7 +172,11 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	}
 
 	joinAddr := fmt.Sprintf("%s:%d", masterHost, cfg.Ports.Gossip)
-	if err := disc.Join([]string{joinAddr}); err != nil {
+	seeds := cfg.Gossip.Join
+	if len(seeds) == 0 {
+		seeds = []string{joinAddr}
+	}
+	if err := disc.Join(seeds); err != nil {
 		_ = disc.Shutdown()
 		return nil, fmt.Errorf("cluster join at %s: %w", joinAddr, err)
 	}
@@ -235,7 +271,9 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	subCtx, cancelSub := context.WithCancel(context.Background())
 
 	// Dispatch arrives over the same authenticated gRPC connection as everything else.
-	msgCh := watchDispatchWithReconnect(subCtx, masterClient, nodeName, snapshotRunning)
+	// With several masters, follow whichever is currently the leader.
+	resolve := newLeaderResolver(cfg, masterClient, dialOpts)
+	msgCh := watchDispatchWithReconnect(subCtx, resolve, nodeName, snapshotRunning)
 
 	slog.Info("worker joined cluster", "node", nodeName, "master", masterHost)
 
@@ -292,7 +330,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 				cancelMu.Unlock()
 
 				go func(p *pb.DispatchMessage) {
-					acknowledgeStart(subCtx, masterClient, nodeName, p)
+					acknowledgeStart(subCtx, resolve, nodeName, p)
 					var ctx context.Context
 					var cf context.CancelFunc
 					if p.WalltimeSeconds > 0 {
@@ -388,7 +426,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 							"duration", endTime.Sub(startTime), "peak_memory_bytes", cg.PeakMemoryBytes())
 					}
 
-					reportWithRetry(subCtx, masterClient, &pb.ReportResultRequest{
+					reportWithRetry(subCtx, resolve, &pb.ReportResultRequest{
 						JobId: p.JobId, WorkerNode: nodeName, Success: success,
 						Output: stdout.String(), Error: errMsg,
 						StartTime: startTime.Unix(), EndTime: endTime.Unix(),
@@ -418,13 +456,17 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 // This used to be an unauthenticated HTTP POST to the master's metrics port, with the port
 // taken from the worker's own config — so the handshake silently failed whenever the master's
 // metrics port differed, and the master then re-dispatched a job that was already running.
-func acknowledgeStart(ctx context.Context, client pb.SchedulerServiceClient, nodeName string, p *pb.DispatchMessage) {
+func acknowledgeStart(ctx context.Context, resolve leaderResolver, nodeName string, p *pb.DispatchMessage) {
 	for attempt := 0; attempt < 3; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := client.AcknowledgeStart(callCtx, &pb.AcknowledgeStartRequest{
-			JobId: p.JobId, WorkerNode: nodeName, Attempt: p.Attempt,
-		})
-		cancel()
+		// Like results, the acknowledgement is a write and only the leader accepts it.
+		client, err := resolve(ctx)
+		if err == nil {
+			callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_, err = client.AcknowledgeStart(callCtx, &pb.AcknowledgeStartRequest{
+				JobId: p.JobId, WorkerNode: nodeName, Attempt: p.Attempt,
+			})
+			cancel()
+		}
 		if err == nil {
 			return
 		}
@@ -480,4 +522,55 @@ func startWorkerHealth(cfg *config.Config, nodeName string, running *atomic.Int6
 		}
 	}()
 	return server
+}
+
+// newLeaderResolver returns a resolver for the master currently accepting writes.
+//
+// With a single master this is the connection already established, and costs nothing. With
+// several, each is asked in turn until one identifies itself as the leader; connections are
+// cached so a failover reuses them rather than reconnecting to every master each time.
+func newLeaderResolver(cfg *config.Config, single pb.SchedulerServiceClient, dialOpts []grpc.DialOption) leaderResolver {
+	addrs := cfg.GRPCAddrs()
+	if len(addrs) <= 1 {
+		return func(context.Context) (pb.SchedulerServiceClient, error) { return single, nil }
+	}
+
+	var mu sync.Mutex
+	conns := make(map[string]*grpc.ClientConn, len(addrs))
+
+	return func(ctx context.Context) (pb.SchedulerServiceClient, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var lastErr error
+		for _, addr := range addrs {
+			conn, ok := conns[addr]
+			if !ok {
+				var err error
+				conn, err = grpc.NewClient(addr, dialOpts...)
+				if err != nil {
+					lastErr = err
+					continue
+				}
+				conns[addr] = conn
+			}
+
+			client := pb.NewSchedulerServiceClient(conn)
+			probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			resp, err := client.ClusterStatus(probeCtx, &pb.ClusterStatusRequest{})
+			cancel()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if resp.IsLeader {
+				return client, nil
+			}
+		}
+
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no master is currently the leader")
+		}
+		return nil, fmt.Errorf("finding the leader among %v: %w", addrs, lastErr)
+	}
 }

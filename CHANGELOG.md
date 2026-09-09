@@ -51,6 +51,29 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Added — high availability
+
+- **Optional multi-master operation with automatic failover.** The master was a single point of
+  failure: one process held the queue, one BoltDB file held the state, and workers dialled one
+  address. Losing that host meant no dispatch, no submission, no status and no results until
+  someone restarted it, and anything not yet flushed to disk was gone.
+- Scheduler state is replicated across masters through Raft. Losing the leader elects a new one
+  that already holds the queue, the running jobs, the groups, the fairshare accounting and the
+  cordons.
+- The leader makes scheduling decisions locally and replicates the *decision*. Matching involves
+  CEL evaluation against live cluster membership, which is neither deterministic across replicas
+  nor expressible in a log entry; replicating "this job goes to that node" as a fact keeps every
+  replica identical without it.
+- Followers serve reads and redirect writes, naming the leader, so a failover looks like a brief
+  retry rather than a lost submission.
+- Clients and workers find the leader automatically and re-resolve it on every reconnect —
+  dispatch streams, start acknowledgements and result reports all follow it.
+- Masters now share one gossip cluster via `gossip.join`. Without it each forms its own
+  membership view and a leader can only dispatch to the workers that happened to join it.
+- Off by default, and off is exactly the previous single-master behaviour: no quorum requirement,
+  no replication, no new failure modes. Enabling it requires an odd number of masters, three at
+  minimum — two are worse than one, since losing either leaves no majority.
+
 ### Changed — master restart
 
 - **A master restart no longer destroys running work.** Every RUNNING job was marked FAILED

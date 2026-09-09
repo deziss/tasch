@@ -166,3 +166,36 @@ func drainCmd(cfgLoader func() *config.Config) *cobra.Command {
 	cmd.Flags().StringVar(&reason, "reason", "", "Why the node is being drained")
 	return cmd
 }
+
+// ClusterStatus prints the master cluster's composition and current leader.
+func ClusterStatus(cfg *config.Config) {
+	client, conn := GetClient(cfg)
+	defer func() { _ = conn.Close() }()
+
+	resp, err := client.ClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
+	if err != nil {
+		log.Fatalf("Failed to get cluster status: %v", err)
+	}
+
+	if !resp.HaEnabled {
+		fmt.Println("High availability is disabled: this is a single master.")
+		fmt.Printf("  Node: %s\n", resp.NodeId)
+		fmt.Println("\nLosing this host stops the cluster until it comes back. See docs/SETUP.md")
+		fmt.Println("to run several masters with automatic failover.")
+		return
+	}
+
+	fmt.Printf("--- Master Cluster ---\nLeader: %s (%s)\n\n", resp.LeaderId, resp.LeaderAddress)
+	fmt.Printf("%-16s %-24s %-10s %s\n", "NODE_ID", "ADDRESS", "ROLE", "SUFFRAGE")
+	for _, m := range resp.Members {
+		role := "follower"
+		if m.Leader {
+			role = "LEADER"
+		}
+		fmt.Printf("%-16s %-24s %-10s %s\n", m.NodeId, m.Address, role, m.Suffrage)
+	}
+
+	// A cluster needs a majority to make progress, so say plainly how much slack is left.
+	tolerated := (len(resp.Members) - 1) / 2
+	fmt.Printf("\n%d masters; can lose %d and keep scheduling.\n", len(resp.Members), tolerated)
+}

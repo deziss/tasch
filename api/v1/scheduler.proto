@@ -29,6 +29,12 @@ service SchedulerService {
   // Worker reports job completion/failure back to master
   rpc ReportResult (ReportResultRequest) returns (ReportResultResponse);
 
+  // Report this master's role in the replicated cluster.
+  //
+  // Clients need it to find the master currently accepting writes: every master answers reads,
+  // but only the leader accepts changes, and which one that is moves on failover.
+  rpc ClusterStatus (ClusterStatusRequest) returns (ClusterStatusResponse);
+
   // Take a node out of, or back into, scheduling rotation.
   //
   // There was no way to stop a node receiving work for maintenance: an operator's only options
@@ -53,6 +59,24 @@ service SchedulerService {
   // every credential the cluster dispatched. This stream carries only the calling node's work
   // and rides the same authenticated, optionally TLS-protected connection as everything else.
   rpc WatchDispatch (WatchDispatchRequest) returns (stream DispatchMessage);
+}
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  bool is_leader = 1;
+  string node_id = 2;
+  string leader_id = 3;
+  string leader_address = 4;
+  bool ha_enabled = 5;
+  repeated ClusterMember members = 6;
+}
+
+message ClusterMember {
+  string node_id = 1;
+  string address = 2;
+  bool leader = 3;
+  string suffrage = 4;   // Voter or Nonvoter
 }
 
 message CordonNodeRequest {

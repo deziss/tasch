@@ -23,7 +23,12 @@ type Config struct {
 	TLS          TLSConfig       `yaml:"tls"`
 	Auth         AuthConfig      `yaml:"auth"`
 	Fairshare    FairshareConfig `yaml:"fairshare"`
-	Gossip       GossipConfig    `yaml:"gossip"`
+	HA           HAConfig        `yaml:"ha"`
+
+	// MasterAddrs lists every master, for clients and workers to fail over between when HA is
+	// enabled. Empty falls back to the single MasterAddr.
+	MasterAddrs []string     `yaml:"master_addrs"`
+	Gossip      GossipConfig `yaml:"gossip"`
 
 	// MetricsBind is the address the health/metrics server listens on. Defaults to all
 	// interfaces for backward compatibility; set 127.0.0.1 to keep it off the network.
@@ -48,6 +53,34 @@ type Config struct {
 	// ClientToken is the token this node presents when calling the master. Set it via
 	// TASCH_AUTH_TOKEN or client_token; it is what the CLI and the worker authenticate with.
 	ClientToken string `yaml:"client_token"`
+}
+
+// HAConfig configures running several masters with automatic failover.
+//
+// Off by default, and off means exactly the previous behaviour: one master, local state, no
+// quorum requirement. Turning it on replicates scheduler state across masters so losing one is
+// survivable — at the cost of needing a majority alive, which means an odd number of masters,
+// three at minimum.
+type HAConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// NodeID identifies this master in the replicated cluster. It must be stable across
+	// restarts: a master that comes back under a new ID leaves its old identity behind as a dead
+	// voter, and enough of those cost the cluster its quorum.
+	NodeID string `yaml:"node_id"`
+
+	// BindAddr is where peers reach this master's replication transport.
+	BindAddr string `yaml:"bind_addr"`
+
+	// DataDir holds this master's replicated log and snapshots. It must not be shared.
+	DataDir string `yaml:"data_dir"`
+
+	// Peers lists every master as "id=host:port", including this one.
+	Peers []string `yaml:"peers"`
+
+	// Bootstrap forms the cluster from Peers on first start. It is ignored once this node has
+	// state, so leaving it set is safe across restarts.
+	Bootstrap bool `yaml:"bootstrap"`
 }
 
 // FairshareConfig tunes how past usage penalises a user's priority.
@@ -105,6 +138,13 @@ type GossipConfig struct {
 
 	// KeyFile optionally reads the key from a file instead.
 	KeyFile string `yaml:"key_file"`
+
+	// Join lists gossip seed addresses ("host:port") to contact on startup.
+	//
+	// With several masters this is what puts them in one membership view. Without it each forms
+	// its own cluster, and whichever master holds leadership can only see the workers that
+	// happened to join it — everything else stays queued forever.
+	Join []string `yaml:"join"`
 
 	// Profile selects memberlist timing: "lan" (default), "wan", or "local". The old hardcoded
 	// "local" profile is tuned for loopback and produces false node-failure detections on any
@@ -208,6 +248,26 @@ func (c *Config) GRPCAddr() string {
 	return fmt.Sprintf("%s:%d", c.MasterAddr, c.Ports.GRPC)
 }
 
+// GRPCAddrs returns every master address a client should try.
+//
+// With several masters only the leader accepts writes, and which one that is changes on
+// failover, so clients need the full set rather than a single address.
+func (c *Config) GRPCAddrs() []string {
+	if len(c.MasterAddrs) == 0 {
+		return []string{c.GRPCAddr()}
+	}
+	addrs := make([]string, 0, len(c.MasterAddrs))
+	for _, host := range c.MasterAddrs {
+		// An entry may already carry a port; otherwise apply the configured one.
+		if strings.Contains(host, ":") {
+			addrs = append(addrs, host)
+			continue
+		}
+		addrs = append(addrs, fmt.Sprintf("%s:%d", host, c.Ports.GRPC))
+	}
+	return addrs
+}
+
 // LoadConfig reads a YAML config from disk.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -303,6 +363,44 @@ func (c *Config) Validate() error {
 			if w < 0 {
 				return fmt.Errorf("fairshare.%s cannot be negative (got %v)", name, w)
 			}
+		}
+	}
+
+	if c.HA.Enabled {
+		if c.HA.NodeID == "" {
+			return fmt.Errorf("ha.node_id is required and must stay the same across restarts")
+		}
+		if c.HA.BindAddr == "" {
+			return fmt.Errorf("ha.bind_addr is required so peers can reach this master")
+		}
+		if c.HA.DataDir == "" {
+			return fmt.Errorf("ha.data_dir is required and must not be shared between masters")
+		}
+		if len(c.HA.Peers) < 3 {
+			// Two masters cannot form a majority once either is lost, so the cluster stops on
+			// the first failure — worse than a single master, which at least restarts.
+			return fmt.Errorf("ha.peers needs at least 3 masters to tolerate a failure (got %d)", len(c.HA.Peers))
+		}
+		if len(c.HA.Peers)%2 == 0 {
+			return fmt.Errorf("ha.peers should be an odd number of masters; %d gives no better fault tolerance than %d", len(c.HA.Peers), len(c.HA.Peers)-1)
+		}
+		seen := make(map[string]bool, len(c.HA.Peers))
+		selfListed := false
+		for _, peer := range c.HA.Peers {
+			id, _, found := strings.Cut(peer, "=")
+			if !found || id == "" {
+				return fmt.Errorf("ha.peers entry %q must be in the form id=host:port", peer)
+			}
+			if seen[id] {
+				return fmt.Errorf("duplicate master id %q in ha.peers", id)
+			}
+			seen[id] = true
+			if id == c.HA.NodeID {
+				selfListed = true
+			}
+		}
+		if !selfListed {
+			return fmt.Errorf("ha.peers must include this master (ha.node_id %q)", c.HA.NodeID)
 		}
 	}
 

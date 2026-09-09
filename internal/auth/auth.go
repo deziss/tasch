@@ -139,6 +139,7 @@ var methodsForWorkers = map[string]bool{
 	"/v1.SchedulerService/ReportResult":     true,
 	"/v1.SchedulerService/WorkerStatus":     true,
 	"/v1.SchedulerService/WatchDispatch":    true,
+	"/v1.SchedulerService/ClusterStatus":    true,
 	"/v1.SchedulerService/AcknowledgeStart": true,
 }
 

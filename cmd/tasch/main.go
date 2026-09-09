@@ -43,6 +43,7 @@ Get started:
 	rootCmd.AddCommand(stopCmd())
 	rootCmd.AddCommand(cli.NodesCmd(loadConfig))
 	rootCmd.AddCommand(cli.JobsCmd(loadConfig))
+	rootCmd.AddCommand(clusterCmd(loadConfig))
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(configCmd())
 
@@ -276,6 +277,23 @@ func configCmd() *cobra.Command {
 				fmt.Println("  NOTE:    max_concurrent_jobs is unlimited; a burst of submissions can")
 				fmt.Println("           fork a worker to death.")
 			}
+		},
+	})
+	return cmd
+}
+
+// --- cluster ---
+
+func clusterCmd(cfgLoader func() *config.Config) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cluster",
+		Short: "Inspect the master cluster",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "Show which master is the leader",
+		Run: func(cmd *cobra.Command, args []string) {
+			cli.ClusterStatus(cfgLoader())
 		},
 	})
 	return cmd

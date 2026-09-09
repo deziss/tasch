@@ -245,6 +245,22 @@ func (gs *GlobalScheduler) Backfill(matchFunc func(job *Job) bool) *Job {
 	return nil
 }
 
+// FindQueued returns a copy of the first queued job satisfying match, without removing it.
+//
+// Selection and removal are separate because the removal has to be replicated as a decision
+// about a specific job: the predicate closes over live cluster state and cannot travel in a log
+// entry.
+func (gs *GlobalScheduler) FindQueued(match func(job *Job) bool) *Job {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	for _, job := range gs.queue {
+		if match(job.Copy()) {
+			return job.Copy()
+		}
+	}
+	return nil
+}
+
 // RemoveByID removes a QUEUED job from the queue by ID and returns it.
 func (gs *GlobalScheduler) RemoveByID(jobID string) *Job {
 	gs.mu.Lock()
@@ -633,6 +649,45 @@ func (gs *GlobalScheduler) ReprioritizeQueued(penaltyFor func(job *Job) int) int
 		heap.Init(&gs.queue)
 	}
 	return changed
+}
+
+// ListGroups returns a copy of every registered job group.
+func (gs *GlobalScheduler) ListGroups() []*JobGroup {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	out := make([]*JobGroup, 0, len(gs.groups))
+	for _, g := range gs.groups {
+		out = append(out, g.Copy())
+	}
+	return out
+}
+
+// Reset replaces all scheduler state, rebuilding the queue from the supplied jobs.
+//
+// Used when a replica loads a snapshot: the heap is derived from the job set rather than being
+// part of the snapshot, since its internal array order is an implementation detail and would
+// otherwise have to stay byte-identical across replicas.
+func (gs *GlobalScheduler) Reset(jobs []*Job, groups []*JobGroup) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	gs.jobs = make(map[string]*Job, len(jobs))
+	gs.groups = make(map[string]*JobGroup, len(groups))
+	gs.queue = make(JobQueue, 0, len(jobs))
+
+	for _, job := range jobs {
+		restored := job.Copy()
+		restored.index = -1
+		gs.jobs[restored.ID] = restored
+		if restored.State == StateQueued {
+			gs.queue = append(gs.queue, restored)
+		}
+	}
+	heap.Init(&gs.queue)
+
+	for _, g := range groups {
+		gs.groups[g.GroupID] = g.Copy()
+	}
 }
 
 // --- Fairshare ---

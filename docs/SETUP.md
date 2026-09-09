@@ -148,7 +148,8 @@ sudo systemctl enable --now tasch
 |------|----------|---------|
 | 7946 | UDP + TCP | Gossip (cluster discovery) |
 | 50051 | TCP | gRPC (CLI + result reporting) |
-| 9090 | TCP | Health checks + Prometheus metrics + dispatch handshake |
+| 9090 | TCP | Health checks + Prometheus metrics |
+| 8300 | TCP | Raft replication between masters (HA only, configurable) |
 
 ## GPU Detection
 
@@ -308,3 +309,59 @@ curl http://localhost:9090/ready
 **Queue full** — Max 10,000 jobs by default. Increase `max_queue_size` in config or wait for jobs to complete.
 
 **Unacknowledged dispatch warning** — If a worker receives a job but doesn't acknowledge within 10s, the master re-queues it. Check worker connectivity to the master's metrics port.
+
+## High Availability
+
+Off by default. A single master is a single point of failure: losing that host stops dispatch,
+submission, and status until it comes back.
+
+With HA enabled, several masters replicate scheduler state through Raft. One is the leader and
+makes every scheduling decision; the others follow. If the leader is lost, the survivors elect a
+new one that already holds the queue, the running jobs, the groups, the fairshare accounting and
+the cordons — nothing that was acknowledged to a client is lost.
+
+```yaml
+ha:
+  enabled: true
+  node_id: master-1                    # stable across restarts
+  bind_addr: 10.0.1.11:8300            # where peers reach this master
+  data_dir: /var/lib/tasch/raft        # per-master, never shared
+  bootstrap: true                      # first start only; ignored once state exists
+  peers:
+    - master-1=10.0.1.11:8300
+    - master-2=10.0.1.12:8300
+    - master-3=10.0.1.13:8300
+
+# Every master and worker must share one gossip cluster, or a leader can only see the workers
+# that happened to join it.
+gossip:
+  join: ["10.0.1.11:7946", "10.0.1.12:7946", "10.0.1.13:7946"]
+
+# Clients and workers try each master until they find the leader.
+master_addrs: ["10.0.1.11", "10.0.1.12", "10.0.1.13"]
+```
+
+**Use an odd number, three at minimum.** Raft needs a majority to make progress: three masters
+tolerate one failure, five tolerate two. Two masters are worse than one — losing either leaves no
+majority, so the cluster stops rather than continuing degraded. The config refuses an even count
+for that reason.
+
+`data_dir` must be local to each master and never shared; it holds that master's copy of the
+replicated log.
+
+Checking the cluster:
+
+```bash
+tasch cluster status
+```
+
+Notes and limits:
+
+- Only the leader schedules. Followers serve reads — `tasch jobs`, `tasch nodes`, job status all
+  work against any master — but writes are redirected.
+- Failover takes a few seconds: the survivors must notice the leader is gone and hold an
+  election. Workers keep executing during that window and are adopted by the new leader.
+- Jobs already running are unaffected by a failover. Workers report what they are executing when
+  they reconnect, and the new leader adopts it.
+- HA replaces neither backups nor the drain-on-shutdown path. It protects against losing a
+  master, not against a bad configuration replicated to all of them.

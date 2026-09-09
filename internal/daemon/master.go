@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -23,6 +24,7 @@ import (
 	pb "github.com/deziss/tasch/api/v1"
 	"github.com/deziss/tasch/internal/auth"
 	"github.com/deziss/tasch/internal/config"
+	"github.com/deziss/tasch/internal/ha"
 	"github.com/deziss/tasch/internal/logging"
 	"github.com/deziss/tasch/internal/store"
 	"github.com/deziss/tasch/pkg/discovery"
@@ -62,8 +64,14 @@ type schedulerServer struct {
 	// GPU resource tracking
 	gpuTracker *gpuTracker
 
+	// state applies scheduler mutations, either locally or through replication.
+	state ha.Store
+
+	// raftNode is non-nil only when HA is enabled, for leadership reporting.
+	raftNode *ha.Node
+
 	// Nodes an operator has taken out of scheduling rotation.
-	cordons *cordonRegistry
+	cordons *ha.Cordons
 
 	// Jobs a worker has claimed since this master started, used to decide which jobs left
 	// RUNNING by a restart were genuinely lost.
@@ -582,7 +590,11 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 		EnvVars: req.EnvVars, MaxRetries: s.cfg.MaxRetries,
 	}
 
-	if err := s.queue.Enqueue(job); err != nil {
+	if err := s.state.Enqueue(job); err != nil {
+		var notLeader ha.ErrNotLeader
+		if errors.As(err, &notLeader) {
+			return nil, leaderRedirect(s, err)
+		}
 		return nil, status.Errorf(codes.ResourceExhausted, "queue full: %v", err)
 	}
 
@@ -646,18 +658,22 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 			BasePriority: priority - penalty,
 			EnvVars:      envVars, MaxRetries: 0, // No retry for distributed
 		}
-		if err := s.queue.Enqueue(job); err != nil {
+		if err := s.state.Enqueue(job); err != nil {
 			return nil, status.Errorf(codes.ResourceExhausted, "queue full: %v", err)
 		}
 		jobIDs = append(jobIDs, jobID)
 		s.appendLog(jobID, "INFO", fmt.Sprintf("Distributed job rank %d/%d queued in group %s", rank, numNodes, groupID))
 	}
 
-	s.queue.RegisterGroup(&scheduler.JobGroup{
+	if err := s.state.RegisterGroup(&scheduler.JobGroup{
 		GroupID: groupID, JobIDs: jobIDs, NumNodes: numNodes,
 		GPUsPerNode: gpusPerNode, MasterPort: masterPort, State: "PENDING",
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		// The ranks are queued but their group is not. Without the group nothing co-schedules
+		// them, so report the failure rather than leaving orphaned ranks behind.
+		return nil, leaderRedirect(s, err)
+	}
 	jobsSubmittedTotal.WithLabelValues(user).Add(float64(numNodes))
 	slog.Info("distributed job queued",
 		"group_id", groupID, "nodes", numNodes, "gpus_per_node", gpusPerNode, "user", user)
@@ -668,7 +684,7 @@ func (s *schedulerServer) CancelJob(ctx context.Context, req *pb.CancelJobReques
 	if _, err := s.authorizeJob(ctx, req.JobId); err != nil {
 		return nil, err
 	}
-	job, ok := s.queue.Cancel(req.JobId)
+	job, ok := s.state.Cancel(req.JobId)
 	if !ok {
 		if job != nil {
 			return &pb.CancelJobResponse{JobId: req.JobId, Status: job.State, Message: fmt.Sprintf("Already %s", job.State)}, nil
@@ -924,7 +940,7 @@ func (s *schedulerServer) adoptReportedJobs(nodeName string, running []*pb.Runni
 			startTime = time.Unix(claim.GetStartTime(), 0)
 		}
 
-		if !s.queue.AdoptRunning(claim.JobId, nodeName, claim.Attempt, startTime) {
+		if !s.state.AdoptRunning(claim.JobId, nodeName, claim.Attempt, startTime) {
 			// The job is gone or already finished as far as the master is concerned. Tell the
 			// worker to stop, rather than leaving an orphan consuming the node indefinitely.
 			rejected++
@@ -993,7 +1009,7 @@ func reapUnclaimedJobs(srv *schedulerServer, orphaned []string) {
 			continue
 		}
 
-		srv.queue.MarkCompleted(jobID, false, "", "lost when the master restarted; no worker claimed it")
+		srv.state.Complete(jobID, false, "", "lost when the master restarted; no worker claimed it")
 		srv.gpuTracker.Release(jobID)
 		srv.appendLog(jobID, "ERROR", "No worker claimed this job after the master restarted")
 		reaped++
@@ -1001,6 +1017,38 @@ func reapUnclaimedJobs(srv *schedulerServer, orphaned []string) {
 	if reaped > 0 {
 		slog.Warn("failed jobs whose workers never reconnected", "count", reaped)
 	}
+}
+
+// ClusterStatus reports this master's role, so a client can find the one accepting writes.
+func (s *schedulerServer) ClusterStatus(ctx context.Context, req *pb.ClusterStatusRequest) (*pb.ClusterStatusResponse, error) {
+	resp := &pb.ClusterStatusResponse{
+		IsLeader:  s.state.IsLeader(),
+		HaEnabled: s.raftNode != nil,
+		NodeId:    s.cfg.NodeName,
+	}
+	if s.raftNode == nil {
+		// A single master is always the leader; there is nobody to defer to.
+		resp.LeaderId = s.cfg.NodeName
+		return resp, nil
+	}
+
+	resp.NodeId = s.cfg.HA.NodeID
+	resp.LeaderId = s.raftNode.LeaderID()
+	resp.LeaderAddress = s.raftNode.LeaderAddress()
+
+	peers, err := s.raftNode.Peers()
+	if err != nil {
+		return resp, nil
+	}
+	for _, peer := range peers {
+		resp.Members = append(resp.Members, &pb.ClusterMember{
+			NodeId:   string(peer.ID),
+			Address:  string(peer.Address),
+			Leader:   string(peer.ID) == resp.LeaderId,
+			Suffrage: peer.Suffrage.String(),
+		})
+	}
+	return resp, nil
 }
 
 // CordonNode takes a node out of scheduling rotation, or returns it to service.
@@ -1017,7 +1065,12 @@ func (s *schedulerServer) CordonNode(ctx context.Context, req *pb.CordonNodeRequ
 	}
 
 	if !req.Cordon {
-		was := s.cordons.Uncordon(req.NodeName)
+		was, err := s.state.Uncordon(req.NodeName)
+		if err != nil {
+			return nil, leaderRedirect(s, err)
+		}
+		// The replicated log is the durable record under HA, but a single master still needs
+		// its own copy on disk, or a cordon would not survive a restart.
 		s.persistCordons()
 		msg := "node returned to service"
 		if !was {
@@ -1031,14 +1084,16 @@ func (s *schedulerServer) CordonNode(ctx context.Context, req *pb.CordonNodeRequ
 	if reason == "" {
 		reason = "cordoned by operator"
 	}
-	s.cordons.Cordon(req.NodeName, reason)
+	if err := s.state.Cordon(req.NodeName, reason, time.Now()); err != nil {
+		return nil, leaderRedirect(s, err)
+	}
 	s.persistCordons()
 	slog.Warn("node cordoned", "node", req.NodeName, "reason", reason, "drain", req.Drain)
 
 	var cancelled int32
 	if req.Drain {
 		for _, job := range s.queue.RunningJobsOnNode(req.NodeName) {
-			if _, ok := s.queue.Cancel(job.ID); ok {
+			if _, ok := s.state.Cancel(job.ID); ok {
 				cancelled++
 				s.gpuTracker.Release(job.ID)
 				if err := s.bus.Send(req.NodeName, &pb.DispatchMessage{
@@ -1063,6 +1118,8 @@ func (s *schedulerServer) CordonNode(ctx context.Context, req *pb.CordonNodeRequ
 }
 
 // persistCordons writes the cordon set so it survives a restart.
+//
+// With HA on the replicated log is already durable, but a single master still needs this.
 func (s *schedulerServer) persistCordons() {
 	if s.store == nil {
 		return
@@ -1078,6 +1135,19 @@ func (s *schedulerServer) persistCordons() {
 	if err := s.store.SaveCordons(encoded); err != nil {
 		slog.Error("could not persist cordons", "error", err)
 	}
+}
+
+// leaderRedirect turns a replication failure into a gRPC error a client can act on.
+//
+// A write that reaches a follower must not be quietly dropped: the client is told which master
+// to retry against, so a failover looks like a brief retry rather than a lost submission.
+func leaderRedirect(s *schedulerServer, err error) error {
+	var notLeader ha.ErrNotLeader
+	if errors.As(err, &notLeader) {
+		return status.Errorf(codes.FailedPrecondition,
+			"this master is not the leader; retry against %s", notLeader.LeaderHint())
+	}
+	return status.Errorf(codes.Internal, "%v", err)
 }
 
 // AcknowledgeStart records that a worker has begun a job, disarming the dispatch-timeout
@@ -1172,7 +1242,7 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 	delete(s.dispatchPending, req.JobId)
 	s.dispatchPendingMu.Unlock()
 
-	s.queue.MarkCompleted(req.JobId, req.Success, req.Output, req.Error)
+	s.state.Complete(req.JobId, req.Success, req.Output, req.Error)
 
 	// Re-read so the state below reflects the completion just recorded.
 	if updated, stillThere := s.queue.GetJob(req.JobId); stillThere {
@@ -1213,7 +1283,7 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 		go func(jobID string) {
 			select {
 			case <-time.After(backoff):
-				_, err := s.queue.Requeue(jobID, true)
+				_, err := s.state.Requeue(jobID, true)
 				if err != nil {
 					logging.Job(jobID).Error("failed to requeue for retry", "error", err)
 				}
@@ -1266,7 +1336,7 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 			if jid == completedJobID {
 				continue
 			}
-			job, jOk := s.queue.Cancel(jid)
+			job, jOk := s.state.Cancel(jid)
 			if jOk && job != nil {
 				if job.WorkerNode != "" {
 					s.gpuTracker.Release(job.ID)
@@ -1280,7 +1350,9 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 				}
 			}
 		}
-		s.queue.SetGroupState(groupID, "FAILED")
+		if err := s.state.SetGroupState(groupID, "FAILED"); err != nil {
+			slog.Error("could not replicate group state change", "error", err)
+		}
 		return
 	}
 	allDone := true
@@ -1295,7 +1367,9 @@ func (s *schedulerServer) handleGroupCompletion(groupID, completedJobID string, 
 		}
 	}
 	if allDone {
-		s.queue.SetGroupState(groupID, "COMPLETED")
+		if err := s.state.SetGroupState(groupID, "COMPLETED"); err != nil {
+			slog.Error("could not replicate group state change", "error", err)
+		}
 		slog.Info("all gang ranks completed", "group_id", groupID)
 	}
 }
@@ -1341,6 +1415,12 @@ func schedulingTick(srv *schedulerServer) {
 	defer func() { schedulingTickDuration.Observe(time.Since(tickStart).Seconds()) }()
 
 	srv.lastTick.Store(time.Now().UnixNano())
+
+	// Followers must not schedule. Two masters dispatching from the same queue would each send
+	// the same job to a different node, and both would run it.
+	if !srv.state.IsLeader() {
+		return
+	}
 	updateSchedulerGauges(srv)
 	dispatchGangGroups(srv)
 
@@ -1390,10 +1470,12 @@ func dispatchGangGroups(srv *schedulerServer) {
 			slog.Warn("gang group timed out, failing all ranks",
 				"group_id", group.GroupID, "num_nodes", group.NumNodes, "timeout", gangTimeout)
 			for _, jid := range group.JobIDs {
-				srv.queue.Cancel(jid)
+				srv.state.Cancel(jid)
 				srv.appendLog(jid, "ERROR", fmt.Sprintf("Gang group timed out waiting for %d nodes", group.NumNodes))
 			}
-			srv.queue.SetGroupState(group.GroupID, "FAILED")
+			if err := srv.state.SetGroupState(group.GroupID, "FAILED"); err != nil {
+				slog.Error("could not replicate group state change", "error", err)
+			}
 			continue
 		}
 		tryDispatchGroup(srv, group)
@@ -1406,36 +1488,42 @@ func dispatchGangGroups(srv *schedulerServer) {
 // A gang rank at the head is not dispatchable here — it belongs to dispatchGangGroups — so
 // this reports false and lets backfill proceed rather than stalling the cycle.
 func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
-	var selectedNode string
-
-	// Match and pop atomically. Matching the head, then popping under a separate lock, let a
-	// concurrent submit or cancel change the head in between — so the job that got dispatched
-	// was not the job that had been checked against the node's resources and CEL requirement.
-	job := srv.queue.DequeueIf(func(topJob *scheduler.Job) bool {
-		selectedNode = ""
-		if topJob.GroupID != "" {
-			return false
-		}
-		for _, member := range members {
-			if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) || srv.cordons.IsCordoned(member.Name) {
-				continue
-			}
-			if !canDispatchResources(srv, member, topJob) {
-				continue
-			}
-			match, evalErr := srv.eval.Match(topJob.Requirement, string(member.Meta))
-			if evalErr == nil && match {
-				selectedNode = member.Name
-				return true
-			}
-		}
-		return false
-	})
-	if job == nil {
+	// Choose on the leader, then replicate the choice.
+	//
+	// Matching involves CEL evaluation against live cluster membership, none of which is
+	// deterministic across replicas or expressible in a log entry. Deciding "this job goes to
+	// that node" here and replicating it as a fact keeps every replica's state identical without
+	// any of that.
+	topJob := srv.queue.Peek()
+	if topJob == nil || topJob.GroupID != "" {
 		return false
 	}
 
-	dispatchJob(srv, job, selectedNode)
+	selectedNode := ""
+	for _, member := range members {
+		if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) || srv.cordons.IsCordoned(member.Name) {
+			continue
+		}
+		if !canDispatchResources(srv, member, topJob) {
+			continue
+		}
+		if match, evalErr := srv.eval.Match(topJob.Requirement, string(member.Meta)); evalErr == nil && match {
+			selectedNode = member.Name
+			break
+		}
+	}
+	if selectedNode == "" {
+		return false
+	}
+
+	// Dispatch removes the job and marks it running as one replicated step, so a concurrent
+	// submit or cancel cannot substitute a different job for the one just matched.
+	job, attempt, ok := srv.state.Dispatch(topJob.ID, selectedNode)
+	if !ok || job == nil {
+		return false
+	}
+
+	dispatchJob(srv, job, selectedNode, attempt)
 	return true
 }
 
@@ -1447,7 +1535,8 @@ func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
 		}
 		memberMeta := string(member.Meta)
 		memberName := member.Name
-		backfillJob := srv.queue.Backfill(func(j *scheduler.Job) bool {
+		// Pick a candidate read-only, then replicate the dispatch of that specific job.
+		candidate := srv.queue.FindQueued(func(j *scheduler.Job) bool {
 			if j.GroupID != "" {
 				return false
 			}
@@ -1457,12 +1546,18 @@ func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
 			match, err := srv.eval.Match(j.Requirement, memberMeta)
 			return err == nil && match
 		})
-		if backfillJob != nil {
-			logging.Job(backfillJob.ID).Info("backfilled", "node", memberName)
-			srv.appendLog(backfillJob.ID, "INFO", fmt.Sprintf("Backfilled onto %s", memberName))
-			dispatchJob(srv, backfillJob, memberName)
-			return
+		if candidate == nil {
+			continue
 		}
+
+		job, attempt, ok := srv.state.Dispatch(candidate.ID, memberName)
+		if !ok || job == nil {
+			continue
+		}
+		logging.Job(job.ID).Info("backfilled", "node", memberName)
+		srv.appendLog(job.ID, "INFO", fmt.Sprintf("Backfilled onto %s", memberName))
+		dispatchJob(srv, job, memberName, attempt)
+		return
 	}
 }
 
@@ -1557,11 +1652,19 @@ func tryDispatchGroup(srv *schedulerServer, group *scheduler.JobGroup) {
 
 	for i, job := range queuedJobs {
 		job.EnvVars["MASTER_ADDR"] = rank0Addr
-		srv.queue.RemoveByID(job.ID)
-		dispatchJob(srv, job, matchedMembers[i].Name)
+		dispatched, attempt, ok := srv.state.Dispatch(job.ID, matchedMembers[i].Name)
+		if !ok || dispatched == nil {
+			logging.Job(job.ID).Warn("gang rank could not be dispatched", "node", matchedMembers[i].Name)
+			continue
+		}
+		// The replicated copy has no MASTER_ADDR, which is decided here at dispatch time.
+		dispatched.EnvVars = job.EnvVars
+		dispatchJob(srv, dispatched, matchedMembers[i].Name, attempt)
 		srv.appendLog(job.ID, "INFO", fmt.Sprintf("Gang-scheduled: rank %d → %s (master=%s)", i, matchedMembers[i].Name, rank0Addr))
 	}
-	srv.queue.SetGroupState(group.GroupID, "RUNNING")
+	if err := srv.state.SetGroupState(group.GroupID, "RUNNING"); err != nil {
+		slog.Error("could not replicate group state change", "error", err)
+	}
 }
 
 // maintenanceLoop periodically reconciles resource accounting and releases memory that would
@@ -1578,6 +1681,10 @@ func maintenanceLoop(ctx context.Context, srv *schedulerServer) {
 	for {
 		select {
 		case <-ticker.C:
+			// Maintenance mutates replicated state, so only the leader performs it.
+			if !srv.state.IsLeader() {
+				continue
+			}
 			running := srv.queue.RunningJobs()
 			dropped, rebooked := srv.gpuTracker.Reconcile(running, func(node string) int {
 				_, total := nodeGPUInfo(srv, node)
@@ -1589,7 +1696,7 @@ func maintenanceLoop(ctx context.Context, srv *schedulerServer) {
 				slog.Info("resource accounting corrected", "dropped", dropped, "rebooked", rebooked)
 			}
 
-			if pruned := srv.queue.PruneTerminal(terminalMaxAge); pruned > 0 {
+			if pruned, err := srv.state.PruneTerminal(terminalMaxAge); err == nil && pruned > 0 {
 				srv.pruneLogs()
 				slog.Info("released finished jobs from memory", "count", pruned)
 			}
@@ -1674,9 +1781,9 @@ func setGPUVisibility(envVars map[string]string, vendor string, devices []int) {
 	}
 }
 
-func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
+func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string, attempt int64) {
 	dispatchStart := time.Now()
-	attempt, runnable := srv.queue.MarkRunning(job.ID, nodeName)
+	runnable := attempt > 0
 	if !runnable {
 		// Cancelled between leaving the queue and being dispatched. Sending it now would run a
 		// job the user was already told was cancelled.
@@ -1701,7 +1808,7 @@ func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 		srv.dispatchPendingMu.Lock()
 		delete(srv.dispatchPending, job.ID)
 		srv.dispatchPendingMu.Unlock()
-		srv.queue.RequeueRunningJob(job.ID)
+		srv.state.RequeueRunning(job.ID)
 		return
 	}
 
@@ -1728,7 +1835,7 @@ func dispatchJob(srv *schedulerServer, job *scheduler.Job, nodeName string) {
 		srv.dispatchPendingMu.Lock()
 		delete(srv.dispatchPending, job.ID)
 		srv.dispatchPendingMu.Unlock()
-		srv.queue.RequeueRunningJob(job.ID)
+		srv.state.RequeueRunning(job.ID)
 		return
 	}
 
@@ -1754,7 +1861,7 @@ func walltimeEnforcer(ctx context.Context, srv *schedulerServer) {
 				if time.Now().After(job.StartTime.Add(time.Duration(job.WalltimeSeconds) * time.Second)) {
 					logging.Job(job.ID).Warn("walltime exceeded, killing", "walltime_seconds", job.WalltimeSeconds)
 					walltimeKillsTotal.Inc()
-					srv.queue.Cancel(job.ID)
+					srv.state.Cancel(job.ID)
 					if job.WorkerNode != "" {
 						srv.gpuTracker.Release(job.ID)
 					}
@@ -1798,7 +1905,7 @@ func dispatchTimeoutEnforcer(ctx context.Context, srv *schedulerServer) {
 				}
 				logging.Job(jobID).Warn("dispatch was never acknowledged, re-queueing")
 				srv.appendLog(jobID, "WARN", "Dispatch handshake timed out, re-queueing")
-				if _, requeued := srv.queue.RequeueRunningJob(jobID); requeued {
+				if _, requeued := srv.state.RequeueRunning(jobID); requeued {
 					if job.WorkerNode != "" {
 						srv.gpuTracker.Release(job.ID)
 					}
@@ -1999,11 +2106,11 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 
 	cb := newCircuitBreaker()
 
-	cordons := newCordonRegistry()
+	cordons := ha.NewCordons()
 	if saved, err := db.LoadCordons(); err == nil && len(saved) > 0 {
-		restored := make(map[string]cordonEntry, len(saved))
+		restored := make(map[string]ha.CordonEntry, len(saved))
 		for node, data := range saved {
-			var entry cordonEntry
+			var entry ha.CordonEntry
 			if err := json.Unmarshal(data, &entry); err != nil {
 				slog.Warn("could not read persisted cordon", "node", node, "error", err)
 				continue
@@ -2012,6 +2119,30 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		}
 		cordons.Restore(restored)
 		slog.Info("restored cordoned nodes", "count", len(restored))
+	}
+
+	// Either apply state changes locally, or replicate them across masters.
+	//
+	// With HA off this is exactly the previous single-master behaviour and costs nothing. With it
+	// on, every mutation goes through the replicated log so a surviving master can take over
+	// holding the same queue.
+	var stateStore ha.Store = ha.NewDirect(queue, fairshare, cordons)
+	var raftNode *ha.Node
+	if cfg.HA.Enabled {
+		fsm := ha.NewFSM(queue, fairshare, cordons)
+		raftNode, err = ha.Start(ha.Config{
+			NodeID:    cfg.HA.NodeID,
+			BindAddr:  cfg.HA.BindAddr,
+			DataDir:   cfg.HA.DataDir,
+			Peers:     cfg.HA.Peers,
+			Bootstrap: cfg.HA.Bootstrap,
+		}, fsm)
+		if err != nil {
+			cleanDB()
+			return nil, fmt.Errorf("high availability: %w", err)
+		}
+		stateStore = ha.NewReplicated(raftNode)
+		slog.Info("high availability enabled", "node_id", cfg.HA.NodeID, "peers", len(cfg.HA.Peers))
 	}
 
 	gt := newGPUTracker()
@@ -2072,7 +2203,8 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 
 	srv := &schedulerServer{
 		disc: disc, queue: queue, eval: eval, bus: bus, fairshare: fairshare,
-		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt, cordons: cordons,
+		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt,
+		cordons: cordons, state: stateStore, raftNode: raftNode,
 		dispatchPending: make(map[string]time.Time),
 		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
 		adopted: make(map[string]bool),
@@ -2096,15 +2228,25 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		for {
 			select {
 			case <-ticker.C:
-				fairshare.DecayUsage(scheduler.DecayFactorFor(fairshareInterval, halfLife))
+				if !srv.state.IsLeader() {
+					continue
+				}
+				if err := srv.state.DecayUsage(scheduler.DecayFactorFor(fairshareInterval, halfLife)); err != nil {
+					slog.Debug("fairshare decay not replicated", "error", err)
+					continue
+				}
 
 				// Recompute the penalty on jobs already waiting. It used to be frozen in at
 				// submission, so a user who filled the queue and only then became the heaviest
 				// consumer kept their whole backlog at its original priority — precisely the
 				// case fairshare exists to handle.
-				if changed := queue.ReprioritizeQueued(func(job *scheduler.Job) int {
-					return fairshare.CalculatePenalty(job.User)
-				}); changed > 0 {
+				// Resolve the penalties here so every replica applies identical numbers;
+				// recomputing them inside each replica would depend on apply-time state.
+				penalties := make(map[string]int)
+				for user := range fairshare.Snapshot() {
+					penalties[user] = fairshare.CalculatePenalty(user)
+				}
+				if changed, err := srv.state.Reprioritize(penalties); err == nil && changed > 0 {
 					slog.Debug("fairshare reprioritised queued jobs", "count", changed)
 				}
 
@@ -2210,6 +2352,28 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	}
 
 	go func() {
+		// Join the other masters' gossip so every master sees the same workers. Without this each
+		// master forms its own membership view, and a leader can only dispatch to the workers that
+		// happened to join it.
+		if len(cfg.Gossip.Join) > 0 {
+			go func() {
+				// Retry: peers may still be starting.
+				for attempt := 0; attempt < 10; attempt++ {
+					if err := disc.Join(cfg.Gossip.Join); err == nil {
+						return
+					} else if attempt == 9 {
+						slog.Warn("could not join the gossip cluster; this master may not see all workers",
+							"seeds", cfg.Gossip.Join, "error", err)
+					}
+					select {
+					case <-time.After(2 * time.Second):
+					case <-shutdownCtx.Done():
+						return
+					}
+				}
+			}()
+		}
+
 		slog.Info("master listening",
 			"grpc_port", cfg.Ports.GRPC, "tls", cfg.TLS.Enabled,
 			"gossip_port", cfg.Ports.Gossip, "metrics_port", cfg.Ports.Metrics)

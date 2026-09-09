@@ -38,6 +38,8 @@ const (
 	CmdDecayUsage     CommandType = "decay_usage"
 	CmdReprioritize   CommandType = "reprioritize"
 	CmdPruneTerminal  CommandType = "prune_terminal"
+	CmdEnqueueBatch   CommandType = "enqueue_batch"
+	CmdFailQueued     CommandType = "fail_queued"
 	CmdCordon         CommandType = "cordon"
 	CmdUncordon       CommandType = "uncordon"
 )
@@ -49,8 +51,10 @@ const (
 type Command struct {
 	Type CommandType `json:"type"`
 
-	// Job carries the whole record for an enqueue.
-	Job *scheduler.Job `json:"job,omitempty"`
+	// Job carries the whole record for an enqueue. Jobs carries a whole array, which is
+	// submitted as one entry so a replica can never hold a partial array.
+	Job  *scheduler.Job   `json:"job,omitempty"`
+	Jobs []*scheduler.Job `json:"jobs,omitempty"`
 
 	JobID   string `json:"job_id,omitempty"`
 	Node    string `json:"node,omitempty"`

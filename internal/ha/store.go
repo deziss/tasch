@@ -18,6 +18,8 @@ import (
 // replicas at all.
 type Store interface {
 	Enqueue(job *scheduler.Job) error
+	EnqueueBatch(jobs []*scheduler.Job) error
+	FailQueued(jobID, reason string) (*scheduler.Job, bool)
 	Dispatch(jobID, node string) (*scheduler.Job, int64, bool)
 	Complete(jobID string, success bool, output, errMsg string)
 	Cancel(jobID string) (*scheduler.Job, bool)
@@ -52,6 +54,12 @@ func NewDirect(queue *scheduler.GlobalScheduler, fairshare *scheduler.FairshareC
 }
 
 func (d *Direct) Enqueue(job *scheduler.Job) error { return d.queue.Enqueue(job) }
+
+func (d *Direct) EnqueueBatch(jobs []*scheduler.Job) error { return d.queue.EnqueueBatch(jobs) }
+
+func (d *Direct) FailQueued(jobID, reason string) (*scheduler.Job, bool) {
+	return d.queue.FailQueued(jobID, reason)
+}
 
 func (d *Direct) Dispatch(jobID, node string) (*scheduler.Job, int64, bool) {
 	job := d.queue.RemoveByID(jobID)
@@ -132,6 +140,23 @@ func NewReplicated(node *Node) *Replicated { return &Replicated{node: node} }
 func (r *Replicated) Enqueue(job *scheduler.Job) error {
 	_, err := r.node.Apply(&Command{Type: CmdEnqueue, Job: job})
 	return err
+}
+
+func (r *Replicated) EnqueueBatch(jobs []*scheduler.Job) error {
+	_, err := r.node.Apply(&Command{Type: CmdEnqueueBatch, Jobs: jobs})
+	return err
+}
+
+func (r *Replicated) FailQueued(jobID, reason string) (*scheduler.Job, bool) {
+	res, err := r.node.Apply(&Command{Type: CmdFailQueued, JobID: jobID, Error: reason})
+	if err != nil {
+		return nil, false
+	}
+	result, ok := res.(DispatchResult)
+	if !ok {
+		return nil, false
+	}
+	return result.Job, result.OK
 }
 
 func (r *Replicated) Dispatch(jobID, node string) (*scheduler.Job, int64, bool) {

@@ -133,6 +133,16 @@ func (f *FSM) Apply(entry *raft.Log) interface{} {
 		}
 		return f.queue.Enqueue(cmd.Job)
 
+	case CmdEnqueueBatch:
+		if len(cmd.Jobs) == 0 {
+			return fmt.Errorf("enqueue_batch command carries no jobs")
+		}
+		return f.queue.EnqueueBatch(cmd.Jobs)
+
+	case CmdFailQueued:
+		job, ok := f.queue.FailQueued(cmd.JobID, cmd.Error)
+		return DispatchResult{Job: job, OK: ok}
+
 	case CmdDispatch:
 		// The leader already chose the node; applying it is deterministic.
 		job := f.queue.RemoveByID(cmd.JobID)

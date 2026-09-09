@@ -9,6 +9,13 @@ import (
 )
 
 // Job states
+// Dependency modes: which outcome of a dependency releases the job that waits on it.
+const (
+	DependAfterOK    = "afterok"    // the dependency must have succeeded
+	DependAfterAny   = "afterany"   // any terminal outcome will do
+	DependAfterNotOK = "afternotok" // the dependency must have failed or been cancelled
+)
+
 const (
 	StateQueued    = "QUEUED"
 	StateRunning   = "RUNNING"
@@ -39,6 +46,25 @@ type Job struct {
 
 	// Distributed job group
 	GroupID string `json:"group_id,omitempty"`
+
+	// DependsOn lists jobs that must reach a terminal state before this one may start, and
+	// DependencyMode says which outcome counts: "afterok" (the default) needs them to have
+	// succeeded, "afterany" accepts any outcome, "afternotok" needs them to have failed — which
+	// is how a cleanup or notification step is expressed.
+	//
+	// A dependency must already exist when the job is submitted. That rule is what makes cycles
+	// impossible: a job can only ever point backwards in submission order, so no chain can close
+	// on itself and nothing has to detect one.
+	DependsOn      []string `json:"depends_on,omitempty"`
+	DependencyMode string   `json:"dependency_mode,omitempty"`
+
+	// Array membership. An array job is submitted once and expands into one job per index, all
+	// sharing ArrayID. ArrayMaxConcurrent throttles how many of them run at a time — the point
+	// of an array over a loop of submissions is that the scheduler, not the user, decides how
+	// fast a thousand tasks are allowed to hit the cluster.
+	ArrayID            string `json:"array_id,omitempty"`
+	ArrayIndex         int    `json:"array_index,omitempty"`
+	ArrayMaxConcurrent int    `json:"array_max_concurrent,omitempty"`
 
 	// Runtime state
 	State      string    `json:"state"`
@@ -84,6 +110,10 @@ func (j *Job) Copy() *Job {
 		for k, v := range j.EnvVars {
 			copied.EnvVars[k] = v
 		}
+	}
+	if j.DependsOn != nil {
+		copied.DependsOn = make([]string, len(j.DependsOn))
+		copy(copied.DependsOn, j.DependsOn)
 	}
 	return &copied
 }
@@ -253,7 +283,14 @@ func (gs *GlobalScheduler) Backfill(matchFunc func(job *Job) bool) *Job {
 func (gs *GlobalScheduler) FindQueued(match func(job *Job) bool) *Job {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
+	arrayRunning := gs.arrayRunningLocked()
 	for _, job := range gs.queue {
+		// Eligibility is checked here rather than left to the caller's predicate because the
+		// caller cannot see it: dependencies and array throttles are properties of the queue as
+		// a whole, not of the job in isolation.
+		if eligible, _ := gs.eligibilityLocked(job, arrayRunning); eligible != EligibleNow {
+			continue
+		}
 		if match(job.Copy()) {
 			return job.Copy()
 		}

@@ -688,8 +688,17 @@ type SubmitJobRequest struct {
 	// oversubscribed. 0 falls back to that regex for backward compatibility.
 	CpusRequired     int32 `protobuf:"varint,8,opt,name=cpus_required,json=cpusRequired,proto3" json:"cpus_required,omitempty"`               // CPU cores to reserve (0 = infer from cel_requirement)
 	MemoryRequiredMb int32 `protobuf:"varint,9,opt,name=memory_required_mb,json=memoryRequiredMb,proto3" json:"memory_required_mb,omitempty"` // Memory to reserve in MB (0 = infer)
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Jobs that must finish before this one starts. Each must already exist, which is what makes
+	// a dependency cycle impossible to express rather than something to detect.
+	DependsOn []string `protobuf:"bytes,10,rep,name=depends_on,json=dependsOn,proto3" json:"depends_on,omitempty"`
+	// Which outcome releases the job: afterok (default), afterany, afternotok.
+	DependencyMode string `protobuf:"bytes,11,opt,name=dependency_mode,json=dependencyMode,proto3" json:"dependency_mode,omitempty"`
+	// Array specification: "1-100", "1-100%5" to cap concurrency at 5, or an explicit list like
+	// "1,4,7". Submitting once and letting the scheduler expand it is what lets it throttle the
+	// tasks; a shell loop of submissions cannot be throttled by anything but the shell.
+	Array         string `protobuf:"bytes,12,opt,name=array,proto3" json:"array,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SubmitJobRequest) Reset() {
@@ -785,10 +794,35 @@ func (x *SubmitJobRequest) GetMemoryRequiredMb() int32 {
 	return 0
 }
 
+func (x *SubmitJobRequest) GetDependsOn() []string {
+	if x != nil {
+		return x.DependsOn
+	}
+	return nil
+}
+
+func (x *SubmitJobRequest) GetDependencyMode() string {
+	if x != nil {
+		return x.DependencyMode
+	}
+	return ""
+}
+
+func (x *SubmitJobRequest) GetArray() string {
+	if x != nil {
+		return x.Array
+	}
+	return ""
+}
+
 type SubmitJobResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	JobId  string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Status string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	// For an array submission: every task's ID, and the array they share. job_id carries the
+	// first task, so a client that does not know about arrays still gets something usable.
+	JobIds        []string `protobuf:"bytes,3,rep,name=job_ids,json=jobIds,proto3" json:"job_ids,omitempty"`
+	ArrayId       string   `protobuf:"bytes,4,opt,name=array_id,json=arrayId,proto3" json:"array_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -833,6 +867,20 @@ func (x *SubmitJobResponse) GetJobId() string {
 func (x *SubmitJobResponse) GetStatus() string {
 	if x != nil {
 		return x.Status
+	}
+	return ""
+}
+
+func (x *SubmitJobResponse) GetJobIds() []string {
+	if x != nil {
+		return x.JobIds
+	}
+	return nil
+}
+
+func (x *SubmitJobResponse) GetArrayId() string {
+	if x != nil {
+		return x.ArrayId
 	}
 	return ""
 }
@@ -1154,17 +1202,23 @@ func (x *GetJobStatusRequest) GetJobId() string {
 }
 
 type GetJobStatusResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	State         string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"` // QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
-	WorkerNode    string                 `protobuf:"bytes,3,opt,name=worker_node,json=workerNode,proto3" json:"worker_node,omitempty"`
-	Command       string                 `protobuf:"bytes,4,opt,name=command,proto3" json:"command,omitempty"`
-	Output        string                 `protobuf:"bytes,5,opt,name=output,proto3" json:"output,omitempty"`
-	Error         string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
-	SubmitTime    int64                  `protobuf:"varint,7,opt,name=submit_time,json=submitTime,proto3" json:"submit_time,omitempty"`
-	StartTime     int64                  `protobuf:"varint,8,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
-	EndTime       int64                  `protobuf:"varint,9,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
-	GroupId       string                 `protobuf:"bytes,10,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // Empty if not part of a distributed job
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	JobId      string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	State      string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"` // QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
+	WorkerNode string                 `protobuf:"bytes,3,opt,name=worker_node,json=workerNode,proto3" json:"worker_node,omitempty"`
+	Command    string                 `protobuf:"bytes,4,opt,name=command,proto3" json:"command,omitempty"`
+	Output     string                 `protobuf:"bytes,5,opt,name=output,proto3" json:"output,omitempty"`
+	Error      string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	SubmitTime int64                  `protobuf:"varint,7,opt,name=submit_time,json=submitTime,proto3" json:"submit_time,omitempty"`
+	StartTime  int64                  `protobuf:"varint,8,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
+	EndTime    int64                  `protobuf:"varint,9,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	GroupId    string                 `protobuf:"bytes,10,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // Empty if not part of a distributed job
+	DependsOn  []string               `protobuf:"bytes,11,rep,name=depends_on,json=dependsOn,proto3" json:"depends_on,omitempty"`
+	ArrayId    string                 `protobuf:"bytes,12,opt,name=array_id,json=arrayId,proto3" json:"array_id,omitempty"`
+	ArrayIndex int32                  `protobuf:"varint,13,opt,name=array_index,json=arrayIndex,proto3" json:"array_index,omitempty"`
+	// Why a queued job is not running yet: an unmet dependency, or its array's concurrency cap.
+	// Empty when nothing is holding it back.
+	BlockedReason string `protobuf:"bytes,14,opt,name=blocked_reason,json=blockedReason,proto3" json:"blocked_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1265,6 +1319,34 @@ func (x *GetJobStatusResponse) GetEndTime() int64 {
 func (x *GetJobStatusResponse) GetGroupId() string {
 	if x != nil {
 		return x.GroupId
+	}
+	return ""
+}
+
+func (x *GetJobStatusResponse) GetDependsOn() []string {
+	if x != nil {
+		return x.DependsOn
+	}
+	return nil
+}
+
+func (x *GetJobStatusResponse) GetArrayId() string {
+	if x != nil {
+		return x.ArrayId
+	}
+	return ""
+}
+
+func (x *GetJobStatusResponse) GetArrayIndex() int32 {
+	if x != nil {
+		return x.ArrayIndex
+	}
+	return 0
+}
+
+func (x *GetJobStatusResponse) GetBlockedReason() string {
+	if x != nil {
+		return x.BlockedReason
 	}
 	return ""
 }
@@ -1981,7 +2063,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x12memory_required_mb\x18\b \x01(\x05R\x10memoryRequiredMb\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa2\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x80\x04\n" +
 	"\x10SubmitJobRequest\x12'\n" +
 	"\x0fcel_requirement\x18\x01 \x01(\tR\x0ecelRequirement\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x1a\n" +
@@ -1991,13 +2073,20 @@ const file_scheduler_proto_rawDesc = "" +
 	"\rgpus_required\x18\x06 \x01(\x05R\fgpusRequired\x12<\n" +
 	"\benv_vars\x18\a \x03(\v2!.v1.SubmitJobRequest.EnvVarsEntryR\aenvVars\x12#\n" +
 	"\rcpus_required\x18\b \x01(\x05R\fcpusRequired\x12,\n" +
-	"\x12memory_required_mb\x18\t \x01(\x05R\x10memoryRequiredMb\x1a:\n" +
+	"\x12memory_required_mb\x18\t \x01(\x05R\x10memoryRequiredMb\x12\x1d\n" +
+	"\n" +
+	"depends_on\x18\n" +
+	" \x03(\tR\tdependsOn\x12'\n" +
+	"\x0fdependency_mode\x18\v \x01(\tR\x0edependencyMode\x12\x14\n" +
+	"\x05array\x18\f \x01(\tR\x05array\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"B\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"v\n" +
 	"\x11SubmitJobResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\"\xa2\x03\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x17\n" +
+	"\ajob_ids\x18\x03 \x03(\tR\x06jobIds\x12\x19\n" +
+	"\barray_id\x18\x04 \x01(\tR\aarrayId\"\xa2\x03\n" +
 	"\x1bSubmitDistributedJobRequest\x12'\n" +
 	"\x0fcel_requirement\x18\x01 \x01(\tR\x0ecelRequirement\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x1b\n" +
@@ -2023,7 +2112,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\",\n" +
 	"\x13GetJobStatusRequest\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xa2\x02\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xa4\x03\n" +
 	"\x14GetJobStatusResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x1f\n" +
@@ -2038,7 +2127,13 @@ const file_scheduler_proto_rawDesc = "" +
 	"start_time\x18\b \x01(\x03R\tstartTime\x12\x19\n" +
 	"\bend_time\x18\t \x01(\x03R\aendTime\x12\x19\n" +
 	"\bgroup_id\x18\n" +
-	" \x01(\tR\agroupId\")\n" +
+	" \x01(\tR\agroupId\x12\x1d\n" +
+	"\n" +
+	"depends_on\x18\v \x03(\tR\tdependsOn\x12\x19\n" +
+	"\barray_id\x18\f \x01(\tR\aarrayId\x12\x1f\n" +
+	"\varray_index\x18\r \x01(\x05R\n" +
+	"arrayIndex\x12%\n" +
+	"\x0eblocked_reason\x18\x0e \x01(\tR\rblockedReason\")\n" +
 	"\x10LogStreamRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"q\n" +
 	"\n" +

@@ -581,15 +581,38 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 	penalty := s.fairshare.CalculatePenalty(user)
 	effectivePriority := priority + penalty
 
-	cpus, mem := resourceRequest(req.CelRequirement, int(req.CpusRequired), int(req.MemoryRequiredMb))
-	job := &scheduler.Job{
-		ID: jobID, Requirement: req.CelRequirement, Command: req.Command,
-		SubmitTime: time.Now(), Priority: effectivePriority, User: user,
-		WalltimeSeconds: int(req.WalltimeSeconds), GPUsRequired: int(req.GpusRequired),
-		CPUsRequired: cpus, MemoryRequiredMB: mem, BasePriority: priority,
-		EnvVars: req.EnvVars, MaxRetries: s.cfg.MaxRetries,
+	// Every dependency must already exist. Catching a typo here rather than leaving the job
+	// queued forever is the immediate benefit; the structural one is that a job can only ever
+	// depend on something submitted before it, so a cycle cannot be expressed and nothing has to
+	// go looking for one.
+	for _, depID := range req.DependsOn {
+		if !s.queue.KnownJob(depID) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"depends_on names job %s, which does not exist; a dependency must be submitted first", depID)
+		}
+	}
+	mode, err := normalizeDependencyMode(req.DependencyMode)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	cpus, mem := resourceRequest(req.CelRequirement, int(req.CpusRequired), int(req.MemoryRequiredMb))
+	newJob := func(id string) *scheduler.Job {
+		return &scheduler.Job{
+			ID: id, Requirement: req.CelRequirement, Command: req.Command,
+			SubmitTime: time.Now(), Priority: effectivePriority, User: user,
+			WalltimeSeconds: int(req.WalltimeSeconds), GPUsRequired: int(req.GpusRequired),
+			CPUsRequired: cpus, MemoryRequiredMB: mem, BasePriority: priority,
+			EnvVars: req.EnvVars, MaxRetries: s.cfg.MaxRetries,
+			DependsOn: req.DependsOn, DependencyMode: mode,
+		}
+	}
+
+	if req.Array != "" {
+		return s.submitArray(req, newJob, user, effectivePriority)
+	}
+
+	job := newJob(jobID)
 	if err := s.state.Enqueue(job); err != nil {
 		var notLeader ha.ErrNotLeader
 		if errors.As(err, &notLeader) {
@@ -600,8 +623,86 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 
 	jobsSubmittedTotal.WithLabelValues(user).Inc()
 	s.appendLog(jobID, "INFO", fmt.Sprintf("Job queued | Priority: %d | GPUs: %d | Retries: %d | Expr: '%s'", effectivePriority, req.GpusRequired, s.cfg.MaxRetries, req.CelRequirement))
+	if len(req.DependsOn) > 0 {
+		s.appendLog(jobID, "INFO", fmt.Sprintf("Waiting on %s (%s)", strings.Join(req.DependsOn, ", "), mode))
+	}
 	logging.Job(jobID).Info("queued", "user", user, "priority", effectivePriority, "gpus", req.GpusRequired)
-	return &pb.SubmitJobResponse{JobId: jobID, Status: "QUEUED"}, nil
+	return &pb.SubmitJobResponse{JobId: jobID, Status: "QUEUED", JobIds: []string{jobID}}, nil
+}
+
+// normalizeDependencyMode validates the requested mode and supplies the default.
+func normalizeDependencyMode(mode string) (string, error) {
+	switch mode {
+	case "":
+		return scheduler.DependAfterOK, nil
+	case scheduler.DependAfterOK, scheduler.DependAfterAny, scheduler.DependAfterNotOK:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("dependency_mode must be %q, %q or %q (got %q)",
+			scheduler.DependAfterOK, scheduler.DependAfterAny, scheduler.DependAfterNotOK, mode)
+	}
+}
+
+// submitArray expands an array specification into one job per index and enqueues them together.
+//
+// The enqueue is one operation on purpose. Half an array is worse than none: the user cannot
+// ask for "the rest" without first working out which rest, while the tasks that did land are
+// already occupying the cluster.
+func (s *schedulerServer) submitArray(req *pb.SubmitJobRequest, newJob func(string) *scheduler.Job,
+	user string, effectivePriority int) (*pb.SubmitJobResponse, error) {
+
+	spec, err := parseArraySpec(req.Array)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid array: %v", err)
+	}
+
+	arrayID := newJobID()
+	jobs := make([]*scheduler.Job, 0, len(spec.Indices))
+	ids := make([]string, 0, len(spec.Indices))
+	for _, index := range spec.Indices {
+		job := newJob(newJobID())
+		job.ArrayID = arrayID
+		job.ArrayIndex = index
+		job.ArrayMaxConcurrent = spec.MaxConcurrent
+		// Each task needs its own environment map: they share a template, but the index is what
+		// distinguishes them, and a shared map would give every task the last one written.
+		job.EnvVars = arrayTaskEnv(req.EnvVars, arrayID, index, len(spec.Indices))
+		jobs = append(jobs, job)
+		ids = append(ids, job.ID)
+	}
+
+	if err := s.state.EnqueueBatch(jobs); err != nil {
+		var notLeader ha.ErrNotLeader
+		if errors.As(err, &notLeader) {
+			return nil, leaderRedirect(s, err)
+		}
+		return nil, status.Errorf(codes.ResourceExhausted, "cannot queue array: %v", err)
+	}
+
+	jobsSubmittedTotal.WithLabelValues(user).Add(float64(len(jobs)))
+	for _, job := range jobs {
+		s.appendLog(job.ID, "INFO", fmt.Sprintf("Array %s task %d queued | Priority: %d",
+			arrayID, job.ArrayIndex, effectivePriority))
+	}
+	slog.Info("array queued", "array_id", arrayID, "tasks", len(jobs),
+		"max_concurrent", spec.MaxConcurrent, "user", user)
+
+	return &pb.SubmitJobResponse{
+		JobId: ids[0], Status: "QUEUED", JobIds: ids, ArrayId: arrayID,
+	}, nil
+}
+
+// arrayTaskEnv builds one task's environment: the submitter's variables plus the index, which
+// is the only thing that distinguishes the tasks from one another.
+func arrayTaskEnv(base map[string]string, arrayID string, index, count int) map[string]string {
+	env := make(map[string]string, len(base)+3)
+	for k, v := range base {
+		env[k] = v
+	}
+	env["TASCH_ARRAY_ID"] = arrayID
+	env["TASCH_ARRAY_TASK_ID"] = strconv.Itoa(index)
+	env["TASCH_ARRAY_TASK_COUNT"] = strconv.Itoa(count)
+	return env
 }
 
 func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.SubmitDistributedJobRequest) (*pb.SubmitDistributedJobResponse, error) {
@@ -762,12 +863,20 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 		JobId: job.ID, State: job.State, WorkerNode: job.WorkerNode,
 		Command: job.Command, Output: job.Output, Error: job.Error,
 		SubmitTime: job.SubmitTime.Unix(), GroupId: job.GroupID,
+		DependsOn: job.DependsOn, ArrayId: job.ArrayID, ArrayIndex: int32(job.ArrayIndex),
 	}
 	if !job.StartTime.IsZero() {
 		resp.StartTime = job.StartTime.Unix()
 	}
 	if !job.EndTime.IsZero() {
 		resp.EndTime = job.EndTime.Unix()
+	}
+	// "QUEUED" on its own does not distinguish a job the cluster is too busy for from one that
+	// is waiting on something specific. Saying which turns a support question into an answer.
+	if job.State == scheduler.StateQueued {
+		if eligible, reason := s.queue.Eligibility(job.ID); eligible != scheduler.EligibleNow {
+			resp.BlockedReason = reason
+		}
 	}
 	return resp, nil
 }
@@ -1422,6 +1531,7 @@ func schedulingTick(srv *schedulerServer) {
 		return
 	}
 	updateSchedulerGauges(srv)
+	failDoomedDependents(srv)
 	dispatchGangGroups(srv)
 
 	members := srv.disc.Members()
@@ -1432,6 +1542,28 @@ func schedulingTick(srv *schedulerServer) {
 		return
 	}
 	backfillOntoIdleNodes(srv, members)
+}
+
+// failDoomedDependents fails queued jobs that can never become eligible.
+//
+// A job whose dependency failed under "afterok" is not waiting for anything: no future event
+// can release it. Left alone it sits QUEUED forever, holding a queue slot and telling its
+// submitter nothing. Failing it with the reason is the only outcome that is true.
+func failDoomedDependents(srv *schedulerServer) {
+	doomed := srv.queue.DoomedQueued()
+	if len(doomed) == 0 {
+		return
+	}
+	for jobID, reason := range doomed {
+		full := "dependency not satisfiable: " + reason
+		job, ok := srv.state.FailQueued(jobID, full)
+		if !ok || job == nil {
+			continue
+		}
+		srv.appendLog(jobID, "ERROR", full)
+		logging.Job(jobID).Warn("failed before starting", "reason", reason, "user", job.User)
+		jobsCompletedTotal.WithLabelValues(job.User, "FAILED").Inc()
+	}
 }
 
 func updateSchedulerGauges(srv *schedulerServer) {
@@ -1494,7 +1626,11 @@ func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
 	// deterministic across replicas or expressible in a log entry. Deciding "this job goes to
 	// that node" here and replicating it as a fact keeps every replica's state identical without
 	// any of that.
-	topJob := srv.queue.Peek()
+	// PeekRunnable, not Peek. A job at the head waiting on a dependency, or held back by its
+	// array's concurrency cap, can never be placed — offering it every tick would starve
+	// everything behind it, which is exactly how a gang rank at the head used to wedge the
+	// whole cluster.
+	topJob := srv.queue.PeekRunnable()
 	if topJob == nil || topJob.GroupID != "" {
 		return false
 	}

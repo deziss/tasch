@@ -58,6 +58,9 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	var submitCPUs int32
 	var submitMemoryMB int32
 	var submitEnvVars []string
+	var submitDependsOn []string
+	var submitDependencyMode string
+	var submitArray string
 
 	submitCmd := &cobra.Command{
 		Use:   "submit [cel_expression] [command]",
@@ -78,11 +81,25 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 				CpusRequired:     submitCPUs,
 				MemoryRequiredMb: submitMemoryMB,
 				EnvVars:          parseEnvFlags(submitEnvVars),
+				DependsOn:        submitDependsOn,
+				DependencyMode:   submitDependencyMode,
+				Array:            submitArray,
 			})
 			if err != nil {
 				log.Fatalf("Submit failed: %v", err)
 			}
+			if resp.ArrayId != "" {
+				fmt.Printf("Array submitted!\n  Array:    %s\n  Tasks:    %d\n  Status:   %s\n",
+					resp.ArrayId, len(resp.JobIds), resp.Status)
+				fmt.Printf("  First:    %s\n  Last:     %s\n",
+					resp.JobIds[0], resp.JobIds[len(resp.JobIds)-1])
+				fmt.Println("  Each task gets TASCH_ARRAY_TASK_ID in its environment.")
+				return
+			}
 			fmt.Printf("Job submitted!\n  ID:       %s\n  Status:   %s\n", resp.JobId, resp.Status)
+			if len(submitDependsOn) > 0 {
+				fmt.Printf("  After:    %s\n", strings.Join(submitDependsOn, ", "))
+			}
 			if submitGPUs > 0 {
 				fmt.Printf("  GPUs:     %d\n", submitGPUs)
 			}
@@ -98,6 +115,12 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	submitCmd.Flags().Int32Var(&submitCPUs, "cpus", 0, "CPU cores to reserve (0 = infer from the CEL requirement)")
 	submitCmd.Flags().Int32Var(&submitMemoryMB, "memory", 0, "Memory to reserve in MB (0 = infer from the CEL requirement)")
 	submitCmd.Flags().StringSliceVarP(&submitEnvVars, "env", "e", nil, "Environment variables (KEY=VALUE)")
+	submitCmd.Flags().StringSliceVar(&submitDependsOn, "depends-on", nil,
+		"Job IDs that must finish first; each must already exist")
+	submitCmd.Flags().StringVar(&submitDependencyMode, "dependency-mode", "",
+		"Which outcome releases the job: afterok (default), afterany, afternotok")
+	submitCmd.Flags().StringVar(&submitArray, "array", "",
+		"Submit as an array: \"1-100\", \"1-100%5\" to run 5 at a time, or \"1,4,7\"")
 
 	// --- train ---
 	var trainNodes int32
@@ -198,6 +221,15 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 			fmt.Printf("  Command: %s\n", resp.Command)
 			if resp.GroupId != "" {
 				fmt.Printf("  Group:   %s\n", resp.GroupId)
+			}
+			if resp.ArrayId != "" {
+				fmt.Printf("  Array:   %s (task %d)\n", resp.ArrayId, resp.ArrayIndex)
+			}
+			if len(resp.DependsOn) > 0 {
+				fmt.Printf("  After:   %s\n", strings.Join(resp.DependsOn, ", "))
+			}
+			if resp.BlockedReason != "" {
+				fmt.Printf("  Blocked: %s\n", resp.BlockedReason)
 			}
 			if resp.WorkerNode != "" {
 				fmt.Printf("  Worker:  %s\n", resp.WorkerNode)

@@ -154,11 +154,27 @@ message SubmitJobRequest {
   // oversubscribed. 0 falls back to that regex for backward compatibility.
   int32 cpus_required = 8;              // CPU cores to reserve (0 = infer from cel_requirement)
   int32 memory_required_mb = 9;         // Memory to reserve in MB (0 = infer)
+
+  // Jobs that must finish before this one starts. Each must already exist, which is what makes
+  // a dependency cycle impossible to express rather than something to detect.
+  repeated string depends_on = 10;
+  // Which outcome releases the job: afterok (default), afterany, afternotok.
+  string dependency_mode = 11;
+
+  // Array specification: "1-100", "1-100%5" to cap concurrency at 5, or an explicit list like
+  // "1,4,7". Submitting once and letting the scheduler expand it is what lets it throttle the
+  // tasks; a shell loop of submissions cannot be throttled by anything but the shell.
+  string array = 12;
 }
 
 message SubmitJobResponse {
   string job_id = 1;
   string status = 2;
+
+  // For an array submission: every task's ID, and the array they share. job_id carries the
+  // first task, so a client that does not know about arrays still gets something usable.
+  repeated string job_ids = 3;
+  string array_id = 4;
 }
 
 message SubmitDistributedJobRequest {
@@ -204,6 +220,13 @@ message GetJobStatusResponse {
   int64 start_time = 8;
   int64 end_time = 9;
   string group_id = 10;   // Empty if not part of a distributed job
+
+  repeated string depends_on = 11;
+  string array_id = 12;
+  int32 array_index = 13;
+  // Why a queued job is not running yet: an unmet dependency, or its array's concurrency cap.
+  // Empty when nothing is holding it back.
+  string blocked_reason = 14;
 }
 
 message LogStreamRequest {

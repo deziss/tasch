@@ -47,8 +47,22 @@ func TestFairshareSnapshotUnderConcurrentUsage(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if got := fc.Snapshot(); len(got) != 2 {
-		t.Fatalf("snapshot has %d users, want 2", len(got))
+	// Record once more with the writers stopped, so what is asserted below cannot depend on how
+	// the two loops interleaved. The earlier version checked the snapshot straight after the
+	// decay loop and assumed both users were still in it — but 200 rounds of 0.95 leaves usage
+	// at three hundred-thousandths of what it was, below the point at which decay prunes an
+	// entry, so whether they survived came down to how many writes had landed. It passed
+	// normally and failed under -cover, which slows the writers relative to the reader: a test
+	// that fails only when the build changes is worse than no test.
+	fc.RecordUsage("alice", 1, 1, 0, 0)
+	fc.RecordUsage("bob", 2, 1, 0, 0)
+
+	got := fc.Snapshot()
+	if len(got) != 2 {
+		t.Fatalf("snapshot has %d users, want alice and bob", len(got))
+	}
+	if _, err := json.Marshal(got); err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
 	}
 }
 

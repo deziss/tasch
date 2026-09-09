@@ -81,6 +81,11 @@ type schedulerServer struct {
 	// it admits everything, which is the behaviour that predates it.
 	policy *policy.Policy
 
+	// members reports the cluster's gossip membership. It is a field rather than a direct call
+	// to disc so the scheduling paths can be exercised against a known set of nodes; every
+	// caller goes through it, so there is no second path that skips the seam.
+	members func() []*memberlist.Node
+
 	// Jobs a worker has claimed since this master started, used to decide which jobs left
 	// RUNNING by a restart were genuinely lost.
 	adoptedMu sync.Mutex
@@ -408,6 +413,14 @@ func (gt *gpuTracker) AvailableMemory(node string, total int) int {
 // memory for the process lifetime.
 const maxLogEntriesPerJob = 500
 
+// clusterMembers reports the gossip membership, through the seam when one is installed.
+func (s *schedulerServer) clusterMembers() []*memberlist.Node {
+	if s.members != nil {
+		return s.members()
+	}
+	return s.disc.Members()
+}
+
 func (s *schedulerServer) appendLog(jobID, level, msg string) {
 	entry := &pb.LogMessage{
 		Timestamp: time.Now().UnixMilli(), Level: level, Message: msg, JobId: jobID,
@@ -434,7 +447,7 @@ func (s *schedulerServer) appendLog(jobID, level, msg string) {
 // --- gRPC Handlers ---
 
 func (s *schedulerServer) WorkerStatus(ctx context.Context, req *pb.WorkerStatusRequest) (*pb.WorkerStatusResponse, error) {
-	members := s.disc.Members()
+	members := s.clusterMembers()
 	nodes := make(map[string]string)
 	states := make(map[string]*pb.NodeSchedulingState)
 	usage := s.gpuTracker.UsageByNode()
@@ -465,7 +478,11 @@ var (
 
 // adoptionGracePeriod is how long a restarted master waits for workers to reconnect and claim
 // the jobs they are still running before declaring those jobs lost.
-const adoptionGracePeriod = 90 * time.Second
+//
+// It is a variable rather than a constant only so tests can shorten it: waiting the real ninety
+// seconds to assert what the reaper does made the suite slower than everything else in it
+// combined.
+var adoptionGracePeriod = 90 * time.Second
 
 // schedulerStallThreshold is how long the dispatch loop may go without a tick before /health
 // reports the master unhealthy. The loop ticks once a second.
@@ -755,6 +772,16 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 
 	if err := s.eval.Validate(req.CelRequirement); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid cel_requirement: %v", err)
+	}
+	// A group of zero ranks registers a gang that can never be satisfied and never fails: it
+	// occupies a slot in the pending-group list for the whole gang timeout and reports nothing.
+	if req.NumNodes < 1 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"num_nodes must be at least 1 (got %d)", req.NumNodes)
+	}
+	if req.GpusPerNode < 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"gpus_per_node cannot be negative (got %d)", req.GpusPerNode)
 	}
 
 	groupID := "dj-" + newJobID()
@@ -1083,7 +1110,11 @@ func (s *schedulerServer) StreamLogs(req *pb.LogStreamRequest, stream pb.Schedul
 func isUserError(errMsg string) bool {
 	return strings.HasPrefix(errMsg, "exit status") ||
 		errMsg == "cancelled" ||
-		strings.Contains(errMsg, "walltime exceeded")
+		strings.Contains(errMsg, "walltime exceeded") ||
+		// A job killed for exceeding the memory it reserved is the job's own doing. Counting it
+		// against the node let a user with memory-hungry work take a worker out of service:
+		// three such jobs in a row tripped the breaker on a machine that was working perfectly.
+		strings.Contains(errMsg, "out of memory: exceeded")
 }
 
 // isRetryable reports whether a failed job should be re-run.
@@ -1095,6 +1126,12 @@ func isRetryable(job *scheduler.Job, errMsg string) bool {
 		return false
 	}
 	if errMsg == "cancelled" || strings.Contains(errMsg, "walltime exceeded") {
+		return false
+	}
+	// A job killed for exceeding its own memory reservation will exceed it again: the
+	// reservation is unchanged, so retrying spends three attempts reaching the same outcome and
+	// occupies a node each time.
+	if strings.Contains(errMsg, "out of memory: exceeded") {
 		return false
 	}
 	return true
@@ -1658,7 +1695,7 @@ func schedulingTick(srv *schedulerServer) {
 	failDoomedDependents(srv)
 	dispatchGangGroups(srv)
 
-	members := srv.disc.Members()
+	members := srv.clusterMembers()
 
 	// Quota usage is counted once per tick, not once per candidate node. It depends only on
 	// what is running, which does not change while a single tick decides where one job goes.
@@ -1726,7 +1763,7 @@ func failDoomedDependents(srv *schedulerServer) {
 func updateSchedulerGauges(srv *schedulerServer) {
 	queueDepth.Set(float64(srv.queue.QueueLen()))
 	runningJobs.Set(float64(len(srv.queue.RunningJobs())))
-	clusterNodes.Set(float64(len(srv.disc.Members())))
+	clusterNodes.Set(float64(len(srv.clusterMembers())))
 	groupsPending.Set(float64(len(srv.queue.PendingGroups())))
 
 	// Per-state counts, so a backlog of failures is visible without querying the API.
@@ -1941,7 +1978,7 @@ func tryDispatchGroup(srv *schedulerServer, group *scheduler.JobGroup) {
 		return
 	}
 
-	members := srv.disc.Members()
+	members := srv.clusterMembers()
 	var matchedMembers []*memberlist.Node
 	usedNodes := make(map[string]bool)
 
@@ -2046,7 +2083,7 @@ func (s *schedulerServer) pruneLogs() {
 
 // nodeGPUInfo reads a node's advertised GPU vendor and physical GPU count from its ClassAd.
 func nodeGPUInfo(srv *schedulerServer, nodeName string) (vendor string, totalGPUs int) {
-	for _, member := range srv.disc.Members() {
+	for _, member := range srv.clusterMembers() {
 		if member.Name != nodeName || len(member.Meta) == 0 {
 			continue
 		}
@@ -2271,7 +2308,7 @@ func startHealthAndMetrics(srv *schedulerServer, cfg *config.Config) *http.Serve
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		members := srv.disc.Members()
+		members := srv.clusterMembers()
 		if len(members) == 0 {
 			w.WriteHeader(503)
 			_, _ = w.Write([]byte(`{"status":"not_ready","reason":"no cluster members"}`))

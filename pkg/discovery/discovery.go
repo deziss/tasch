@@ -155,8 +155,16 @@ func (d *NodeDiscovery) Join(existingNodes []string) error {
 	return nil
 }
 
-// Members returns a list of all currently known active nodes in the cluster
+// Members returns a list of all currently known active nodes in the cluster.
+//
+// It answers "no members" rather than panicking when discovery is not running. Every caller is
+// on a scheduling path, and for a scheduler an empty membership is the safe reading: it
+// dispatches nothing, where a nil dereference takes the master down. A master mid-startup, or
+// one whose gossip layer failed to come up, should decline to place work — not crash.
 func (d *NodeDiscovery) Members() []*memberlist.Node {
+	if d == nil || d.list == nil {
+		return nil
+	}
 	return d.list.Members()
 }
 

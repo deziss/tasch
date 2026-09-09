@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -90,8 +91,20 @@ func runSandboxed(t *testing.T, cfg *config.Config, command string, env map[stri
 	if err != nil {
 		t.Fatalf("prepareCommand: %v", err)
 	}
-	out, runErr := cmd.CombinedOutput()
-	return string(out), runErr
+
+	// stdout and stderr are captured separately, and only stdout is asserted on. The helper
+	// writes diagnostics to stderr, and under `go test -cover` the Go runtime adds its own —
+	// the instrumented binary cannot reach its coverage directory once it has pivoted into the
+	// sandbox. Reading combined output made those messages part of what the assertions parsed,
+	// so the tests failed for a reason that had nothing to do with isolation.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	if stderr.Len() > 0 {
+		t.Logf("sandbox stderr: %s", stderr.String())
+	}
+	return stdout.String(), runErr
 }
 
 func sandboxCfg(t *testing.T, mode string) *config.Config {
@@ -228,11 +241,14 @@ func TestStrictSandboxWorkdirIsWritableAndMapped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareCommand: %v", err)
 	}
-	out, runErr := cmd.CombinedOutput()
-	if runErr != nil {
-		t.Fatalf("job failed: %v (output %q)", runErr, out)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		t.Fatalf("job failed: %v (stdout %q, stderr %q)", runErr, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(string(out), sandboxWorkdir) {
+	out := stdout.String()
+	if !strings.Contains(out, sandboxWorkdir) {
 		t.Fatalf("job did not start in %s: %q", sandboxWorkdir, out)
 	}
 
@@ -361,11 +377,15 @@ func TestSandboxWorksWithCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareCommand: %v", err)
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("a job confined by both a cgroup and namespaces failed: %v (output %q)", err, out)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("a job confined by both a cgroup and namespaces failed: %v (stdout %q, stderr %q)",
+			err, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(string(out), "confined") {
+	out := stdout.String()
+	if !strings.Contains(out, "confined") {
 		t.Fatalf("job output %q", out)
 	}
 }

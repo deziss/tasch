@@ -696,7 +696,12 @@ type SubmitJobRequest struct {
 	// Array specification: "1-100", "1-100%5" to cap concurrency at 5, or an explicit list like
 	// "1,4,7". Submitting once and letting the scheduler expand it is what lets it throttle the
 	// tasks; a shell loop of submissions cannot be throttled by anything but the shell.
-	Array         string `protobuf:"bytes,12,opt,name=array,proto3" json:"array,omitempty"`
+	Array string `protobuf:"bytes,12,opt,name=array,proto3" json:"array,omitempty"`
+	// Which pool of nodes to run on, and which account to charge. Both are optional: with no
+	// partitions or accounts configured they are ignored, and with them configured a job that
+	// names neither takes the default partition and the submitter's first account.
+	Partition     string `protobuf:"bytes,13,opt,name=partition,proto3" json:"partition,omitempty"`
+	Account       string `protobuf:"bytes,14,opt,name=account,proto3" json:"account,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -811,6 +816,20 @@ func (x *SubmitJobRequest) GetDependencyMode() string {
 func (x *SubmitJobRequest) GetArray() string {
 	if x != nil {
 		return x.Array
+	}
+	return ""
+}
+
+func (x *SubmitJobRequest) GetPartition() string {
+	if x != nil {
+		return x.Partition
+	}
+	return ""
+}
+
+func (x *SubmitJobRequest) GetAccount() string {
+	if x != nil {
+		return x.Account
 	}
 	return ""
 }
@@ -1219,6 +1238,8 @@ type GetJobStatusResponse struct {
 	// Why a queued job is not running yet: an unmet dependency, or its array's concurrency cap.
 	// Empty when nothing is holding it back.
 	BlockedReason string `protobuf:"bytes,14,opt,name=blocked_reason,json=blockedReason,proto3" json:"blocked_reason,omitempty"`
+	Partition     string `protobuf:"bytes,15,opt,name=partition,proto3" json:"partition,omitempty"`
+	Account       string `protobuf:"bytes,16,opt,name=account,proto3" json:"account,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1347,6 +1368,20 @@ func (x *GetJobStatusResponse) GetArrayIndex() int32 {
 func (x *GetJobStatusResponse) GetBlockedReason() string {
 	if x != nil {
 		return x.BlockedReason
+	}
+	return ""
+}
+
+func (x *GetJobStatusResponse) GetPartition() string {
+	if x != nil {
+		return x.Partition
+	}
+	return ""
+}
+
+func (x *GetJobStatusResponse) GetAccount() string {
+	if x != nil {
+		return x.Account
 	}
 	return ""
 }
@@ -2063,7 +2098,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x12memory_required_mb\x18\b \x01(\x05R\x10memoryRequiredMb\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x80\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb8\x04\n" +
 	"\x10SubmitJobRequest\x12'\n" +
 	"\x0fcel_requirement\x18\x01 \x01(\tR\x0ecelRequirement\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x1a\n" +
@@ -2078,7 +2113,9 @@ const file_scheduler_proto_rawDesc = "" +
 	"depends_on\x18\n" +
 	" \x03(\tR\tdependsOn\x12'\n" +
 	"\x0fdependency_mode\x18\v \x01(\tR\x0edependencyMode\x12\x14\n" +
-	"\x05array\x18\f \x01(\tR\x05array\x1a:\n" +
+	"\x05array\x18\f \x01(\tR\x05array\x12\x1c\n" +
+	"\tpartition\x18\r \x01(\tR\tpartition\x12\x18\n" +
+	"\aaccount\x18\x0e \x01(\tR\aaccount\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"v\n" +
@@ -2112,7 +2149,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\",\n" +
 	"\x13GetJobStatusRequest\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xa4\x03\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xdc\x03\n" +
 	"\x14GetJobStatusResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x1f\n" +
@@ -2133,7 +2170,9 @@ const file_scheduler_proto_rawDesc = "" +
 	"\barray_id\x18\f \x01(\tR\aarrayId\x12\x1f\n" +
 	"\varray_index\x18\r \x01(\x05R\n" +
 	"arrayIndex\x12%\n" +
-	"\x0eblocked_reason\x18\x0e \x01(\tR\rblockedReason\")\n" +
+	"\x0eblocked_reason\x18\x0e \x01(\tR\rblockedReason\x12\x1c\n" +
+	"\tpartition\x18\x0f \x01(\tR\tpartition\x12\x18\n" +
+	"\aaccount\x18\x10 \x01(\tR\aaccount\")\n" +
 	"\x10LogStreamRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"q\n" +
 	"\n" +

@@ -47,6 +47,12 @@ type Job struct {
 	// Distributed job group
 	GroupID string `json:"group_id,omitempty"`
 
+	// Partition is the pool of nodes this job may run on, and Account is the group its usage is
+	// charged to. Both are resolved once at submit, not looked up at dispatch: the answer must
+	// not change under a job because someone edited the configuration while it queued.
+	Partition string `json:"partition,omitempty"`
+	Account   string `json:"account,omitempty"`
+
 	// DependsOn lists jobs that must reach a terminal state before this one may start, and
 	// DependencyMode says which outcome counts: "afterok" (the default) needs them to have
 	// succeeded, "afterany" accepts any outcome, "afternotok" needs them to have failed — which
@@ -887,4 +893,19 @@ func DecayFactorFor(interval, halfLife time.Duration) float64 {
 		return 1
 	}
 	return math.Pow(0.5, interval.Seconds()/halfLife.Seconds())
+}
+
+// QueuedJobs returns copies of every job currently waiting in the queue.
+//
+// Separate from ListJobs(StateQueued), which walks the whole job map: the queue slice holds
+// exactly the queued jobs, so admission checks that run on every submit do not pay for a scan
+// of everything the scheduler has ever seen.
+func (gs *GlobalScheduler) QueuedJobs() []*Job {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	out := make([]*Job, 0, gs.queue.Len())
+	for _, job := range gs.queue {
+		out = append(out, job.Copy())
+	}
+	return out
 }

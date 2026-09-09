@@ -56,6 +56,78 @@ type Config struct {
 
 	// Sandbox confines what a job can see and touch on the worker.
 	Sandbox SandboxConfig `yaml:"sandbox"`
+
+	// Partitions divide the cluster into named pools of nodes with their own limits and
+	// priority. Accounts group users so quotas can be applied to a team rather than a person.
+	// Both are empty by default, which is the previous behaviour: one undivided cluster with
+	// no per-group ceiling.
+	Partitions []PartitionConfig `yaml:"partitions"`
+	Accounts   []AccountConfig   `yaml:"accounts"`
+}
+
+// PartitionConfig is a named pool of nodes with its own admission rules.
+//
+// Without partitions every job competes for every node, so one team's long CPU batch can sit in
+// front of another team's GPU work purely because it was submitted first. A partition scopes a
+// job to the nodes it belongs on, and gives an operator somewhere to hang the limits that
+// differ between those pools — walltime ceilings above all, which are what stop a single job
+// occupying a scarce node indefinitely.
+type PartitionConfig struct {
+	Name string `yaml:"name"`
+
+	// NodeSelector is a CEL expression over the node's class ad, the same language job
+	// requirements use. Empty matches every node.
+	NodeSelector string `yaml:"node_selector"`
+
+	// Default marks the partition jobs land in when they name none. At most one may be default;
+	// with none, a job that names no partition is unrestricted, as it was before partitions
+	// existed.
+	Default bool `yaml:"default"`
+
+	// PriorityBoost is added to a job's priority on entry. Negative raises it, matching the
+	// queue's convention that lower sorts first — so an interactive partition uses a negative
+	// boost and a bulk one a positive.
+	PriorityBoost int `yaml:"priority_boost"`
+
+	// MaxRunningJobs caps concurrent jobs in this partition. 0 is unlimited.
+	MaxRunningJobs int `yaml:"max_running_jobs"`
+
+	// MaxWalltimeSeconds refuses jobs asking for longer, and DefaultWalltimeSeconds is applied
+	// to jobs that ask for nothing. A partition with a ceiling but no default still admits jobs
+	// that never end, which is usually not what the ceiling was for.
+	MaxWalltimeSeconds     int `yaml:"max_walltime_seconds"`
+	DefaultWalltimeSeconds int `yaml:"default_walltime_seconds"`
+
+	// AllowedUsers and AllowedAccounts restrict who may submit here. Empty means everyone.
+	AllowedUsers    []string `yaml:"allowed_users"`
+	AllowedAccounts []string `yaml:"allowed_accounts"`
+}
+
+// AccountConfig is a group of users that quotas apply to, optionally nested.
+//
+// Nesting is what makes a quota a budget rather than a per-user cap: a department can be given
+// 32 GPUs and split them between its teams without any team being able to exceed the
+// department's share, because a job counts against every account above it as well as its own.
+type AccountConfig struct {
+	Name string `yaml:"name"`
+
+	// Parent nests this account inside another. Empty makes it a root.
+	Parent string `yaml:"parent"`
+
+	// Users belonging to this account. A user in several accounts submits to the first listed
+	// unless the job names one of the others.
+	Users []string `yaml:"users"`
+
+	// Ceilings on what this account and everything under it may hold at once. 0 is unlimited.
+	MaxRunningJobs int `yaml:"max_running_jobs"`
+	MaxGPUs        int `yaml:"max_gpus"`
+	MaxCPUs        int `yaml:"max_cpus"`
+	MaxMemoryMB    int `yaml:"max_memory_mb"`
+
+	// MaxQueuedJobs bounds the backlog an account may build up. It is checked at submit, so a
+	// runaway script is refused at the door rather than after it has filled the queue for
+	// everyone.
+	MaxQueuedJobs int `yaml:"max_queued_jobs"`
 }
 
 // SandboxConfig controls job isolation on the worker.
@@ -464,6 +536,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
 	}
 
+	if err := c.validatePartitions(); err != nil {
+		return err
+	}
+	if err := c.validateAccounts(); err != nil {
+		return err
+	}
+
 	switch c.Sandbox.Mode {
 	case "", SandboxNone, SandboxPrivate, SandboxStrict:
 	default:
@@ -662,6 +741,87 @@ func (c *Config) ApplyEnvOverrides() error {
 	}
 	if v := os.Getenv("TASCH_AUTH_TOKEN"); v != "" {
 		c.ClientToken = v
+	}
+	return nil
+}
+
+// validatePartitions checks partition names, defaults and walltime bounds.
+func (c *Config) validatePartitions() error {
+	seen := make(map[string]bool, len(c.Partitions))
+	defaultName := ""
+	for i, p := range c.Partitions {
+		if p.Name == "" {
+			return fmt.Errorf("partitions[%d] has no name", i)
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("partition %q is defined twice", p.Name)
+		}
+		seen[p.Name] = true
+
+		if p.Default {
+			if defaultName != "" {
+				return fmt.Errorf("partitions %q and %q are both marked default; only one can be",
+					defaultName, p.Name)
+			}
+			defaultName = p.Name
+		}
+		if p.MaxRunningJobs < 0 {
+			return fmt.Errorf("partition %q: max_running_jobs cannot be negative", p.Name)
+		}
+		if p.MaxWalltimeSeconds < 0 || p.DefaultWalltimeSeconds < 0 {
+			return fmt.Errorf("partition %q: walltimes cannot be negative", p.Name)
+		}
+		if p.MaxWalltimeSeconds > 0 && p.DefaultWalltimeSeconds > p.MaxWalltimeSeconds {
+			return fmt.Errorf("partition %q: default_walltime_seconds (%d) exceeds its own "+
+				"max_walltime_seconds (%d), so every job that relies on the default is rejected",
+				p.Name, p.DefaultWalltimeSeconds, p.MaxWalltimeSeconds)
+		}
+	}
+	return nil
+}
+
+// validateAccounts checks that the account tree is a tree: unique names, existing parents, and
+// no cycles. A cycle would make a quota rollup loop forever on the first job submitted.
+func (c *Config) validateAccounts() error {
+	byName := make(map[string]AccountConfig, len(c.Accounts))
+	for i, a := range c.Accounts {
+		if a.Name == "" {
+			return fmt.Errorf("accounts[%d] has no name", i)
+		}
+		if _, dup := byName[a.Name]; dup {
+			return fmt.Errorf("account %q is defined twice", a.Name)
+		}
+		for _, limit := range []struct {
+			field string
+			value int
+		}{
+			{"max_running_jobs", a.MaxRunningJobs}, {"max_gpus", a.MaxGPUs},
+			{"max_cpus", a.MaxCPUs}, {"max_memory_mb", a.MaxMemoryMB},
+			{"max_queued_jobs", a.MaxQueuedJobs},
+		} {
+			if limit.value < 0 {
+				return fmt.Errorf("account %q: %s cannot be negative", a.Name, limit.field)
+			}
+		}
+		byName[a.Name] = a
+	}
+
+	for _, a := range c.Accounts {
+		if a.Parent == "" {
+			continue
+		}
+		if _, ok := byName[a.Parent]; !ok {
+			return fmt.Errorf("account %q names parent %q, which does not exist", a.Name, a.Parent)
+		}
+		// Walk to a root, refusing to take more steps than there are accounts.
+		seen := map[string]bool{a.Name: true}
+		for cur := a.Parent; cur != ""; {
+			if seen[cur] {
+				return fmt.Errorf("accounts form a cycle through %q; the hierarchy must be a tree", cur)
+			}
+			seen[cur] = true
+			cur = byName[cur].Parent
+		}
 	}
 	return nil
 }

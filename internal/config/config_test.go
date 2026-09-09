@@ -417,3 +417,116 @@ func TestSandboxReadOnlyPathsFallBackToSystemDirs(t *testing.T) {
 		t.Fatalf("configured paths should replace the defaults, got %v", got)
 	}
 }
+
+func TestPartitionValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		parts   []PartitionConfig
+		wantErr string
+	}{
+		{
+			name:  "a plain partition",
+			parts: []PartitionConfig{{Name: "gpu", NodeSelector: "ad.gpu_count > 0"}},
+		},
+		{
+			name:    "unnamed",
+			parts:   []PartitionConfig{{NodeSelector: "true"}},
+			wantErr: "has no name",
+		},
+		{
+			name:    "duplicate name",
+			parts:   []PartitionConfig{{Name: "gpu"}, {Name: "gpu"}},
+			wantErr: "defined twice",
+		},
+		{
+			name:    "two defaults leave it ambiguous which one an unnamed job lands in",
+			parts:   []PartitionConfig{{Name: "a", Default: true}, {Name: "b", Default: true}},
+			wantErr: "only one can be",
+		},
+		{
+			name: "a default above its own ceiling rejects every job that relies on it",
+			parts: []PartitionConfig{
+				{Name: "gpu", DefaultWalltimeSeconds: 7200, MaxWalltimeSeconds: 3600},
+			},
+			wantErr: "exceeds its own",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.NodeName = "n1"
+			cfg.Partitions = tc.parts
+
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestAccountValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		accounts []AccountConfig
+		wantErr  string
+	}{
+		{
+			name: "a two-level tree",
+			accounts: []AccountConfig{
+				{Name: "dept", MaxGPUs: 8},
+				{Name: "team", Parent: "dept"},
+			},
+		},
+		{
+			name:     "dangling parent",
+			accounts: []AccountConfig{{Name: "team", Parent: "ghost"}},
+			wantErr:  "which does not exist",
+		},
+		{
+			name:     "duplicate name",
+			accounts: []AccountConfig{{Name: "a"}, {Name: "a"}},
+			wantErr:  "defined twice",
+		},
+		{
+			// A cycle would make the quota rollup loop forever on the first job submitted.
+			name: "cycle",
+			accounts: []AccountConfig{
+				{Name: "a", Parent: "b"},
+				{Name: "b", Parent: "a"},
+			},
+			wantErr: "cycle",
+		},
+		{
+			name:     "negative quota",
+			accounts: []AccountConfig{{Name: "a", MaxGPUs: -1}},
+			wantErr:  "cannot be negative",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.NodeName = "n1"
+			cfg.Accounts = tc.accounts
+
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

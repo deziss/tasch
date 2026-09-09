@@ -165,6 +165,12 @@ message SubmitJobRequest {
   // "1,4,7". Submitting once and letting the scheduler expand it is what lets it throttle the
   // tasks; a shell loop of submissions cannot be throttled by anything but the shell.
   string array = 12;
+
+  // Which pool of nodes to run on, and which account to charge. Both are optional: with no
+  // partitions or accounts configured they are ignored, and with them configured a job that
+  // names neither takes the default partition and the submitter's first account.
+  string partition = 13;
+  string account = 14;
 }
 
 message SubmitJobResponse {
@@ -227,6 +233,8 @@ message GetJobStatusResponse {
   // Why a queued job is not running yet: an unmet dependency, or its array's concurrency cap.
   // Empty when nothing is holding it back.
   string blocked_reason = 14;
+  string partition = 15;
+  string account = 16;
 }
 
 message LogStreamRequest {

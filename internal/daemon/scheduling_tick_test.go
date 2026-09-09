@@ -5,14 +5,21 @@ import (
 	"time"
 
 	pb "github.com/deziss/tasch/api/v1"
+	"github.com/deziss/tasch/internal/config"
+	"github.com/deziss/tasch/internal/policy"
 	"github.com/deziss/tasch/pkg/scheduler"
 )
 
 // newTestServer builds the minimum schedulerServer the scheduling phases need. The phases
 // under test here never reach discovery, matchmaking, or dispatch, so those stay nil.
 func newTestServer() *schedulerServer {
+	pol, err := policy.New(config.DefaultConfig(), nil)
+	if err != nil {
+		panic(err)
+	}
 	return &schedulerServer{
 		queue:           scheduler.NewGlobalScheduler(),
+		policy:          pol,
 		cb:              newCircuitBreaker(),
 		gpuTracker:      newGPUTracker(),
 		dispatchPending: make(map[string]time.Time),
@@ -56,7 +63,7 @@ func TestDispatchTopJobYieldsToBackfillForGangRank(t *testing.T) {
 		t.Fatalf("test setup: head is %v, want rank-0", head)
 	}
 
-	if dispatchTopJob(srv, nil) {
+	if dispatchTopJob(srv, nil, newAdmission(srv)) {
 		t.Fatal("dispatchTopJob claimed it dispatched a gang rank")
 	}
 
@@ -73,7 +80,7 @@ func TestDispatchTopJobYieldsToBackfillForGangRank(t *testing.T) {
 // TestDispatchTopJobDeclinesEmptyQueue confirms an empty queue is a clean no-op.
 func TestDispatchTopJobDeclinesEmptyQueue(t *testing.T) {
 	srv := newTestServer()
-	if dispatchTopJob(srv, nil) {
+	if dispatchTopJob(srv, nil, newAdmission(srv)) {
 		t.Fatal("dispatchTopJob claimed a dispatch from an empty queue")
 	}
 }
@@ -86,7 +93,7 @@ func TestDispatchTopJobDeclinesWhenNoNodeMatches(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 
-	if dispatchTopJob(srv, nil) {
+	if dispatchTopJob(srv, nil, newAdmission(srv)) {
 		t.Fatal("dispatchTopJob claimed a dispatch with no cluster members")
 	}
 	if got := srv.queue.QueueLen(); got != 1 {

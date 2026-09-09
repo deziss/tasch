@@ -61,6 +61,8 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 	var submitDependsOn []string
 	var submitDependencyMode string
 	var submitArray string
+	var submitPartition string
+	var submitAccount string
 
 	submitCmd := &cobra.Command{
 		Use:   "submit [cel_expression] [command]",
@@ -84,6 +86,8 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 				DependsOn:        submitDependsOn,
 				DependencyMode:   submitDependencyMode,
 				Array:            submitArray,
+				Partition:        submitPartition,
+				Account:          submitAccount,
 			})
 			if err != nil {
 				log.Fatalf("Submit failed: %v", err)
@@ -119,6 +123,10 @@ func JobsCmd(cfgLoader func() *config.Config) *cobra.Command {
 		"Job IDs that must finish first; each must already exist")
 	submitCmd.Flags().StringVar(&submitDependencyMode, "dependency-mode", "",
 		"Which outcome releases the job: afterok (default), afterany, afternotok")
+	submitCmd.Flags().StringVar(&submitPartition, "partition", "",
+		"Partition to run in (default: the cluster's default partition)")
+	submitCmd.Flags().StringVar(&submitAccount, "account", "",
+		"Account to charge (default: your first account); must be one you belong to")
 	submitCmd.Flags().StringVar(&submitArray, "array", "",
 		"Submit as an array: \"1-100\", \"1-100%5\" to run 5 at a time, or \"1,4,7\"")
 
@@ -224,6 +232,12 @@ Auto-injected env vars: $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT, $LOCAL_R
 			}
 			if resp.ArrayId != "" {
 				fmt.Printf("  Array:   %s (task %d)\n", resp.ArrayId, resp.ArrayIndex)
+			}
+			if resp.Partition != "" {
+				fmt.Printf("  Part:    %s\n", resp.Partition)
+			}
+			if resp.Account != "" {
+				fmt.Printf("  Account: %s\n", resp.Account)
 			}
 			if len(resp.DependsOn) > 0 {
 				fmt.Printf("  After:   %s\n", strings.Join(resp.DependsOn, ", "))

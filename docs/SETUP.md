@@ -248,6 +248,85 @@ look for that line rather than assuming limits apply.
 GPUs are not covered: cgroup v2 has no GPU controller, so the injected `CUDA_VISIBLE_DEVICES`
 remains advisory and a job can unset it.
 
+## Partitions, Accounts and Quotas
+
+Without these, every job competes for every node and the only ordering is priority plus
+fairshare. That works for one team. It stops working the moment two teams share a cluster: one
+team's long CPU batch sits in front of the other's GPU work purely because it was submitted
+first, and nothing caps how much of the cluster any one group can hold.
+
+Both are off by default — no partitions and no accounts means the previous behaviour exactly.
+
+### Partitions
+
+A partition is a named pool of nodes with its own admission rules.
+
+```yaml
+partitions:
+  - name: gpu
+    node_selector: 'ad.gpu_count > 0'     # CEL, the same language job requirements use
+    max_walltime_seconds: 86400
+    default_walltime_seconds: 3600
+    priority_boost: -5                    # negative sorts earlier
+    allowed_accounts: [research]
+  - name: cpu
+    node_selector: 'ad.gpu_count == 0'
+    default: true
+    max_running_jobs: 200
+```
+
+Submit with `--partition gpu`, or leave it out to land in whichever partition is marked
+`default`. A job that names a partition only ever runs on nodes matching its selector, checked
+before the resource arithmetic — so a job never lands somewhere an operator excluded merely
+because that node happened to have room.
+
+`max_walltime_seconds` is the setting that earns a partition its keep: it is what stops one job
+holding a scarce node indefinitely. A partition with a ceiling and no default gets the ceiling
+as its default, because a ceiling that still admits jobs which never end is rarely what the
+ceiling was for.
+
+Node selectors are compiled when the master starts. An invalid one fails the start rather than
+silently matching no node on every scheduling cycle forever.
+
+### Accounts and quotas
+
+An account is a group of users that quotas apply to, and accounts nest.
+
+```yaml
+accounts:
+  - name: research
+    max_gpus: 32
+    max_running_jobs: 100
+  - name: ml-team
+    parent: research
+    users: [alice, bob]
+    max_gpus: 24
+    max_queued_jobs: 500
+  - name: vision-team
+    parent: research
+    users: [carol]
+    max_gpus: 24
+```
+
+Nesting is what makes a quota a budget rather than a per-user cap. A job counts against its own
+account *and* every account above it, so the two teams above can each be given 24 GPUs while
+the department as a whole can never exceed 32. Whichever ceiling binds first is the one
+reported, by name.
+
+A job is charged to the submitter's first account, or to `--account NAME` — which must be one
+they belong to. Without that check quotas would be advisory: anyone out of budget could simply
+name a fuller account.
+
+`max_queued_jobs` is checked at submit rather than at dispatch, so a runaway script is refused
+at the door instead of after it has filled the queue for everyone else.
+
+`tasch jobs status` says which limit is holding a job:
+
+```
+State:   QUEUED
+Blocked: account research would exceed its quota of 32 GPUs (30 in use, 4 needed)
+```
+
 ## Job Isolation
 
 Resource limits say how *much* a job may use. They say nothing about what it can *see*: with no

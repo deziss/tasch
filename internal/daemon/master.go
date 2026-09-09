@@ -26,6 +26,7 @@ import (
 	"github.com/deziss/tasch/internal/config"
 	"github.com/deziss/tasch/internal/ha"
 	"github.com/deziss/tasch/internal/logging"
+	"github.com/deziss/tasch/internal/policy"
 	"github.com/deziss/tasch/internal/store"
 	"github.com/deziss/tasch/pkg/discovery"
 	"github.com/deziss/tasch/pkg/matchmaker"
@@ -72,6 +73,10 @@ type schedulerServer struct {
 
 	// Nodes an operator has taken out of scheduling rotation.
 	cordons *ha.Cordons
+
+	// policy resolves partitions and account quotas. It is never nil; with neither configured
+	// it admits everything, which is the behaviour that predates it.
+	policy *policy.Policy
 
 	// Jobs a worker has claimed since this master started, used to decide which jobs left
 	// RUNNING by a restart were genuinely lost.
@@ -581,6 +586,30 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 	penalty := s.fairshare.CalculatePenalty(user)
 	effectivePriority := priority + penalty
 
+	// Resolve which pool this job belongs to and which account pays for it, before anything
+	// else looks at the job. Both are settled once, at submit: a job must not change partition
+	// or account while it waits because someone edited the configuration underneath it.
+	account, err := s.policy.ResolveAccount(user, req.Account)
+	if err != nil {
+		return nil, policyError(err)
+	}
+	partition, err := s.policy.ResolvePartition(req.Partition, user, account)
+	if err != nil {
+		return nil, policyError(err)
+	}
+	walltime, effectivePriority, err := policy.ApplyPartitionDefaults(
+		partition, int(req.WalltimeSeconds), effectivePriority)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := s.policy.AdmitQueued(account, s.policy.AccountUsage(s.queue.QueuedJobs())); err != nil {
+		return nil, status.Error(codes.ResourceExhausted, err.Error())
+	}
+	partitionName := ""
+	if partition != nil {
+		partitionName = partition.Name
+	}
+
 	// Every dependency must already exist. Catching a typo here rather than leaving the job
 	// queued forever is the immediate benefit; the structural one is that a job can only ever
 	// depend on something submitted before it, so a cycle cannot be expressed and nothing has to
@@ -601,10 +630,11 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 		return &scheduler.Job{
 			ID: id, Requirement: req.CelRequirement, Command: req.Command,
 			SubmitTime: time.Now(), Priority: effectivePriority, User: user,
-			WalltimeSeconds: int(req.WalltimeSeconds), GPUsRequired: int(req.GpusRequired),
+			WalltimeSeconds: walltime, GPUsRequired: int(req.GpusRequired),
 			CPUsRequired: cpus, MemoryRequiredMB: mem, BasePriority: priority,
 			EnvVars: req.EnvVars, MaxRetries: s.cfg.MaxRetries,
 			DependsOn: req.DependsOn, DependencyMode: mode,
+			Partition: partitionName, Account: account,
 		}
 	}
 
@@ -628,6 +658,16 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 	}
 	logging.Job(jobID).Info("queued", "user", user, "priority", effectivePriority, "gpus", req.GpusRequired)
 	return &pb.SubmitJobResponse{JobId: jobID, Status: "QUEUED", JobIds: []string{jobID}}, nil
+}
+
+// policyError maps a policy refusal onto the right gRPC code: naming something that does not
+// exist is a malformed request, while naming something you may not use is not.
+func policyError(err error) error {
+	var access policy.AccessDenied
+	if errors.As(err, &access) {
+		return status.Error(codes.PermissionDenied, err.Error())
+	}
+	return status.Error(codes.InvalidArgument, err.Error())
 }
 
 // normalizeDependencyMode validates the requested mode and supplies the default.
@@ -864,6 +904,7 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 		Command: job.Command, Output: job.Output, Error: job.Error,
 		SubmitTime: job.SubmitTime.Unix(), GroupId: job.GroupID,
 		DependsOn: job.DependsOn, ArrayId: job.ArrayID, ArrayIndex: int32(job.ArrayIndex),
+		Partition: job.Partition, Account: job.Account,
 	}
 	if !job.StartTime.IsZero() {
 		resp.StartTime = job.StartTime.Unix()
@@ -875,6 +916,10 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 	// is waiting on something specific. Saying which turns a support question into an answer.
 	if job.State == scheduler.StateQueued {
 		if eligible, reason := s.queue.Eligibility(job.ID); eligible != scheduler.EligibleNow {
+			resp.BlockedReason = reason
+		} else if ok, reason := s.policy.AdmitDispatch(job,
+			s.policy.AccountUsage(s.queue.RunningJobs()),
+			policy.PartitionUsage(s.queue.RunningJobs())); !ok {
 			resp.BlockedReason = reason
 		}
 	}
@@ -1536,12 +1581,30 @@ func schedulingTick(srv *schedulerServer) {
 
 	members := srv.disc.Members()
 
+	// Quota usage is counted once per tick, not once per candidate node. It depends only on
+	// what is running, which does not change while a single tick decides where one job goes.
+	adm := newAdmission(srv)
+
 	// One dispatch per tick: if the top job went out, leave backfill for the next cycle so a
 	// full queue cannot starve the head.
-	if dispatchTopJob(srv, members) {
+	if dispatchTopJob(srv, members, adm) {
 		return
 	}
-	backfillOntoIdleNodes(srv, members)
+	backfillOntoIdleNodes(srv, members, adm)
+}
+
+// admission is the quota state one scheduling tick decides against.
+type admission struct {
+	accounts   map[string]policy.Usage
+	partitions map[string]int
+}
+
+func newAdmission(srv *schedulerServer) *admission {
+	running := srv.queue.RunningJobs()
+	return &admission{
+		accounts:   srv.policy.AccountUsage(running),
+		partitions: policy.PartitionUsage(running),
+	}
 }
 
 // failDoomedDependents fails queued jobs that can never become eligible.
@@ -1619,7 +1682,7 @@ func dispatchGangGroups(srv *schedulerServer) {
 //
 // A gang rank at the head is not dispatchable here — it belongs to dispatchGangGroups — so
 // this reports false and lets backfill proceed rather than stalling the cycle.
-func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
+func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node, adm *admission) bool {
 	// Choose on the leader, then replicate the choice.
 	//
 	// Matching involves CEL evaluation against live cluster membership, none of which is
@@ -1632,6 +1695,15 @@ func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
 	// whole cluster.
 	topJob := srv.queue.PeekRunnable()
 	if topJob == nil || topJob.GroupID != "" {
+		return false
+	}
+
+	// Quota is a property of the job and its account, not of any node, so it is settled before
+	// the node search rather than inside it. Returning false lets backfill look past this job
+	// at one whose account still has room; without that, a single over-quota job at the head
+	// would idle the whole cluster.
+	if ok, reason := srv.policy.AdmitDispatch(topJob, adm.accounts, adm.partitions); !ok {
+		logging.Job(topJob.ID).Debug("held at the head of the queue", "reason", reason)
 		return false
 	}
 
@@ -1664,7 +1736,7 @@ func dispatchTopJob(srv *schedulerServer, members []*memberlist.Node) bool {
 }
 
 // backfillOntoIdleNodes places a lower-priority job on the first node that can take one.
-func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
+func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node, adm *admission) {
 	for _, member := range members {
 		if len(member.Meta) == 0 || srv.cb.IsBlocked(member.Name) || srv.cordons.IsCordoned(member.Name) {
 			continue
@@ -1674,6 +1746,9 @@ func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
 		// Pick a candidate read-only, then replicate the dispatch of that specific job.
 		candidate := srv.queue.FindQueued(func(j *scheduler.Job) bool {
 			if j.GroupID != "" {
+				return false
+			}
+			if ok, _ := srv.policy.AdmitDispatch(j, adm.accounts, adm.partitions); !ok {
 				return false
 			}
 			if !canDispatchResources(srv, member, j) {
@@ -1699,6 +1774,13 @@ func backfillOntoIdleNodes(srv *schedulerServer, members []*memberlist.Node) {
 
 // canDispatchResources checks GPUs, CPUs, and Memory capacities on the node.
 func canDispatchResources(srv *schedulerServer, member *memberlist.Node, job *scheduler.Job) bool {
+	// A partition is a promise about which nodes a job runs on. Checking it before the resource
+	// arithmetic also means a job never lands somewhere its operator excluded just because that
+	// node happened to have room.
+	if !srv.policy.MatchesPartition(job.Partition, string(member.Meta)) {
+		return false
+	}
+
 	var ad map[string]interface{}
 	if len(member.Meta) > 0 {
 		if err := json.Unmarshal(member.Meta, &ad); err != nil {
@@ -2331,6 +2413,16 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		return nil, fmt.Errorf("CEL evaluator: %w", err)
 	}
 
+	// Partitions and accounts are compiled here rather than at config load, because a node
+	// selector needs the same CEL compiler job requirements use. An invalid one fails the start
+	// instead of silently matching no node on every cycle forever.
+	pol, err := policy.New(cfg, eval)
+	if err != nil {
+		_ = disc.Shutdown()
+		cleanDB()
+		return nil, err
+	}
+
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
 	// Dispatch rides the authenticated gRPC connection. There is no separate broadcast socket
@@ -2340,7 +2432,7 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	srv := &schedulerServer{
 		disc: disc, queue: queue, eval: eval, bus: bus, fairshare: fairshare,
 		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt,
-		cordons: cordons, state: stateStore, raftNode: raftNode,
+		cordons: cordons, state: stateStore, raftNode: raftNode, policy: pol,
 		dispatchPending: make(map[string]time.Time),
 		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
 		adopted: make(map[string]bool),

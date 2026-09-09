@@ -251,9 +251,16 @@ remains advisory and a job can unset it.
 
 Jobs and state are persisted to `~/.tasch/tasch.db` (BoltDB). On master restart:
 - QUEUED jobs are re-enqueued
-- RUNNING jobs are marked FAILED ("master restarted") — the worker is not contacted, so any
-  process it is still running keeps going until its walltime
+- RUNNING jobs are **kept running**. Workers report what they are executing when they reconnect,
+  and the master adopts those jobs — preserving their dispatch attempt so the eventual result is
+  still accepted — and re-books their CPU, memory, and GPUs. A job nobody claims within 90
+  seconds is failed.
+- Cordoned nodes stay cordoned
 - Fairshare usage data is restored
+
+Note that this only helps when the master and its workers are separate processes. In
+`role: both`, killing the process takes the worker with it, so its jobs have nobody to claim
+them.
 
 The database holds every job's captured output and environment variables in plaintext. It is
 mode 0600, but every job runs as the same service account that owns it — so treat any submitted

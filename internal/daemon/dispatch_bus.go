@@ -107,6 +107,13 @@ func (b *dispatchBus) Send(nodeName string, msg *pb.DispatchMessage) error {
 	return nil
 }
 
+// IsConnected reports whether a node currently holds a dispatch stream.
+func (b *dispatchBus) IsConnected(nodeName string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.nodes[nodeName]) > 0
+}
+
 // ConnectedNodes returns the node names with at least one live stream.
 func (b *dispatchBus) ConnectedNodes() []string {
 	b.mu.RLock()

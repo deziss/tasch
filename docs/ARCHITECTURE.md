@@ -190,3 +190,27 @@ pkg/
   discovery/                   # Memberlist + EventHooks
   messaging/                   # ZeroMQ PUB/SUB
 ```
+
+## Master Restart
+
+A master restart does not stop the cluster's work.
+
+1. QUEUED jobs are re-enqueued from BoltDB. Jobs that were RUNNING are held in that state rather
+   than failed.
+2. Each worker re-establishes its dispatch stream and reports the jobs it is currently executing,
+   with the attempt number from the dispatch that started them.
+3. The master adopts those jobs: it restores them to RUNNING on that node, keeps their existing
+   attempt so the eventual result is not mistaken for a stale one, and re-books their CPU,
+   memory, and GPU allocations.
+4. After a 90-second grace period, any job still RUNNING that no worker claimed is failed. The
+   test is adoption, not connectivity — a worker that reconnects without claiming a job is
+   telling the master it is not running it.
+
+This replaces the previous behaviour, which marked every RUNNING job FAILED without contacting
+anyone. The workers kept executing regardless, so the new master's empty resource accounting
+believed those nodes were idle and immediately oversubscribed them, and when a job did finish its
+result was discarded because the master no longer had a record of it.
+
+The mechanism relies on the worker outliving the master, so it applies to separate master and
+worker processes. In `role: both` a single process holds both, and killing it leaves the job's
+processes orphaned with nobody to report them.

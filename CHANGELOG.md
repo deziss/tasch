@@ -51,6 +51,24 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Changed — master restart
+
+- **A master restart no longer destroys running work.** Every RUNNING job was marked FAILED
+  without contacting anyone, while the workers carried on executing them. The new master's empty
+  resource accounting therefore believed those nodes were idle and immediately oversubscribed
+  them, and when a job eventually finished its result was discarded because the master no longer
+  had a record of it.
+- Workers now report their in-flight jobs whenever they establish a dispatch stream, and the
+  master adopts them — restoring them to RUNNING on that node, keeping the dispatch attempt so
+  the result is not later mistaken for a stale one, and re-booking their resources.
+- A job that no worker claims within 90 seconds is failed. The test is adoption rather than
+  connectivity: a worker that reconnects without claiming a job is stating it is not running it,
+  and treating a reachable node as proof of life left such jobs RUNNING forever.
+- A worker reporting a job the master has since cancelled is told to stop it, rather than the
+  orphan being left to occupy the node.
+- This depends on the worker outliving the master, so it applies to separate processes; in
+  `role: both`, killing the process takes the worker with it.
+
 ### Fixed — hardware detection
 
 - **Windows reported 0 MB of VRAM for every modern GPU.** `Win32_VideoController.AdapterRAM` is

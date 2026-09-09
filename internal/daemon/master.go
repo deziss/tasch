@@ -65,6 +65,11 @@ type schedulerServer struct {
 	// Nodes an operator has taken out of scheduling rotation.
 	cordons *cordonRegistry
 
+	// Jobs a worker has claimed since this master started, used to decide which jobs left
+	// RUNNING by a restart were genuinely lost.
+	adoptedMu sync.Mutex
+	adopted   map[string]bool
+
 	// Dispatch acknowledgement tracking
 	dispatchPendingMu sync.Mutex
 	dispatchPending   map[string]time.Time
@@ -441,6 +446,10 @@ var (
 	celCPURegex = regexp.MustCompile(`cpu_cores\s*(?:>=|==|>)\s*(\d+)`)
 	celMemRegex = regexp.MustCompile(`total_memory_mb\s*(?:>=|==|>)\s*(\d+)`)
 )
+
+// adoptionGracePeriod is how long a restarted master waits for workers to reconnect and claim
+// the jobs they are still running before declaring those jobs lost.
+const adoptionGracePeriod = 90 * time.Second
 
 // schedulerStallThreshold is how long the dispatch loop may go without a tick before /health
 // reports the master unhealthy. The loop ticks once a second.
@@ -895,6 +904,105 @@ func isRetryable(job *scheduler.Job, errMsg string) bool {
 	return true
 }
 
+// adoptReportedJobs reconciles the master against what a worker says it is executing.
+//
+// Each claimed job is restored to RUNNING on that node and its resources re-booked, so the
+// scheduler stops treating the node as idle. A job the master has since cancelled is not
+// adopted; the worker is told to stop it instead.
+func (s *schedulerServer) adoptReportedJobs(nodeName string, running []*pb.RunningJob) {
+	if len(running) == 0 {
+		return
+	}
+
+	adopted, rejected := 0, 0
+	for _, claim := range running {
+		if claim.GetJobId() == "" {
+			continue
+		}
+		var startTime time.Time
+		if claim.GetStartTime() > 0 {
+			startTime = time.Unix(claim.GetStartTime(), 0)
+		}
+
+		if !s.queue.AdoptRunning(claim.JobId, nodeName, claim.Attempt, startTime) {
+			// The job is gone or already finished as far as the master is concerned. Tell the
+			// worker to stop, rather than leaving an orphan consuming the node indefinitely.
+			rejected++
+			logging.Job(claim.JobId).Warn("worker reported a job the master no longer owns; cancelling",
+				"node", nodeName)
+			if err := s.bus.Send(nodeName, &pb.DispatchMessage{
+				JobId: claim.JobId, Action: "cancel", Attempt: claim.Attempt,
+			}); err != nil {
+				logging.Job(claim.JobId).Error("could not cancel an unrecognised job", "node", nodeName, "error", err)
+			}
+			continue
+		}
+
+		job, ok := s.queue.GetJob(claim.JobId)
+		if !ok {
+			continue
+		}
+		_, totalGPUs := nodeGPUInfo(s, nodeName)
+		if _, booked := s.gpuTracker.Allocate(nodeName, job.ID, job.GPUsRequired, job.CPUsRequired, job.MemoryRequiredMB, totalGPUs); !booked {
+			logging.Job(job.ID).Warn("could not re-book resources for an adopted job", "node", nodeName)
+		}
+		s.adoptedMu.Lock()
+		s.adopted[job.ID] = true
+		s.adoptedMu.Unlock()
+
+		s.appendLog(job.ID, "INFO", fmt.Sprintf("Reclaimed by master after reconnect on %s", nodeName))
+		adopted++
+	}
+
+	if adopted > 0 || rejected > 0 {
+		slog.Info("reconciled worker jobs", "node", nodeName, "adopted", adopted, "rejected", rejected)
+	}
+}
+
+// reapUnclaimedJobs fails jobs left RUNNING by a restart that no worker has claimed.
+//
+// Workers reconnect within seconds, so anything still unclaimed after the grace period really is
+// gone — its worker died with the master, or was decommissioned while the master was down.
+func reapUnclaimedJobs(srv *schedulerServer, orphaned []string) {
+	if len(orphaned) == 0 {
+		return
+	}
+
+	timer := time.NewTimer(adoptionGracePeriod)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-srv.ctx.Done():
+		return
+	}
+
+	reaped := 0
+	for _, jobID := range orphaned {
+		job, ok := srv.queue.GetJob(jobID)
+		if !ok || job.State != scheduler.StateRunning {
+			continue
+		}
+
+		// Adoption, not connectivity, is the test. A worker that reconnected and did not claim
+		// the job is telling us it is not running it; checking only whether the node was
+		// reachable left such jobs RUNNING forever, holding resources and never reporting.
+		srv.adoptedMu.Lock()
+		claimed := srv.adopted[jobID]
+		srv.adoptedMu.Unlock()
+		if claimed {
+			continue
+		}
+
+		srv.queue.MarkCompleted(jobID, false, "", "lost when the master restarted; no worker claimed it")
+		srv.gpuTracker.Release(jobID)
+		srv.appendLog(jobID, "ERROR", "No worker claimed this job after the master restarted")
+		reaped++
+	}
+	if reaped > 0 {
+		slog.Warn("failed jobs whose workers never reconnected", "count", reaped)
+	}
+}
+
 // CordonNode takes a node out of scheduling rotation, or returns it to service.
 //
 // Cordoning stops new dispatches while letting the jobs already running finish. Draining
@@ -1008,6 +1116,11 @@ func (s *schedulerServer) WatchDispatch(req *pb.WatchDispatchRequest, stream pb.
 	if nodeName == "" {
 		return status.Error(codes.InvalidArgument, "node_name is required")
 	}
+
+	// Adopt whatever this worker says it is running before sending it anything new. After a
+	// master restart this is the only way to learn that a job survived, and it must happen
+	// before the scheduler can hand the node more work on top of it.
+	s.adoptReportedJobs(nodeName, req.RunningJobs)
 
 	queue, unsubscribe := s.bus.Subscribe(nodeName)
 	defer unsubscribe()
@@ -1838,6 +1951,7 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	}
 
 	// Restore state from BoltDB
+	var orphaned []string
 	if jobs, err := db.LoadJobs(); err == nil {
 		restored := 0
 		for _, job := range jobs {
@@ -1848,17 +1962,23 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 				}
 				restored++
 			case scheduler.StateRunning:
-				// Mark as failed — worker connections lost after restart
-				job.State = scheduler.StateFailed
-				job.Error = "master restarted"
-				job.EndTime = time.Now()
-				if err := db.SaveJob(job); err != nil {
-					logging.Job(job.ID).Error("could not persist on restore", "error", err)
-				}
+				// Do not fail it. The worker is very likely still executing this job: failing it
+				// here left the process running while the new master's empty resource accounting
+				// believed the node was idle, immediately oversubscribing it, and discarded the
+				// real result when it eventually arrived.
+				//
+				// Keep the job RUNNING and let its worker claim it when it reconnects.
+				// reapUnclaimedJobs fails whatever nobody claims.
+				queue.RestoreRunning(job)
+				orphaned = append(orphaned, job.ID)
 			}
 		}
 		if restored > 0 {
 			slog.Info("restored queued jobs from disk", "count", restored)
+		}
+		if len(orphaned) > 0 {
+			slog.Warn("jobs were running when the master stopped; waiting for their workers to reconnect and claim them",
+				"count", len(orphaned), "grace_period", adoptionGracePeriod)
 		}
 	}
 	if groups, err := db.LoadGroups(); err == nil {
@@ -1955,13 +2075,15 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt, cordons: cordons,
 		dispatchPending: make(map[string]time.Time),
 		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
-		ctx: shutdownCtx,
+		adopted: make(map[string]bool),
+		ctx:     shutdownCtx,
 	}
 
 	httpServer := startHealthAndMetrics(srv, cfg)
 
 	go dispatchLoop(shutdownCtx, srv)
 	go maintenanceLoop(shutdownCtx, srv)
+	go reapUnclaimedJobs(srv, orphaned)
 	go walltimeEnforcer(shutdownCtx, srv)
 	go dispatchTimeoutEnforcer(shutdownCtx, srv)
 	halfLife := time.Duration(cfg.Fairshare.HalfLifeHours * float64(time.Hour))

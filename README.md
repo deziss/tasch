@@ -86,7 +86,8 @@ tasch stop                     # graceful drain + shutdown
 | **Multi-GPU vendor** | NVIDIA · AMD · Intel · Apple Metal · Jetson Tegra |
 | **GPU env binding** | Auto-injects `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `ONEAPI_DEVICE_SELECTOR`, `METAL_DEVICE_INDEX` per vendor |
 | **Distributed training** | `tasch jobs train` — gang scheduling + auto DDP env vars (`RANK`, `WORLD_SIZE`, `MASTER_ADDR`) |
-| **BoltDB persistence** | Jobs, groups, fairshare survive master restart (`~/.tasch/tasch.db`) |
+| **BoltDB persistence** | Jobs, groups, fairshare, and cordons survive master restart (`~/.tasch/tasch.db`) |
+| **Restart adoption** | Workers report their in-flight jobs on reconnect; a restarted master adopts them instead of failing them, keeping their fencing token so results are still accepted |
 | **Job retry** | Auto-retry failed jobs (default 3×) with exponential backoff. Dead letter queue for exhausted retries |
 | **Health checks** | `/health` (liveness) + `/ready` (readiness) endpoints on metrics port |
 | **Prometheus metrics** | 22 metrics including queue-wait and scheduling-loop histograms, per-state job gauges, GPU utilisation, and delivery, retry and persistence counters. Workers export their own |

@@ -32,7 +32,7 @@ import (
 // on arrival. Besides handing every worker every job's command and environment variables, that
 // design dropped any dispatch published while a subscriber was mid-reconnect, because PUB has
 // no delivery guarantee and the master discarded its send errors.
-func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceClient, nodeName string) <-chan *pb.DispatchMessage {
+func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceClient, nodeName string, running func() []*pb.RunningJob) <-chan *pb.DispatchMessage {
 	ch := make(chan *pb.DispatchMessage, 100)
 	go func() {
 		defer close(ch)
@@ -41,7 +41,12 @@ func watchDispatchWithReconnect(ctx context.Context, client pb.SchedulerServiceC
 			if ctx.Err() != nil {
 				return
 			}
-			stream, err := client.WatchDispatch(ctx, &pb.WatchDispatchRequest{NodeName: nodeName})
+			// Report what is executing on every connect. After a master restart this is the only
+			// way the master learns these jobs survived; without it they are declared failed
+			// while the processes keep running and holding the node's resources.
+			stream, err := client.WatchDispatch(ctx, &pb.WatchDispatchRequest{
+				NodeName: nodeName, RunningJobs: running(),
+			})
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -204,10 +209,33 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	}
 	masterClient := pb.NewSchedulerServiceClient(grpcConn)
 
+	var cancelMu sync.Mutex
+	cancelFuncs := make(map[string]context.CancelFunc)
+	// Attempt currently running for each job, so a re-delivered dispatch — a stream reconnect,
+	// or the master re-dispatching after a lost acknowledgement — does not start a second copy
+	// of a job this worker is already running.
+	runningAttempts := make(map[string]int64)
+	runningStarted := make(map[string]time.Time)
+
+	// snapshotRunning describes this worker's in-flight jobs for the master to reconcile against.
+	snapshotRunning := func() []*pb.RunningJob {
+		cancelMu.Lock()
+		defer cancelMu.Unlock()
+		out := make([]*pb.RunningJob, 0, len(runningAttempts))
+		for jobID, attempt := range runningAttempts {
+			entry := &pb.RunningJob{JobId: jobID, Attempt: attempt}
+			if started, ok := runningStarted[jobID]; ok {
+				entry.StartTime = started.Unix()
+			}
+			out = append(out, entry)
+		}
+		return out
+	}
+
 	subCtx, cancelSub := context.WithCancel(context.Background())
 
 	// Dispatch arrives over the same authenticated gRPC connection as everything else.
-	msgCh := watchDispatchWithReconnect(subCtx, masterClient, nodeName)
+	msgCh := watchDispatchWithReconnect(subCtx, masterClient, nodeName, snapshotRunning)
 
 	slog.Info("worker joined cluster", "node", nodeName, "master", masterHost)
 
@@ -228,13 +256,6 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 	if cfg.Role == "worker" {
 		workerHTTP = startWorkerHealth(cfg, nodeName, &runningJobCount)
 	}
-
-	var cancelMu sync.Mutex
-	cancelFuncs := make(map[string]context.CancelFunc)
-	// Attempt currently running for each job, so a re-delivered dispatch — a stream reconnect,
-	// or the master re-dispatching after a lost acknowledgement — does not start a second copy
-	// of a job this worker is already running.
-	runningAttempts := make(map[string]int64)
 
 	// Bound concurrent jobs. Every dispatch used to spawn an unbounded goroutine, so a burst of
 	// submissions could fork a worker to death with nothing to stop it. A nil channel means
@@ -267,6 +288,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					continue
 				}
 				runningAttempts[payload.JobId] = payload.Attempt
+				runningStarted[payload.JobId] = time.Now()
 				cancelMu.Unlock()
 
 				go func(p *pb.DispatchMessage) {
@@ -289,6 +311,7 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 						delete(cancelFuncs, p.JobId)
 						if runningAttempts[p.JobId] == p.Attempt {
 							delete(runningAttempts, p.JobId)
+							delete(runningStarted, p.JobId)
 						}
 						cancelMu.Unlock()
 					}()

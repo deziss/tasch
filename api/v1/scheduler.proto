@@ -81,6 +81,22 @@ message AcknowledgeStartResponse {
 
 message WatchDispatchRequest {
   string node_name = 1;
+
+  // Jobs this worker is currently executing, sent every time the stream is established.
+  //
+  // A master restart used to mark every RUNNING job FAILED without contacting anyone. The
+  // workers kept executing them, holding CPU and GPU that the new master's empty accounting
+  // believed were free, so it immediately oversubscribed those nodes — and when a job finally
+  // finished, its result was discarded because the master no longer had the job. Reporting what
+  // is actually running lets the master adopt those jobs instead of guessing.
+  repeated RunningJob running_jobs = 2;
+}
+
+// RunningJob identifies work a worker is executing, so the master can reconcile against it.
+message RunningJob {
+  string job_id = 1;
+  int64 attempt = 2;      // Fencing token from the dispatch that started it
+  int64 start_time = 3;
 }
 
 message DispatchMessage {

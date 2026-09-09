@@ -349,6 +349,64 @@ func (gs *GlobalScheduler) notifyGroupChange(group *JobGroup) {
 	}
 }
 
+// RestoreRunning re-inserts a job that was RUNNING when the master stopped, without touching
+// its state.
+//
+// The job is not queued: it is presumed to still be executing on its worker, and stays RUNNING
+// until either that worker reconnects and claims it or the grace period expires.
+func (gs *GlobalScheduler) RestoreRunning(job *Job) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	job.index = -1
+	gs.jobs[job.ID] = job
+}
+
+// AdoptRunning restores a job to RUNNING on a node, as reported by a worker after a master
+// restart.
+//
+// It is deliberately not MarkRunning: no new attempt is allocated, because the dispatch that
+// started this job already happened and its fencing token must be preserved — the worker will
+// report its result carrying that token, and a fresh one would make the result look stale and
+// get it discarded.
+//
+// Returns false if the job is unknown or has already reached a terminal state, so a worker
+// reporting stale work cannot resurrect a job a user has since cancelled.
+func (gs *GlobalScheduler) AdoptRunning(jobID, workerNode string, attempt int64, startTime time.Time) bool {
+	gs.mu.Lock()
+
+	job, ok := gs.jobs[jobID]
+	if !ok {
+		gs.mu.Unlock()
+		return false
+	}
+	if job.State == StateCancelled || job.State == StateCompleted {
+		gs.mu.Unlock()
+		return false
+	}
+	// A job the worker claims must not still be sitting in the queue.
+	if job.State == StateQueued && job.index >= 0 && job.index < gs.queue.Len() {
+		heap.Remove(&gs.queue, job.index)
+	}
+
+	job.State = StateRunning
+	job.WorkerNode = workerNode
+	job.Error = ""
+	job.EndTime = time.Time{}
+	if attempt > job.Attempt {
+		job.Attempt = attempt
+	}
+	if !startTime.IsZero() {
+		job.StartTime = startTime
+	} else if job.StartTime.IsZero() {
+		job.StartTime = time.Now()
+	}
+	snapshot := job.Copy()
+	gs.mu.Unlock()
+
+	gs.notifyJobChange(snapshot)
+	return true
+}
+
 // MarkRunning transitions a job to RUNNING state, returning the dispatch attempt number.
 //
 // ok is false for an unknown job and for one that was cancelled after being dequeued; callers

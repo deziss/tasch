@@ -269,3 +269,101 @@ func TestPruneTerminalKeepsRunningJobs(t *testing.T) {
 		t.Error("the running job is gone")
 	}
 }
+
+// TestAdoptRunningPreservesFencingToken is the regression test for the master restart path. A
+// restart used to mark every RUNNING job FAILED without contacting anyone: the worker kept
+// executing, holding resources the new master believed were free, and its eventual result was
+// discarded because the master no longer had the job.
+//
+// Adoption must not allocate a new attempt. The dispatch that started the job already happened,
+// and the worker will report carrying that token — a fresh one would make the real result look
+// stale and get it thrown away.
+func TestAdoptRunningPreservesFencingToken(t *testing.T) {
+	gs := NewGlobalScheduler()
+	job := newJob("j1")
+	if err := gs.Enqueue(job); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	attempt, _ := gs.MarkRunning("j1", "worker-1")
+
+	// Simulate a restart: a fresh scheduler holding the persisted record.
+	restarted := NewGlobalScheduler()
+	persisted, _ := gs.GetJob("j1")
+	restarted.RestoreRunning(persisted)
+
+	started := time.Now().Add(-90 * time.Second)
+	if !restarted.AdoptRunning("j1", "worker-1", attempt, started) {
+		t.Fatal("the worker's claim was rejected")
+	}
+
+	adopted, ok := restarted.GetJob("j1")
+	if !ok {
+		t.Fatal("job is missing after adoption")
+	}
+	if adopted.State != StateRunning {
+		t.Errorf("state = %s, want RUNNING", adopted.State)
+	}
+	if adopted.WorkerNode != "worker-1" {
+		t.Errorf("worker = %q, want worker-1", adopted.WorkerNode)
+	}
+	if adopted.Attempt != attempt {
+		t.Errorf("attempt = %d, want %d — a new token would make the real result look stale",
+			adopted.Attempt, attempt)
+	}
+	if !adopted.StartTime.Equal(started) {
+		t.Errorf("start time = %v, want the worker's reported %v", adopted.StartTime, started)
+	}
+}
+
+// TestAdoptRunningRefusesTerminalJobs confirms a worker cannot resurrect work the user has since
+// cancelled, or that already completed.
+func TestAdoptRunningRefusesTerminalJobs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*GlobalScheduler)
+	}{
+		{"cancelled", func(gs *GlobalScheduler) { gs.Cancel("j1") }},
+		{"completed", func(gs *GlobalScheduler) { gs.MarkCompleted("j1", true, "done", "") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gs := NewGlobalScheduler()
+			if err := gs.Enqueue(newJob("j1")); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			tc.set(gs)
+
+			if gs.AdoptRunning("j1", "worker-1", 1, time.Now()) {
+				t.Fatal("a terminal job was adopted back into RUNNING")
+			}
+		})
+	}
+}
+
+// TestAdoptRunningRejectsUnknownJob confirms a worker reporting a job the master never had is
+// declined, so the master can tell it to stop rather than leaving an orphan on the node.
+func TestAdoptRunningRejectsUnknownJob(t *testing.T) {
+	gs := NewGlobalScheduler()
+	if gs.AdoptRunning("never-existed", "worker-1", 1, time.Now()) {
+		t.Fatal("an unknown job was adopted")
+	}
+}
+
+// TestAdoptRunningRemovesFromQueue covers a job the master restored as QUEUED that a worker then
+// claims: it must leave the heap, or the scheduler would dispatch a second copy.
+func TestAdoptRunningRemovesFromQueue(t *testing.T) {
+	gs := NewGlobalScheduler()
+	if err := gs.Enqueue(newJob("j1")); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if gs.QueueLen() != 1 {
+		t.Fatalf("queue length = %d, want 1", gs.QueueLen())
+	}
+
+	if !gs.AdoptRunning("j1", "worker-1", 1, time.Now()) {
+		t.Fatal("adoption failed")
+	}
+	if gs.QueueLen() != 0 {
+		t.Errorf("queue length = %d, want 0 — an adopted job left in the queue would be dispatched twice",
+			gs.QueueLen())
+	}
+}

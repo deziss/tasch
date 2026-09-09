@@ -1072,6 +1072,429 @@ func (x *SubmitDistributedJobResponse) GetStatus() string {
 	return ""
 }
 
+// Reservations hold nodes aside for a window of time. Unlike a cordon they say *when*, so the
+// scheduler can drain a node by itself: it stops placing jobs that would still be running when
+// the window opens, and lets everything that fits run to completion.
+type CreateReservationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Nodes         []string               `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	StartTime     int64                  `protobuf:"varint,2,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"` // Unix seconds
+	EndTime       int64                  `protobuf:"varint,3,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	Users         []string               `protobuf:"bytes,4,rep,name=users,proto3" json:"users,omitempty"` // Who may run here during the window
+	Accounts      []string               `protobuf:"bytes,5,rep,name=accounts,proto3" json:"accounts,omitempty"`
+	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"` // Both users and accounts empty means nobody: maintenance
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateReservationRequest) Reset() {
+	*x = CreateReservationRequest{}
+	mi := &file_scheduler_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateReservationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateReservationRequest) ProtoMessage() {}
+
+func (x *CreateReservationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateReservationRequest.ProtoReflect.Descriptor instead.
+func (*CreateReservationRequest) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CreateReservationRequest) GetNodes() []string {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *CreateReservationRequest) GetStartTime() int64 {
+	if x != nil {
+		return x.StartTime
+	}
+	return 0
+}
+
+func (x *CreateReservationRequest) GetEndTime() int64 {
+	if x != nil {
+		return x.EndTime
+	}
+	return 0
+}
+
+func (x *CreateReservationRequest) GetUsers() []string {
+	if x != nil {
+		return x.Users
+	}
+	return nil
+}
+
+func (x *CreateReservationRequest) GetAccounts() []string {
+	if x != nil {
+		return x.Accounts
+	}
+	return nil
+}
+
+func (x *CreateReservationRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type CreateReservationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateReservationResponse) Reset() {
+	*x = CreateReservationResponse{}
+	mi := &file_scheduler_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateReservationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateReservationResponse) ProtoMessage() {}
+
+func (x *CreateReservationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateReservationResponse.ProtoReflect.Descriptor instead.
+func (*CreateReservationResponse) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *CreateReservationResponse) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *CreateReservationResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type DeleteReservationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteReservationRequest) Reset() {
+	*x = DeleteReservationRequest{}
+	mi := &file_scheduler_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteReservationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteReservationRequest) ProtoMessage() {}
+
+func (x *DeleteReservationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteReservationRequest.ProtoReflect.Descriptor instead.
+func (*DeleteReservationRequest) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *DeleteReservationRequest) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+type DeleteReservationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	Deleted       bool                   `protobuf:"varint,2,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteReservationResponse) Reset() {
+	*x = DeleteReservationResponse{}
+	mi := &file_scheduler_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteReservationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteReservationResponse) ProtoMessage() {}
+
+func (x *DeleteReservationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteReservationResponse.ProtoReflect.Descriptor instead.
+func (*DeleteReservationResponse) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *DeleteReservationResponse) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *DeleteReservationResponse) GetDeleted() bool {
+	if x != nil {
+		return x.Deleted
+	}
+	return false
+}
+
+type ListReservationsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListReservationsRequest) Reset() {
+	*x = ListReservationsRequest{}
+	mi := &file_scheduler_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListReservationsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListReservationsRequest) ProtoMessage() {}
+
+func (x *ListReservationsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListReservationsRequest.ProtoReflect.Descriptor instead.
+func (*ListReservationsRequest) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{18}
+}
+
+type ReservationInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	Nodes         []string               `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	StartTime     int64                  `protobuf:"varint,3,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
+	EndTime       int64                  `protobuf:"varint,4,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	Users         []string               `protobuf:"bytes,5,rep,name=users,proto3" json:"users,omitempty"`
+	Accounts      []string               `protobuf:"bytes,6,rep,name=accounts,proto3" json:"accounts,omitempty"`
+	Reason        string                 `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
+	CreatedBy     string                 `protobuf:"bytes,8,opt,name=created_by,json=createdBy,proto3" json:"created_by,omitempty"`
+	Active        bool                   `protobuf:"varint,9,opt,name=active,proto3" json:"active,omitempty"` // The window is open right now
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReservationInfo) Reset() {
+	*x = ReservationInfo{}
+	mi := &file_scheduler_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReservationInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReservationInfo) ProtoMessage() {}
+
+func (x *ReservationInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReservationInfo.ProtoReflect.Descriptor instead.
+func (*ReservationInfo) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ReservationInfo) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *ReservationInfo) GetNodes() []string {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *ReservationInfo) GetStartTime() int64 {
+	if x != nil {
+		return x.StartTime
+	}
+	return 0
+}
+
+func (x *ReservationInfo) GetEndTime() int64 {
+	if x != nil {
+		return x.EndTime
+	}
+	return 0
+}
+
+func (x *ReservationInfo) GetUsers() []string {
+	if x != nil {
+		return x.Users
+	}
+	return nil
+}
+
+func (x *ReservationInfo) GetAccounts() []string {
+	if x != nil {
+		return x.Accounts
+	}
+	return nil
+}
+
+func (x *ReservationInfo) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *ReservationInfo) GetCreatedBy() string {
+	if x != nil {
+		return x.CreatedBy
+	}
+	return ""
+}
+
+func (x *ReservationInfo) GetActive() bool {
+	if x != nil {
+		return x.Active
+	}
+	return false
+}
+
+type ListReservationsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Reservations  []*ReservationInfo     `protobuf:"bytes,1,rep,name=reservations,proto3" json:"reservations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListReservationsResponse) Reset() {
+	*x = ListReservationsResponse{}
+	mi := &file_scheduler_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListReservationsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListReservationsResponse) ProtoMessage() {}
+
+func (x *ListReservationsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_scheduler_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListReservationsResponse.ProtoReflect.Descriptor instead.
+func (*ListReservationsResponse) Descriptor() ([]byte, []int) {
+	return file_scheduler_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ListReservationsResponse) GetReservations() []*ReservationInfo {
+	if x != nil {
+		return x.Reservations
+	}
+	return nil
+}
+
 type CancelJobRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
@@ -1081,7 +1504,7 @@ type CancelJobRequest struct {
 
 func (x *CancelJobRequest) Reset() {
 	*x = CancelJobRequest{}
-	mi := &file_scheduler_proto_msgTypes[14]
+	mi := &file_scheduler_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1093,7 +1516,7 @@ func (x *CancelJobRequest) String() string {
 func (*CancelJobRequest) ProtoMessage() {}
 
 func (x *CancelJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[14]
+	mi := &file_scheduler_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1106,7 +1529,7 @@ func (x *CancelJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelJobRequest.ProtoReflect.Descriptor instead.
 func (*CancelJobRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{14}
+	return file_scheduler_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *CancelJobRequest) GetJobId() string {
@@ -1127,7 +1550,7 @@ type CancelJobResponse struct {
 
 func (x *CancelJobResponse) Reset() {
 	*x = CancelJobResponse{}
-	mi := &file_scheduler_proto_msgTypes[15]
+	mi := &file_scheduler_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1139,7 +1562,7 @@ func (x *CancelJobResponse) String() string {
 func (*CancelJobResponse) ProtoMessage() {}
 
 func (x *CancelJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[15]
+	mi := &file_scheduler_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1152,7 +1575,7 @@ func (x *CancelJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelJobResponse.ProtoReflect.Descriptor instead.
 func (*CancelJobResponse) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{15}
+	return file_scheduler_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CancelJobResponse) GetJobId() string {
@@ -1185,7 +1608,7 @@ type GetJobStatusRequest struct {
 
 func (x *GetJobStatusRequest) Reset() {
 	*x = GetJobStatusRequest{}
-	mi := &file_scheduler_proto_msgTypes[16]
+	mi := &file_scheduler_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1197,7 +1620,7 @@ func (x *GetJobStatusRequest) String() string {
 func (*GetJobStatusRequest) ProtoMessage() {}
 
 func (x *GetJobStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[16]
+	mi := &file_scheduler_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1210,7 +1633,7 @@ func (x *GetJobStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetJobStatusRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{16}
+	return file_scheduler_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *GetJobStatusRequest) GetJobId() string {
@@ -1246,7 +1669,7 @@ type GetJobStatusResponse struct {
 
 func (x *GetJobStatusResponse) Reset() {
 	*x = GetJobStatusResponse{}
-	mi := &file_scheduler_proto_msgTypes[17]
+	mi := &file_scheduler_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1258,7 +1681,7 @@ func (x *GetJobStatusResponse) String() string {
 func (*GetJobStatusResponse) ProtoMessage() {}
 
 func (x *GetJobStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[17]
+	mi := &file_scheduler_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1271,7 +1694,7 @@ func (x *GetJobStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetJobStatusResponse) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{17}
+	return file_scheduler_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *GetJobStatusResponse) GetJobId() string {
@@ -1395,7 +1818,7 @@ type LogStreamRequest struct {
 
 func (x *LogStreamRequest) Reset() {
 	*x = LogStreamRequest{}
-	mi := &file_scheduler_proto_msgTypes[18]
+	mi := &file_scheduler_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1407,7 +1830,7 @@ func (x *LogStreamRequest) String() string {
 func (*LogStreamRequest) ProtoMessage() {}
 
 func (x *LogStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[18]
+	mi := &file_scheduler_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1420,7 +1843,7 @@ func (x *LogStreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogStreamRequest.ProtoReflect.Descriptor instead.
 func (*LogStreamRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{18}
+	return file_scheduler_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LogStreamRequest) GetJobId() string {
@@ -1442,7 +1865,7 @@ type LogMessage struct {
 
 func (x *LogMessage) Reset() {
 	*x = LogMessage{}
-	mi := &file_scheduler_proto_msgTypes[19]
+	mi := &file_scheduler_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1454,7 +1877,7 @@ func (x *LogMessage) String() string {
 func (*LogMessage) ProtoMessage() {}
 
 func (x *LogMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[19]
+	mi := &file_scheduler_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1467,7 +1890,7 @@ func (x *LogMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogMessage.ProtoReflect.Descriptor instead.
 func (*LogMessage) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{19}
+	return file_scheduler_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *LogMessage) GetTimestamp() int64 {
@@ -1506,7 +1929,7 @@ type WorkerStatusRequest struct {
 
 func (x *WorkerStatusRequest) Reset() {
 	*x = WorkerStatusRequest{}
-	mi := &file_scheduler_proto_msgTypes[20]
+	mi := &file_scheduler_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1518,7 +1941,7 @@ func (x *WorkerStatusRequest) String() string {
 func (*WorkerStatusRequest) ProtoMessage() {}
 
 func (x *WorkerStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[20]
+	mi := &file_scheduler_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1531,7 +1954,7 @@ func (x *WorkerStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerStatusRequest.ProtoReflect.Descriptor instead.
 func (*WorkerStatusRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{20}
+	return file_scheduler_proto_rawDescGZIP(), []int{27}
 }
 
 type WorkerStatusResponse struct {
@@ -1544,7 +1967,7 @@ type WorkerStatusResponse struct {
 
 func (x *WorkerStatusResponse) Reset() {
 	*x = WorkerStatusResponse{}
-	mi := &file_scheduler_proto_msgTypes[21]
+	mi := &file_scheduler_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1556,7 +1979,7 @@ func (x *WorkerStatusResponse) String() string {
 func (*WorkerStatusResponse) ProtoMessage() {}
 
 func (x *WorkerStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[21]
+	mi := &file_scheduler_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1569,7 +1992,7 @@ func (x *WorkerStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerStatusResponse.ProtoReflect.Descriptor instead.
 func (*WorkerStatusResponse) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{21}
+	return file_scheduler_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *WorkerStatusResponse) GetWorkerNodes() map[string]string {
@@ -1600,7 +2023,7 @@ type NodeSchedulingState struct {
 
 func (x *NodeSchedulingState) Reset() {
 	*x = NodeSchedulingState{}
-	mi := &file_scheduler_proto_msgTypes[22]
+	mi := &file_scheduler_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1612,7 +2035,7 @@ func (x *NodeSchedulingState) String() string {
 func (*NodeSchedulingState) ProtoMessage() {}
 
 func (x *NodeSchedulingState) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[22]
+	mi := &file_scheduler_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1625,7 +2048,7 @@ func (x *NodeSchedulingState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSchedulingState.ProtoReflect.Descriptor instead.
 func (*NodeSchedulingState) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{22}
+	return file_scheduler_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *NodeSchedulingState) GetCordoned() bool {
@@ -1677,7 +2100,7 @@ type ListJobsRequest struct {
 
 func (x *ListJobsRequest) Reset() {
 	*x = ListJobsRequest{}
-	mi := &file_scheduler_proto_msgTypes[23]
+	mi := &file_scheduler_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1689,7 +2112,7 @@ func (x *ListJobsRequest) String() string {
 func (*ListJobsRequest) ProtoMessage() {}
 
 func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[23]
+	mi := &file_scheduler_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1702,7 +2125,7 @@ func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsRequest.ProtoReflect.Descriptor instead.
 func (*ListJobsRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{23}
+	return file_scheduler_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ListJobsRequest) GetStateFilter() string {
@@ -1737,7 +2160,7 @@ type ListJobsResponse struct {
 
 func (x *ListJobsResponse) Reset() {
 	*x = ListJobsResponse{}
-	mi := &file_scheduler_proto_msgTypes[24]
+	mi := &file_scheduler_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1749,7 +2172,7 @@ func (x *ListJobsResponse) String() string {
 func (*ListJobsResponse) ProtoMessage() {}
 
 func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[24]
+	mi := &file_scheduler_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1762,7 +2185,7 @@ func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsResponse.ProtoReflect.Descriptor instead.
 func (*ListJobsResponse) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{24}
+	return file_scheduler_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ListJobsResponse) GetJobs() []*JobInfo {
@@ -1803,7 +2226,7 @@ type JobInfo struct {
 
 func (x *JobInfo) Reset() {
 	*x = JobInfo{}
-	mi := &file_scheduler_proto_msgTypes[25]
+	mi := &file_scheduler_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1815,7 +2238,7 @@ func (x *JobInfo) String() string {
 func (*JobInfo) ProtoMessage() {}
 
 func (x *JobInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[25]
+	mi := &file_scheduler_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1828,7 +2251,7 @@ func (x *JobInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobInfo.ProtoReflect.Descriptor instead.
 func (*JobInfo) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{25}
+	return file_scheduler_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *JobInfo) GetJobId() string {
@@ -1914,7 +2337,7 @@ type ReportResultRequest struct {
 
 func (x *ReportResultRequest) Reset() {
 	*x = ReportResultRequest{}
-	mi := &file_scheduler_proto_msgTypes[26]
+	mi := &file_scheduler_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1926,7 +2349,7 @@ func (x *ReportResultRequest) String() string {
 func (*ReportResultRequest) ProtoMessage() {}
 
 func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[26]
+	mi := &file_scheduler_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1939,7 +2362,7 @@ func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultRequest.ProtoReflect.Descriptor instead.
 func (*ReportResultRequest) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{26}
+	return file_scheduler_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ReportResultRequest) GetJobId() string {
@@ -2007,7 +2430,7 @@ type ReportResultResponse struct {
 
 func (x *ReportResultResponse) Reset() {
 	*x = ReportResultResponse{}
-	mi := &file_scheduler_proto_msgTypes[27]
+	mi := &file_scheduler_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2019,7 +2442,7 @@ func (x *ReportResultResponse) String() string {
 func (*ReportResultResponse) ProtoMessage() {}
 
 func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_scheduler_proto_msgTypes[27]
+	mi := &file_scheduler_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2032,7 +2455,7 @@ func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultResponse.ProtoReflect.Descriptor instead.
 func (*ReportResultResponse) Descriptor() ([]byte, []int) {
-	return file_scheduler_proto_rawDescGZIP(), []int{27}
+	return file_scheduler_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ReportResultResponse) GetAcknowledged() bool {
@@ -2141,7 +2564,38 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x1cSubmitDistributedJobResponse\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\tR\agroupId\x12\x17\n" +
 	"\ajob_ids\x18\x02 \x03(\tR\x06jobIds\x12\x16\n" +
-	"\x06status\x18\x03 \x01(\tR\x06status\")\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\"\xb4\x01\n" +
+	"\x18CreateReservationRequest\x12\x14\n" +
+	"\x05nodes\x18\x01 \x03(\tR\x05nodes\x12\x1d\n" +
+	"\n" +
+	"start_time\x18\x02 \x01(\x03R\tstartTime\x12\x19\n" +
+	"\bend_time\x18\x03 \x01(\x03R\aendTime\x12\x14\n" +
+	"\x05users\x18\x04 \x03(\tR\x05users\x12\x1a\n" +
+	"\baccounts\x18\x05 \x03(\tR\baccounts\x12\x16\n" +
+	"\x06reason\x18\x06 \x01(\tR\x06reason\"Z\n" +
+	"\x19CreateReservationResponse\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\"A\n" +
+	"\x18DeleteReservationRequest\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\"\\\n" +
+	"\x19DeleteReservationResponse\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x18\n" +
+	"\adeleted\x18\x02 \x01(\bR\adeleted\"\x19\n" +
+	"\x17ListReservationsRequest\"\x89\x02\n" +
+	"\x0fReservationInfo\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x14\n" +
+	"\x05nodes\x18\x02 \x03(\tR\x05nodes\x12\x1d\n" +
+	"\n" +
+	"start_time\x18\x03 \x01(\x03R\tstartTime\x12\x19\n" +
+	"\bend_time\x18\x04 \x01(\x03R\aendTime\x12\x14\n" +
+	"\x05users\x18\x05 \x03(\tR\x05users\x12\x1a\n" +
+	"\baccounts\x18\x06 \x03(\tR\baccounts\x12\x16\n" +
+	"\x06reason\x18\a \x01(\tR\x06reason\x12\x1d\n" +
+	"\n" +
+	"created_by\x18\b \x01(\tR\tcreatedBy\x12\x16\n" +
+	"\x06active\x18\t \x01(\bR\x06active\"S\n" +
+	"\x18ListReservationsResponse\x127\n" +
+	"\freservations\x18\x01 \x03(\v2\x13.v1.ReservationInfoR\freservations\")\n" +
 	"\x10CancelJobRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\\\n" +
 	"\x11CancelJobResponse\x12\x15\n" +
@@ -2231,7 +2685,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\bend_time\x18\a \x01(\x03R\aendTime\x12\x18\n" +
 	"\aattempt\x18\b \x01(\x03R\aattempt\":\n" +
 	"\x14ReportResultResponse\x12\"\n" +
-	"\facknowledged\x18\x01 \x01(\bR\facknowledged2\xab\x06\n" +
+	"\facknowledged\x18\x01 \x01(\bR\facknowledged2\x9e\b\n" +
 	"\x10SchedulerService\x128\n" +
 	"\tSubmitJob\x12\x14.v1.SubmitJobRequest\x1a\x15.v1.SubmitJobResponse\x12Y\n" +
 	"\x14SubmitDistributedJob\x12\x1f.v1.SubmitDistributedJobRequest\x1a .v1.SubmitDistributedJobResponse\x128\n" +
@@ -2244,7 +2698,10 @@ const file_scheduler_proto_rawDesc = "" +
 	"\fReportResult\x12\x17.v1.ReportResultRequest\x1a\x18.v1.ReportResultResponse\x12D\n" +
 	"\rClusterStatus\x12\x18.v1.ClusterStatusRequest\x1a\x19.v1.ClusterStatusResponse\x12;\n" +
 	"\n" +
-	"CordonNode\x12\x15.v1.CordonNodeRequest\x1a\x16.v1.CordonNodeResponse\x12M\n" +
+	"CordonNode\x12\x15.v1.CordonNodeRequest\x1a\x16.v1.CordonNodeResponse\x12P\n" +
+	"\x11CreateReservation\x12\x1c.v1.CreateReservationRequest\x1a\x1d.v1.CreateReservationResponse\x12P\n" +
+	"\x11DeleteReservation\x12\x1c.v1.DeleteReservationRequest\x1a\x1d.v1.DeleteReservationResponse\x12M\n" +
+	"\x10ListReservations\x12\x1b.v1.ListReservationsRequest\x1a\x1c.v1.ListReservationsResponse\x12M\n" +
 	"\x10AcknowledgeStart\x12\x1b.v1.AcknowledgeStartRequest\x1a\x1c.v1.AcknowledgeStartResponse\x12@\n" +
 	"\rWatchDispatch\x12\x18.v1.WatchDispatchRequest\x1a\x13.v1.DispatchMessage0\x01B Z\x1egithub.com/deziss/tasch/api/v1b\x06proto3"
 
@@ -2260,7 +2717,7 @@ func file_scheduler_proto_rawDescGZIP() []byte {
 	return file_scheduler_proto_rawDescData
 }
 
-var file_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
+var file_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_scheduler_proto_goTypes = []any{
 	(*ClusterStatusRequest)(nil),         // 0: v1.ClusterStatusRequest
 	(*ClusterStatusResponse)(nil),        // 1: v1.ClusterStatusResponse
@@ -2276,65 +2733,79 @@ var file_scheduler_proto_goTypes = []any{
 	(*SubmitJobResponse)(nil),            // 11: v1.SubmitJobResponse
 	(*SubmitDistributedJobRequest)(nil),  // 12: v1.SubmitDistributedJobRequest
 	(*SubmitDistributedJobResponse)(nil), // 13: v1.SubmitDistributedJobResponse
-	(*CancelJobRequest)(nil),             // 14: v1.CancelJobRequest
-	(*CancelJobResponse)(nil),            // 15: v1.CancelJobResponse
-	(*GetJobStatusRequest)(nil),          // 16: v1.GetJobStatusRequest
-	(*GetJobStatusResponse)(nil),         // 17: v1.GetJobStatusResponse
-	(*LogStreamRequest)(nil),             // 18: v1.LogStreamRequest
-	(*LogMessage)(nil),                   // 19: v1.LogMessage
-	(*WorkerStatusRequest)(nil),          // 20: v1.WorkerStatusRequest
-	(*WorkerStatusResponse)(nil),         // 21: v1.WorkerStatusResponse
-	(*NodeSchedulingState)(nil),          // 22: v1.NodeSchedulingState
-	(*ListJobsRequest)(nil),              // 23: v1.ListJobsRequest
-	(*ListJobsResponse)(nil),             // 24: v1.ListJobsResponse
-	(*JobInfo)(nil),                      // 25: v1.JobInfo
-	(*ReportResultRequest)(nil),          // 26: v1.ReportResultRequest
-	(*ReportResultResponse)(nil),         // 27: v1.ReportResultResponse
-	nil,                                  // 28: v1.DispatchMessage.EnvVarsEntry
-	nil,                                  // 29: v1.SubmitJobRequest.EnvVarsEntry
-	nil,                                  // 30: v1.SubmitDistributedJobRequest.EnvVarsEntry
-	nil,                                  // 31: v1.WorkerStatusResponse.WorkerNodesEntry
-	nil,                                  // 32: v1.WorkerStatusResponse.NodeStateEntry
+	(*CreateReservationRequest)(nil),     // 14: v1.CreateReservationRequest
+	(*CreateReservationResponse)(nil),    // 15: v1.CreateReservationResponse
+	(*DeleteReservationRequest)(nil),     // 16: v1.DeleteReservationRequest
+	(*DeleteReservationResponse)(nil),    // 17: v1.DeleteReservationResponse
+	(*ListReservationsRequest)(nil),      // 18: v1.ListReservationsRequest
+	(*ReservationInfo)(nil),              // 19: v1.ReservationInfo
+	(*ListReservationsResponse)(nil),     // 20: v1.ListReservationsResponse
+	(*CancelJobRequest)(nil),             // 21: v1.CancelJobRequest
+	(*CancelJobResponse)(nil),            // 22: v1.CancelJobResponse
+	(*GetJobStatusRequest)(nil),          // 23: v1.GetJobStatusRequest
+	(*GetJobStatusResponse)(nil),         // 24: v1.GetJobStatusResponse
+	(*LogStreamRequest)(nil),             // 25: v1.LogStreamRequest
+	(*LogMessage)(nil),                   // 26: v1.LogMessage
+	(*WorkerStatusRequest)(nil),          // 27: v1.WorkerStatusRequest
+	(*WorkerStatusResponse)(nil),         // 28: v1.WorkerStatusResponse
+	(*NodeSchedulingState)(nil),          // 29: v1.NodeSchedulingState
+	(*ListJobsRequest)(nil),              // 30: v1.ListJobsRequest
+	(*ListJobsResponse)(nil),             // 31: v1.ListJobsResponse
+	(*JobInfo)(nil),                      // 32: v1.JobInfo
+	(*ReportResultRequest)(nil),          // 33: v1.ReportResultRequest
+	(*ReportResultResponse)(nil),         // 34: v1.ReportResultResponse
+	nil,                                  // 35: v1.DispatchMessage.EnvVarsEntry
+	nil,                                  // 36: v1.SubmitJobRequest.EnvVarsEntry
+	nil,                                  // 37: v1.SubmitDistributedJobRequest.EnvVarsEntry
+	nil,                                  // 38: v1.WorkerStatusResponse.WorkerNodesEntry
+	nil,                                  // 39: v1.WorkerStatusResponse.NodeStateEntry
 }
 var file_scheduler_proto_depIdxs = []int32{
 	2,  // 0: v1.ClusterStatusResponse.members:type_name -> v1.ClusterMember
 	8,  // 1: v1.WatchDispatchRequest.running_jobs:type_name -> v1.RunningJob
-	28, // 2: v1.DispatchMessage.env_vars:type_name -> v1.DispatchMessage.EnvVarsEntry
-	29, // 3: v1.SubmitJobRequest.env_vars:type_name -> v1.SubmitJobRequest.EnvVarsEntry
-	30, // 4: v1.SubmitDistributedJobRequest.env_vars:type_name -> v1.SubmitDistributedJobRequest.EnvVarsEntry
-	31, // 5: v1.WorkerStatusResponse.worker_nodes:type_name -> v1.WorkerStatusResponse.WorkerNodesEntry
-	32, // 6: v1.WorkerStatusResponse.node_state:type_name -> v1.WorkerStatusResponse.NodeStateEntry
-	25, // 7: v1.ListJobsResponse.jobs:type_name -> v1.JobInfo
-	22, // 8: v1.WorkerStatusResponse.NodeStateEntry.value:type_name -> v1.NodeSchedulingState
-	10, // 9: v1.SchedulerService.SubmitJob:input_type -> v1.SubmitJobRequest
-	12, // 10: v1.SchedulerService.SubmitDistributedJob:input_type -> v1.SubmitDistributedJobRequest
-	14, // 11: v1.SchedulerService.CancelJob:input_type -> v1.CancelJobRequest
-	16, // 12: v1.SchedulerService.GetJobStatus:input_type -> v1.GetJobStatusRequest
-	18, // 13: v1.SchedulerService.StreamLogs:input_type -> v1.LogStreamRequest
-	20, // 14: v1.SchedulerService.WorkerStatus:input_type -> v1.WorkerStatusRequest
-	23, // 15: v1.SchedulerService.ListJobs:input_type -> v1.ListJobsRequest
-	26, // 16: v1.SchedulerService.ReportResult:input_type -> v1.ReportResultRequest
-	0,  // 17: v1.SchedulerService.ClusterStatus:input_type -> v1.ClusterStatusRequest
-	3,  // 18: v1.SchedulerService.CordonNode:input_type -> v1.CordonNodeRequest
-	5,  // 19: v1.SchedulerService.AcknowledgeStart:input_type -> v1.AcknowledgeStartRequest
-	7,  // 20: v1.SchedulerService.WatchDispatch:input_type -> v1.WatchDispatchRequest
-	11, // 21: v1.SchedulerService.SubmitJob:output_type -> v1.SubmitJobResponse
-	13, // 22: v1.SchedulerService.SubmitDistributedJob:output_type -> v1.SubmitDistributedJobResponse
-	15, // 23: v1.SchedulerService.CancelJob:output_type -> v1.CancelJobResponse
-	17, // 24: v1.SchedulerService.GetJobStatus:output_type -> v1.GetJobStatusResponse
-	19, // 25: v1.SchedulerService.StreamLogs:output_type -> v1.LogMessage
-	21, // 26: v1.SchedulerService.WorkerStatus:output_type -> v1.WorkerStatusResponse
-	24, // 27: v1.SchedulerService.ListJobs:output_type -> v1.ListJobsResponse
-	27, // 28: v1.SchedulerService.ReportResult:output_type -> v1.ReportResultResponse
-	1,  // 29: v1.SchedulerService.ClusterStatus:output_type -> v1.ClusterStatusResponse
-	4,  // 30: v1.SchedulerService.CordonNode:output_type -> v1.CordonNodeResponse
-	6,  // 31: v1.SchedulerService.AcknowledgeStart:output_type -> v1.AcknowledgeStartResponse
-	9,  // 32: v1.SchedulerService.WatchDispatch:output_type -> v1.DispatchMessage
-	21, // [21:33] is the sub-list for method output_type
-	9,  // [9:21] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	35, // 2: v1.DispatchMessage.env_vars:type_name -> v1.DispatchMessage.EnvVarsEntry
+	36, // 3: v1.SubmitJobRequest.env_vars:type_name -> v1.SubmitJobRequest.EnvVarsEntry
+	37, // 4: v1.SubmitDistributedJobRequest.env_vars:type_name -> v1.SubmitDistributedJobRequest.EnvVarsEntry
+	19, // 5: v1.ListReservationsResponse.reservations:type_name -> v1.ReservationInfo
+	38, // 6: v1.WorkerStatusResponse.worker_nodes:type_name -> v1.WorkerStatusResponse.WorkerNodesEntry
+	39, // 7: v1.WorkerStatusResponse.node_state:type_name -> v1.WorkerStatusResponse.NodeStateEntry
+	32, // 8: v1.ListJobsResponse.jobs:type_name -> v1.JobInfo
+	29, // 9: v1.WorkerStatusResponse.NodeStateEntry.value:type_name -> v1.NodeSchedulingState
+	10, // 10: v1.SchedulerService.SubmitJob:input_type -> v1.SubmitJobRequest
+	12, // 11: v1.SchedulerService.SubmitDistributedJob:input_type -> v1.SubmitDistributedJobRequest
+	21, // 12: v1.SchedulerService.CancelJob:input_type -> v1.CancelJobRequest
+	23, // 13: v1.SchedulerService.GetJobStatus:input_type -> v1.GetJobStatusRequest
+	25, // 14: v1.SchedulerService.StreamLogs:input_type -> v1.LogStreamRequest
+	27, // 15: v1.SchedulerService.WorkerStatus:input_type -> v1.WorkerStatusRequest
+	30, // 16: v1.SchedulerService.ListJobs:input_type -> v1.ListJobsRequest
+	33, // 17: v1.SchedulerService.ReportResult:input_type -> v1.ReportResultRequest
+	0,  // 18: v1.SchedulerService.ClusterStatus:input_type -> v1.ClusterStatusRequest
+	3,  // 19: v1.SchedulerService.CordonNode:input_type -> v1.CordonNodeRequest
+	14, // 20: v1.SchedulerService.CreateReservation:input_type -> v1.CreateReservationRequest
+	16, // 21: v1.SchedulerService.DeleteReservation:input_type -> v1.DeleteReservationRequest
+	18, // 22: v1.SchedulerService.ListReservations:input_type -> v1.ListReservationsRequest
+	5,  // 23: v1.SchedulerService.AcknowledgeStart:input_type -> v1.AcknowledgeStartRequest
+	7,  // 24: v1.SchedulerService.WatchDispatch:input_type -> v1.WatchDispatchRequest
+	11, // 25: v1.SchedulerService.SubmitJob:output_type -> v1.SubmitJobResponse
+	13, // 26: v1.SchedulerService.SubmitDistributedJob:output_type -> v1.SubmitDistributedJobResponse
+	22, // 27: v1.SchedulerService.CancelJob:output_type -> v1.CancelJobResponse
+	24, // 28: v1.SchedulerService.GetJobStatus:output_type -> v1.GetJobStatusResponse
+	26, // 29: v1.SchedulerService.StreamLogs:output_type -> v1.LogMessage
+	28, // 30: v1.SchedulerService.WorkerStatus:output_type -> v1.WorkerStatusResponse
+	31, // 31: v1.SchedulerService.ListJobs:output_type -> v1.ListJobsResponse
+	34, // 32: v1.SchedulerService.ReportResult:output_type -> v1.ReportResultResponse
+	1,  // 33: v1.SchedulerService.ClusterStatus:output_type -> v1.ClusterStatusResponse
+	4,  // 34: v1.SchedulerService.CordonNode:output_type -> v1.CordonNodeResponse
+	15, // 35: v1.SchedulerService.CreateReservation:output_type -> v1.CreateReservationResponse
+	17, // 36: v1.SchedulerService.DeleteReservation:output_type -> v1.DeleteReservationResponse
+	20, // 37: v1.SchedulerService.ListReservations:output_type -> v1.ListReservationsResponse
+	6,  // 38: v1.SchedulerService.AcknowledgeStart:output_type -> v1.AcknowledgeStartResponse
+	9,  // 39: v1.SchedulerService.WatchDispatch:output_type -> v1.DispatchMessage
+	25, // [25:40] is the sub-list for method output_type
+	10, // [10:25] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_scheduler_proto_init() }
@@ -2348,7 +2819,7 @@ func file_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_scheduler_proto_rawDesc), len(file_scheduler_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   33,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -346,3 +346,9 @@ func contains(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// PartitionByName returns a partition's configuration.
+func (p *Policy) PartitionByName(name string) (*config.PartitionConfig, bool) {
+	part, ok := p.partitionByName[name]
+	return part, ok
+}

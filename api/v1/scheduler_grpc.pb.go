@@ -29,6 +29,9 @@ const (
 	SchedulerService_ReportResult_FullMethodName         = "/v1.SchedulerService/ReportResult"
 	SchedulerService_ClusterStatus_FullMethodName        = "/v1.SchedulerService/ClusterStatus"
 	SchedulerService_CordonNode_FullMethodName           = "/v1.SchedulerService/CordonNode"
+	SchedulerService_CreateReservation_FullMethodName    = "/v1.SchedulerService/CreateReservation"
+	SchedulerService_DeleteReservation_FullMethodName    = "/v1.SchedulerService/DeleteReservation"
+	SchedulerService_ListReservations_FullMethodName     = "/v1.SchedulerService/ListReservations"
 	SchedulerService_AcknowledgeStart_FullMethodName     = "/v1.SchedulerService/AcknowledgeStart"
 	SchedulerService_WatchDispatch_FullMethodName        = "/v1.SchedulerService/WatchDispatch"
 )
@@ -64,6 +67,11 @@ type SchedulerServiceClient interface {
 	// were to kill the worker, which fails every job running on it, or to wait. Cordoning stops
 	// new dispatches while letting running jobs finish; draining additionally cancels them.
 	CordonNode(ctx context.Context, in *CordonNodeRequest, opts ...grpc.CallOption) (*CordonNodeResponse, error)
+	// Reservations. A cordon stops a node taking work now and stays until someone lifts it; a
+	// reservation says when the window is, so the scheduler drains the node on its own.
+	CreateReservation(ctx context.Context, in *CreateReservationRequest, opts ...grpc.CallOption) (*CreateReservationResponse, error)
+	DeleteReservation(ctx context.Context, in *DeleteReservationRequest, opts ...grpc.CallOption) (*DeleteReservationResponse, error)
+	ListReservations(ctx context.Context, in *ListReservationsRequest, opts ...grpc.CallOption) (*ListReservationsResponse, error)
 	// Worker confirms it has started a job.
 	//
 	// This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -199,6 +207,36 @@ func (c *schedulerServiceClient) CordonNode(ctx context.Context, in *CordonNodeR
 	return out, nil
 }
 
+func (c *schedulerServiceClient) CreateReservation(ctx context.Context, in *CreateReservationRequest, opts ...grpc.CallOption) (*CreateReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateReservationResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_CreateReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerServiceClient) DeleteReservation(ctx context.Context, in *DeleteReservationRequest, opts ...grpc.CallOption) (*DeleteReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteReservationResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_DeleteReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerServiceClient) ListReservations(ctx context.Context, in *ListReservationsRequest, opts ...grpc.CallOption) (*ListReservationsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListReservationsResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_ListReservations_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *schedulerServiceClient) AcknowledgeStart(ctx context.Context, in *AcknowledgeStartRequest, opts ...grpc.CallOption) (*AcknowledgeStartResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AcknowledgeStartResponse)
@@ -259,6 +297,11 @@ type SchedulerServiceServer interface {
 	// were to kill the worker, which fails every job running on it, or to wait. Cordoning stops
 	// new dispatches while letting running jobs finish; draining additionally cancels them.
 	CordonNode(context.Context, *CordonNodeRequest) (*CordonNodeResponse, error)
+	// Reservations. A cordon stops a node taking work now and stays until someone lifts it; a
+	// reservation says when the window is, so the scheduler drains the node on its own.
+	CreateReservation(context.Context, *CreateReservationRequest) (*CreateReservationResponse, error)
+	DeleteReservation(context.Context, *DeleteReservationRequest) (*DeleteReservationResponse, error)
+	ListReservations(context.Context, *ListReservationsRequest) (*ListReservationsResponse, error)
 	// Worker confirms it has started a job.
 	//
 	// This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -314,6 +357,15 @@ func (UnimplementedSchedulerServiceServer) ClusterStatus(context.Context, *Clust
 }
 func (UnimplementedSchedulerServiceServer) CordonNode(context.Context, *CordonNodeRequest) (*CordonNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CordonNode not implemented")
+}
+func (UnimplementedSchedulerServiceServer) CreateReservation(context.Context, *CreateReservationRequest) (*CreateReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateReservation not implemented")
+}
+func (UnimplementedSchedulerServiceServer) DeleteReservation(context.Context, *DeleteReservationRequest) (*DeleteReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteReservation not implemented")
+}
+func (UnimplementedSchedulerServiceServer) ListReservations(context.Context, *ListReservationsRequest) (*ListReservationsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListReservations not implemented")
 }
 func (UnimplementedSchedulerServiceServer) AcknowledgeStart(context.Context, *AcknowledgeStartRequest) (*AcknowledgeStartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeStart not implemented")
@@ -515,6 +567,60 @@ func _SchedulerService_CordonNode_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SchedulerService_CreateReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).CreateReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_CreateReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).CreateReservation(ctx, req.(*CreateReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SchedulerService_DeleteReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).DeleteReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_DeleteReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).DeleteReservation(ctx, req.(*DeleteReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SchedulerService_ListReservations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListReservationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).ListReservations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_ListReservations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).ListReservations(ctx, req.(*ListReservationsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SchedulerService_AcknowledgeStart_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AcknowledgeStartRequest)
 	if err := dec(in); err != nil {
@@ -586,6 +692,18 @@ var SchedulerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CordonNode",
 			Handler:    _SchedulerService_CordonNode_Handler,
+		},
+		{
+			MethodName: "CreateReservation",
+			Handler:    _SchedulerService_CreateReservation_Handler,
+		},
+		{
+			MethodName: "DeleteReservation",
+			Handler:    _SchedulerService_DeleteReservation_Handler,
+		},
+		{
+			MethodName: "ListReservations",
+			Handler:    _SchedulerService_ListReservations_Handler,
 		},
 		{
 			MethodName: "AcknowledgeStart",

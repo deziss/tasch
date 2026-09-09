@@ -11,7 +11,7 @@ import (
 )
 
 func newTestFSM() *FSM {
-	return NewFSM(scheduler.NewGlobalScheduler(), scheduler.NewFairshareCalculator(), NewCordons())
+	return NewFSM(scheduler.NewGlobalScheduler(), scheduler.NewFairshareCalculator(), NewCordons(), NewReservations())
 }
 
 func apply(t *testing.T, f *FSM, cmd *Command) interface{} {

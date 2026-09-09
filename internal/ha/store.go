@@ -34,6 +34,8 @@ type Store interface {
 	PruneTerminal(maxAge time.Duration) (int, error)
 	Cordon(node, reason string, at time.Time) error
 	Uncordon(node string) (bool, error)
+	AddReservation(r Reservation) error
+	RemoveReservation(id string) (bool, error)
 
 	// IsLeader reports whether this master may accept writes and run the scheduling loop.
 	IsLeader() bool
@@ -43,14 +45,16 @@ type Store interface {
 
 // Direct applies changes to the local scheduler with no replication.
 type Direct struct {
-	queue     *scheduler.GlobalScheduler
-	fairshare *scheduler.FairshareCalculator
-	cordons   *Cordons
+	queue        *scheduler.GlobalScheduler
+	fairshare    *scheduler.FairshareCalculator
+	cordons      *Cordons
+	reservations *Reservations
 }
 
 // NewDirect builds the single-master store.
-func NewDirect(queue *scheduler.GlobalScheduler, fairshare *scheduler.FairshareCalculator, cordons *Cordons) *Direct {
-	return &Direct{queue: queue, fairshare: fairshare, cordons: cordons}
+func NewDirect(queue *scheduler.GlobalScheduler, fairshare *scheduler.FairshareCalculator,
+	cordons *Cordons, reservations *Reservations) *Direct {
+	return &Direct{queue: queue, fairshare: fairshare, cordons: cordons, reservations: reservations}
 }
 
 func (d *Direct) Enqueue(job *scheduler.Job) error { return d.queue.Enqueue(job) }
@@ -124,6 +128,15 @@ func (d *Direct) Cordon(node, reason string, at time.Time) error {
 }
 
 func (d *Direct) Uncordon(node string) (bool, error) { return d.cordons.Clear(node), nil }
+
+func (d *Direct) AddReservation(r Reservation) error {
+	d.reservations.Add(r)
+	return nil
+}
+
+func (d *Direct) RemoveReservation(id string) (bool, error) {
+	return d.reservations.Remove(id), nil
+}
 
 // A single master is always the leader: there is nobody to defer to.
 func (d *Direct) IsLeader() bool     { return true }
@@ -275,6 +288,20 @@ func (r *Replicated) Uncordon(node string) (bool, error) {
 	}
 	was, _ := res.(bool)
 	return was, nil
+}
+
+func (r *Replicated) AddReservation(res Reservation) error {
+	_, err := r.node.Apply(&Command{Type: CmdAddReservation, Reservation: &res})
+	return err
+}
+
+func (r *Replicated) RemoveReservation(id string) (bool, error) {
+	res, err := r.node.Apply(&Command{Type: CmdRemoveReservation, ReservationID: id})
+	if err != nil {
+		return false, err
+	}
+	result, _ := res.(DispatchResult)
+	return result.OK, nil
 }
 
 func (r *Replicated) IsLeader() bool { return r.node.IsLeader() }

@@ -43,6 +43,7 @@ Get started:
 	rootCmd.AddCommand(stopCmd())
 	rootCmd.AddCommand(cli.NodesCmd(loadConfig))
 	rootCmd.AddCommand(cli.JobsCmd(loadConfig))
+	rootCmd.AddCommand(cli.ReserveCmd(loadConfig))
 	rootCmd.AddCommand(clusterCmd(loadConfig))
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(configCmd())

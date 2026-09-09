@@ -15,12 +15,13 @@ import (
 )
 
 var (
-	bucketJobs        = []byte("jobs")
-	bucketGroups      = []byte("groups")
-	bucketFairshare   = []byte("fairshare")
-	bucketDeadLetters = []byte("dead_letters")
-	bucketMeta        = []byte("meta")
-	bucketCordons     = []byte("cordons")
+	bucketJobs         = []byte("jobs")
+	bucketGroups       = []byte("groups")
+	bucketFairshare    = []byte("fairshare")
+	bucketDeadLetters  = []byte("dead_letters")
+	bucketMeta         = []byte("meta")
+	bucketCordons      = []byte("cordons")
+	bucketReservations = []byte("reservations")
 )
 
 // SchemaVersion is the on-disk format this build writes.
@@ -55,7 +56,7 @@ func Open(path string) (*Store, error) {
 
 	// Create buckets and establish the schema version.
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters, bucketMeta, bucketCordons} {
+		for _, b := range [][]byte{bucketJobs, bucketGroups, bucketFairshare, bucketDeadLetters, bucketMeta, bucketCordons, bucketReservations} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -337,6 +338,48 @@ func (s *Store) LoadCordons() (map[string][]byte, error) {
 		}
 		return b.ForEach(func(k, v []byte) error {
 			// Bolt's values are only valid for the life of the transaction.
+			data := make([]byte, len(v))
+			copy(data, v)
+			out[string(k)] = data
+			return nil
+		})
+	})
+	return out, err
+}
+
+// --- Reservations ---
+
+// SaveReservations persists the set of nodes held aside for a window of time.
+//
+// Like cordons, this is written whole rather than incrementally: the set is small, and a
+// rewrite cannot leave a partially updated view behind.
+func (s *Store) SaveReservations(entries map[string][]byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.DeleteBucket(bucketReservations); err != nil && !errors.Is(err, bolterrors.ErrBucketNotFound) {
+			return err
+		}
+		b, err := tx.CreateBucket(bucketReservations)
+		if err != nil {
+			return err
+		}
+		for id, data := range entries {
+			if err := b.Put([]byte(id), data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// LoadReservations reads the persisted reservation set.
+func (s *Store) LoadReservations() (map[string][]byte, error) {
+	out := make(map[string][]byte)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketReservations)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
 			data := make([]byte, len(v))
 			copy(data, v)
 			out[string(k)] = data

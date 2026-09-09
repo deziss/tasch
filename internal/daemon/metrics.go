@@ -54,6 +54,11 @@ var (
 		Help: "Total number of jobs killed due to walltime enforcement.",
 	})
 
+	preemptionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tasch_preemptions_total",
+		Help: "Total number of running jobs evicted to make room for higher-priority work.",
+	})
+
 	workerLostTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tasch_worker_lost_total",
 		Help: "Total number of worker node departures detected.",
@@ -159,6 +164,7 @@ func registerMetrics() {
 		jobDuration,
 		groupsPending,
 		walltimeKillsTotal,
+		preemptionsTotal,
 		workerLostTotal,
 		queueWaitDuration,
 		schedulingTickDuration,

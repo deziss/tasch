@@ -63,6 +63,33 @@ type Config struct {
 	// no per-group ceiling.
 	Partitions []PartitionConfig `yaml:"partitions"`
 	Accounts   []AccountConfig   `yaml:"accounts"`
+
+	// Preemption lets an urgent job take a busy node by evicting lower-priority work.
+	Preemption PreemptionConfig `yaml:"preemption"`
+}
+
+// PreemptionConfig controls whether an urgent job may evict running work to get a node.
+//
+// Without it, priority only decides the order jobs *start* in. Once the cluster is full, a job
+// submitted at the highest priority waits behind whatever bulk work happens to be running,
+// which can be hours — so "urgent" means nothing precisely when it matters. Preemption makes
+// priority mean something at a full cluster, at the cost of throwing away work in progress,
+// which is why it is off by default and hedged with the guards below.
+type PreemptionConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// PriorityMargin is how much higher-priority the incoming job must be. Preempting across a
+	// difference of one turns ordinary priority jitter into eviction churn; a margin makes
+	// preemption a statement about class of work rather than a tie-break.
+	PriorityMargin int `yaml:"priority_margin"`
+
+	// MinRuntimeSeconds protects work that has only just started. Without it a cluster under
+	// load can spend its time starting and killing the same jobs, making no progress at all.
+	MinRuntimeSeconds int `yaml:"min_runtime_seconds"`
+
+	// MaxVictimsPerJob bounds how much is thrown away to place one job. A job needing a whole
+	// large node could otherwise evict everything on it at once.
+	MaxVictimsPerJob int `yaml:"max_victims_per_job"`
 }
 
 // PartitionConfig is a named pool of nodes with its own admission rules.
@@ -97,6 +124,11 @@ type PartitionConfig struct {
 	// that never end, which is usually not what the ceiling was for.
 	MaxWalltimeSeconds     int `yaml:"max_walltime_seconds"`
 	DefaultWalltimeSeconds int `yaml:"default_walltime_seconds"`
+
+	// Preemptible allows jobs in this partition to be evicted for higher-priority work. It is a
+	// property of the partition rather than of the job on purpose: given the choice, every
+	// submitter would mark their own job unpreemptible, and the setting would mean nothing.
+	Preemptible bool `yaml:"preemptible"`
 
 	// AllowedUsers and AllowedAccounts restrict who may submit here. Empty means everyone.
 	AllowedUsers    []string `yaml:"allowed_users"`
@@ -367,6 +399,14 @@ func DefaultConfig() *Config {
 		// 3 MiB, comfortably under gRPC's 4 MiB default receive limit.
 		MaxOutputBytes: 3 << 20,
 		Gossip:         GossipConfig{Profile: "lan"},
+		Preemption: PreemptionConfig{
+			// Off, because it throws away work in progress. The numbers are the defaults that
+			// apply once it is switched on.
+			Enabled:           false,
+			PriorityMargin:    5,
+			MinRuntimeSeconds: 60,
+			MaxVictimsPerJob:  4,
+		},
 		Sandbox: SandboxConfig{
 			// "none" keeps an upgrade from changing what running jobs can reach. SETUP.md
 			// explains why a shared cluster should move to "private" or "strict".
@@ -534,6 +574,21 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPIDsPerJob < 0 {
 		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
+	}
+
+	if c.Preemption.Enabled {
+		for _, f := range []struct {
+			name  string
+			value int
+		}{
+			{"priority_margin", c.Preemption.PriorityMargin},
+			{"min_runtime_seconds", c.Preemption.MinRuntimeSeconds},
+			{"max_victims_per_job", c.Preemption.MaxVictimsPerJob},
+		} {
+			if f.value < 0 {
+				return fmt.Errorf("preemption.%s cannot be negative (got %d)", f.name, f.value)
+			}
+		}
 	}
 
 	if err := c.validatePartitions(); err != nil {

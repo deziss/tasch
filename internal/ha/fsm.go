@@ -80,17 +80,19 @@ func (c *Cordons) Restore(entries map[string]CordonEntry) {
 // already holds the queue, the running jobs, the groups, the fairshare accounting and the
 // cordons — no recovery step, and nothing lost that had been acknowledged to a client.
 type FSM struct {
-	queue     *scheduler.GlobalScheduler
-	fairshare *scheduler.FairshareCalculator
-	cordons   *Cordons
+	queue        *scheduler.GlobalScheduler
+	fairshare    *scheduler.FairshareCalculator
+	cordons      *Cordons
+	reservations *Reservations
 
 	// applied counts commands applied, for observability.
 	applied uint64
 }
 
 // NewFSM builds the state machine over an existing scheduler.
-func NewFSM(queue *scheduler.GlobalScheduler, fairshare *scheduler.FairshareCalculator, cordons *Cordons) *FSM {
-	return &FSM{queue: queue, fairshare: fairshare, cordons: cordons}
+func NewFSM(queue *scheduler.GlobalScheduler, fairshare *scheduler.FairshareCalculator,
+	cordons *Cordons, reservations *Reservations) *FSM {
+	return &FSM{queue: queue, fairshare: fairshare, cordons: cordons, reservations: reservations}
 }
 
 // Queue exposes the replicated scheduler for reads.
@@ -101,6 +103,9 @@ func (f *FSM) Fairshare() *scheduler.FairshareCalculator { return f.fairshare }
 
 // Cordons exposes the replicated cordon set for reads.
 func (f *FSM) Cordons() *Cordons { return f.cordons }
+
+// Reservations exposes the replicated reservation set for reads.
+func (f *FSM) Reservations() *Reservations { return f.reservations }
 
 // Applied reports how many commands this replica has applied.
 func (f *FSM) Applied() uint64 { return f.applied }
@@ -132,6 +137,16 @@ func (f *FSM) Apply(entry *raft.Log) interface{} {
 			return fmt.Errorf("enqueue command carries no job")
 		}
 		return f.queue.Enqueue(cmd.Job)
+
+	case CmdAddReservation:
+		if cmd.Reservation == nil {
+			return fmt.Errorf("add_reservation command carries no reservation")
+		}
+		f.reservations.Add(*cmd.Reservation)
+		return nil
+
+	case CmdRemoveReservation:
+		return DispatchResult{OK: f.reservations.Remove(cmd.ReservationID)}
 
 	case CmdEnqueueBatch:
 		if len(cmd.Jobs) == 0 {
@@ -223,6 +238,8 @@ type fsmSnapshot struct {
 	Groups    []*scheduler.JobGroup  `json:"groups"`
 	Fairshare map[string]float64     `json:"fairshare"`
 	Cordons   map[string]CordonEntry `json:"cordons"`
+	// Reservations is nil in snapshots taken before they existed; Restore treats that as none.
+	Reservations map[string]Reservation `json:"reservations,omitempty"`
 }
 
 // Snapshot captures the state so the log can be truncated and a new replica can catch up
@@ -233,6 +250,8 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		Groups:    f.queue.ListGroups(),
 		Fairshare: f.fairshare.Snapshot(),
 		Cordons:   f.cordons.Snapshot(),
+
+		Reservations: f.reservations.Snapshot(),
 	}, nil
 }
 
@@ -248,9 +267,11 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	f.queue.Reset(snap.Jobs, snap.Groups)
 	f.fairshare.Restore(snap.Fairshare)
 	f.cordons.Restore(snap.Cordons)
+	f.reservations.Restore(snap.Reservations)
 
 	slog.Info("restored replicated state from snapshot",
-		"jobs", len(snap.Jobs), "groups", len(snap.Groups), "cordoned_nodes", len(snap.Cordons))
+		"jobs", len(snap.Jobs), "groups", len(snap.Groups), "cordoned_nodes", len(snap.Cordons),
+		"reservations", len(snap.Reservations))
 	return nil
 }
 

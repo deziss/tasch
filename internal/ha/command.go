@@ -25,23 +25,25 @@ import (
 type CommandType string
 
 const (
-	CmdEnqueue        CommandType = "enqueue"
-	CmdDispatch       CommandType = "dispatch"
-	CmdComplete       CommandType = "complete"
-	CmdCancel         CommandType = "cancel"
-	CmdRequeue        CommandType = "requeue"
-	CmdRequeueRunning CommandType = "requeue_running"
-	CmdAdoptRunning   CommandType = "adopt_running"
-	CmdRegisterGroup  CommandType = "register_group"
-	CmdSetGroupState  CommandType = "set_group_state"
-	CmdRecordUsage    CommandType = "record_usage"
-	CmdDecayUsage     CommandType = "decay_usage"
-	CmdReprioritize   CommandType = "reprioritize"
-	CmdPruneTerminal  CommandType = "prune_terminal"
-	CmdEnqueueBatch   CommandType = "enqueue_batch"
-	CmdFailQueued     CommandType = "fail_queued"
-	CmdCordon         CommandType = "cordon"
-	CmdUncordon       CommandType = "uncordon"
+	CmdEnqueue           CommandType = "enqueue"
+	CmdDispatch          CommandType = "dispatch"
+	CmdComplete          CommandType = "complete"
+	CmdCancel            CommandType = "cancel"
+	CmdRequeue           CommandType = "requeue"
+	CmdRequeueRunning    CommandType = "requeue_running"
+	CmdAdoptRunning      CommandType = "adopt_running"
+	CmdRegisterGroup     CommandType = "register_group"
+	CmdSetGroupState     CommandType = "set_group_state"
+	CmdRecordUsage       CommandType = "record_usage"
+	CmdDecayUsage        CommandType = "decay_usage"
+	CmdReprioritize      CommandType = "reprioritize"
+	CmdPruneTerminal     CommandType = "prune_terminal"
+	CmdEnqueueBatch      CommandType = "enqueue_batch"
+	CmdAddReservation    CommandType = "add_reservation"
+	CmdRemoveReservation CommandType = "remove_reservation"
+	CmdFailQueued        CommandType = "fail_queued"
+	CmdCordon            CommandType = "cordon"
+	CmdUncordon          CommandType = "uncordon"
 )
 
 // Command is one entry in the replicated log.
@@ -88,6 +90,9 @@ type Command struct {
 
 	Reason string    `json:"reason,omitempty"`
 	At     time.Time `json:"at,omitempty"`
+
+	Reservation   *Reservation `json:"reservation,omitempty"`
+	ReservationID string       `json:"reservation_id,omitempty"`
 }
 
 // Encode serializes a command for the replicated log.

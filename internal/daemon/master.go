@@ -74,6 +74,9 @@ type schedulerServer struct {
 	// Nodes an operator has taken out of scheduling rotation.
 	cordons *ha.Cordons
 
+	// Nodes held aside for a window of time.
+	reservations *ha.Reservations
+
 	// policy resolves partitions and account quotas. It is never nil; with neither configured
 	// it admits everything, which is the behaviour that predates it.
 	policy *policy.Policy
@@ -1271,6 +1274,47 @@ func (s *schedulerServer) CordonNode(ctx context.Context, req *pb.CordonNodeRequ
 	}, nil
 }
 
+// persistReservations writes the reservation set so it survives a restart.
+//
+// Reservations describe planned work — a maintenance window agreed with the people who own the
+// machines. A master restart forgetting them would silently let jobs back onto nodes that are
+// about to be taken away.
+func (s *schedulerServer) persistReservations() {
+	if s.store == nil {
+		return
+	}
+	snapshot := s.reservations.Snapshot()
+	encoded := make(map[string][]byte, len(snapshot))
+	for id, r := range snapshot {
+		data, err := json.Marshal(r)
+		if err != nil {
+			slog.Error("could not encode reservation", "id", id, "error", err)
+			continue
+		}
+		encoded[id] = data
+	}
+	if err := s.store.SaveReservations(encoded); err != nil {
+		slog.Error("could not persist reservations", "error", err)
+	}
+}
+
+// expireReservations removes windows that have closed.
+//
+// Left behind they are only clutter, but the clutter is the kind that gets acted on: an
+// operator reading a months-old reservation has no way to tell it is spent.
+func (s *schedulerServer) expireReservations() {
+	expired := s.reservations.Expired(time.Now())
+	if len(expired) == 0 {
+		return
+	}
+	for _, id := range expired {
+		if ok, err := s.state.RemoveReservation(id); err == nil && ok {
+			slog.Info("reservation window closed", "reservation_id", id)
+		}
+	}
+	s.persistReservations()
+}
+
 // persistCordons writes the cordon set so it survives a restart.
 //
 // With HA on the replicated log is already durable, but a single master still needs this.
@@ -1387,6 +1431,18 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 		staleResultsTotal.Inc()
 		logging.Job(req.JobId).Warn("ignoring stale result from a superseded dispatch",
 			"reported_attempt", req.Attempt, "current_attempt", job.Attempt)
+		return &pb.ReportResultResponse{Acknowledged: true}, nil
+	}
+
+	// A result for a job that is no longer RUNNING belongs to a dispatch that has already been
+	// superseded — by a requeue after preemption or a lost worker, or by a cancel. The attempt
+	// fence above does not catch it: a requeue leaves the attempt unchanged, so the numbers
+	// still match. Applying it would overwrite the requeue and turn a job that was only
+	// delayed into a failed one, which is exactly what preemption promised not to do.
+	if job.State != scheduler.StateRunning {
+		staleResultsTotal.Inc()
+		logging.Job(req.JobId).Info("ignoring a result for a job that is no longer running",
+			"state", job.State, "worker", req.WorkerNode)
 		return &pb.ReportResultResponse{Acknowledged: true}, nil
 	}
 
@@ -1590,6 +1646,21 @@ func schedulingTick(srv *schedulerServer) {
 	if dispatchTopJob(srv, members, adm) {
 		return
 	}
+
+	// Nothing could be placed at the head. If the cluster is full of work this job outranks,
+	// make room — otherwise priority stops meaning anything at exactly the moment it matters.
+	// The eviction only frees resources; the next tick does the placing, so dispatch stays the
+	// responsibility of one path rather than two.
+	if srv.cfg.Preemption.Enabled {
+		if head := srv.queue.PeekRunnable(); head != nil {
+			if ok, _ := srv.policy.AdmitDispatch(head, adm.accounts, adm.partitions); ok {
+				if preemptFor(srv, head, members) {
+					return
+				}
+			}
+		}
+	}
+
 	backfillOntoIdleNodes(srv, members, adm)
 }
 
@@ -1781,6 +1852,14 @@ func canDispatchResources(srv *schedulerServer, member *memberlist.Node, job *sc
 		return false
 	}
 
+	// Reservations, which also cover the window *before* one opens: a job that could still be
+	// running when a maintenance window starts must not be placed on that node now. That is what
+	// drains the node in time without anyone having to cordon it early and waste the interval.
+	if ok, _ := srv.reservations.Admits(member.Name, job.User, job.Account,
+		job.WalltimeSeconds, time.Now()); !ok {
+		return false
+	}
+
 	var ad map[string]interface{}
 	if len(member.Meta) > 0 {
 		if err := json.Unmarshal(member.Meta, &ad); err != nil {
@@ -1903,6 +1982,8 @@ func maintenanceLoop(ctx context.Context, srv *schedulerServer) {
 			if !srv.state.IsLeader() {
 				continue
 			}
+			srv.expireReservations()
+
 			running := srv.queue.RunningJobs()
 			dropped, rebooked := srv.gpuTracker.Reconcile(running, func(node string) int {
 				_, total := nodeGPUInfo(srv, node)
@@ -2339,15 +2420,30 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		slog.Info("restored cordoned nodes", "count", len(restored))
 	}
 
+	reservations := ha.NewReservations()
+	if saved, err := db.LoadReservations(); err == nil && len(saved) > 0 {
+		restored := make(map[string]ha.Reservation, len(saved))
+		for id, data := range saved {
+			var r ha.Reservation
+			if err := json.Unmarshal(data, &r); err != nil {
+				slog.Warn("could not read persisted reservation", "id", id, "error", err)
+				continue
+			}
+			restored[id] = r
+		}
+		reservations.Restore(restored)
+		slog.Info("restored reservations", "count", len(restored))
+	}
+
 	// Either apply state changes locally, or replicate them across masters.
 	//
 	// With HA off this is exactly the previous single-master behaviour and costs nothing. With it
 	// on, every mutation goes through the replicated log so a surviving master can take over
 	// holding the same queue.
-	var stateStore ha.Store = ha.NewDirect(queue, fairshare, cordons)
+	var stateStore ha.Store = ha.NewDirect(queue, fairshare, cordons, reservations)
 	var raftNode *ha.Node
 	if cfg.HA.Enabled {
-		fsm := ha.NewFSM(queue, fairshare, cordons)
+		fsm := ha.NewFSM(queue, fairshare, cordons, reservations)
 		raftNode, err = ha.Start(ha.Config{
 			NodeID:    cfg.HA.NodeID,
 			BindAddr:  cfg.HA.BindAddr,
@@ -2432,11 +2528,26 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	srv := &schedulerServer{
 		disc: disc, queue: queue, eval: eval, bus: bus, fairshare: fairshare,
 		store: db, cfg: cfg, draining: draining, cb: cb, gpuTracker: gt,
-		cordons: cordons, state: stateStore, raftNode: raftNode, policy: pol,
+		cordons: cordons, state: stateStore, raftNode: raftNode, policy: pol, reservations: reservations,
 		dispatchPending: make(map[string]time.Time),
 		logStore:        make(map[string][]*pb.LogMessage), logChannels: make(map[string][]chan *pb.LogMessage),
 		adopted: make(map[string]bool),
 		ctx:     shutdownCtx,
+	}
+
+	if len(cfg.Partitions) > 0 || len(cfg.Accounts) > 0 {
+		slog.Info("scheduling policy active",
+			"partitions", len(cfg.Partitions), "accounts", len(cfg.Accounts))
+	}
+	// Preemption enabled with no preemptible partition acts on nothing, which looks from the
+	// outside exactly like preemption being broken. Say which of the two it is.
+	if cfg.Preemption.Enabled && !preemptionConfigured(cfg) {
+		slog.Warn("preemption is enabled but no partition is marked preemptible, so nothing " +
+			"can ever be evicted; set preemptible: true on a partition")
+	} else if cfg.Preemption.Enabled {
+		slog.Info("preemption active", "priority_margin", cfg.Preemption.PriorityMargin,
+			"min_runtime_seconds", cfg.Preemption.MinRuntimeSeconds,
+			"max_victims_per_job", cfg.Preemption.MaxVictimsPerJob)
 	}
 
 	httpServer := startHealthAndMetrics(srv, cfg)

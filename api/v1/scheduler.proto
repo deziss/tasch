@@ -42,6 +42,12 @@ service SchedulerService {
   // new dispatches while letting running jobs finish; draining additionally cancels them.
   rpc CordonNode (CordonNodeRequest) returns (CordonNodeResponse);
 
+  // Reservations. A cordon stops a node taking work now and stays until someone lifts it; a
+  // reservation says when the window is, so the scheduler drains the node on its own.
+  rpc CreateReservation (CreateReservationRequest) returns (CreateReservationResponse);
+  rpc DeleteReservation (DeleteReservationRequest) returns (DeleteReservationResponse);
+  rpc ListReservations (ListReservationsRequest) returns (ListReservationsResponse);
+
   // Worker confirms it has started a job.
   //
   // This replaces an unauthenticated HTTP POST to /acknowledge_start on the metrics port. That
@@ -199,6 +205,50 @@ message SubmitDistributedJobResponse {
   string group_id = 1;
   repeated string job_ids = 2;
   string status = 3;
+}
+
+// Reservations hold nodes aside for a window of time. Unlike a cordon they say *when*, so the
+// scheduler can drain a node by itself: it stops placing jobs that would still be running when
+// the window opens, and lets everything that fits run to completion.
+message CreateReservationRequest {
+  repeated string nodes = 1;
+  int64 start_time = 2;             // Unix seconds
+  int64 end_time = 3;
+  repeated string users = 4;        // Who may run here during the window
+  repeated string accounts = 5;
+  string reason = 6;                // Both users and accounts empty means nobody: maintenance
+}
+
+message CreateReservationResponse {
+  string reservation_id = 1;
+  string status = 2;
+}
+
+message DeleteReservationRequest {
+  string reservation_id = 1;
+}
+
+message DeleteReservationResponse {
+  string reservation_id = 1;
+  bool deleted = 2;
+}
+
+message ListReservationsRequest {}
+
+message ReservationInfo {
+  string reservation_id = 1;
+  repeated string nodes = 2;
+  int64 start_time = 3;
+  int64 end_time = 4;
+  repeated string users = 5;
+  repeated string accounts = 6;
+  string reason = 7;
+  string created_by = 8;
+  bool active = 9;                  // The window is open right now
+}
+
+message ListReservationsResponse {
+  repeated ReservationInfo reservations = 1;
 }
 
 message CancelJobRequest {

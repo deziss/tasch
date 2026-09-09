@@ -327,6 +327,79 @@ State:   QUEUED
 Blocked: account research would exceed its quota of 32 GPUs (30 in use, 4 needed)
 ```
 
+## Reservations
+
+A cordon stops a node taking work now and stays until someone lifts it. That is the wrong shape
+for planned work: cordon an hour before a maintenance window and you waste the hour; cordon at
+the start of it and whatever is still running gets killed.
+
+A reservation carries the window, so the scheduler drains the node itself.
+
+```
+tasch reserve create --nodes gpu-01,gpu-02 --start 2026-09-11T22:00:00Z --for 4h --reason firmware
+tasch reserve create --nodes gpu-03 --for 12h --account research --reason "paper deadline"
+tasch reserve list
+tasch reserve delete <id>
+```
+
+With neither `--user` nor `--account`, nobody may run during the window: that is a maintenance
+reservation. Naming users or accounts holds the nodes *for* them instead.
+
+Two rules apply, and the second is the one a cordon cannot express:
+
+1. While the window is open, only the people it was reserved for may run on those nodes.
+2. **Before** it opens, a job may only start if it will have finished by then. A job with no
+   walltime has no such guarantee, so it cannot start on a node with a reservation ahead of it.
+
+That second rule is what empties the node on time with nothing killed. It also means a cluster
+where nobody sets `--walltime` cannot drain: consider a partition `max_walltime_seconds` if you
+plan to use reservations.
+
+Reservations survive a master restart and, under HA, are replicated like everything else.
+Closed windows are cleaned up automatically.
+
+## Preemption
+
+Priority decides the order jobs start in. On a full cluster it decides nothing — a job
+submitted at the highest priority still waits behind whatever bulk work happens to be running,
+which can be hours. Preemption makes priority bind by evicting lower-priority work.
+
+```yaml
+preemption:
+  enabled: true
+  priority_margin: 5        # how much higher-priority the incoming job must be
+  min_runtime_seconds: 60   # never evict work younger than this
+  max_victims_per_job: 4    # cap what one placement throws away
+
+partitions:
+  - name: bulk
+    preemptible: true       # only jobs here can be evicted
+```
+
+It is off by default, because the cost is real: the evicted job's progress is discarded.
+
+**Evicted jobs are requeued, not failed.** They go back at their own priority with their retry
+budget intact, so preemption delays work rather than destroying it.
+
+Preemptibility is a property of the partition, not of the job. Given the choice, every submitter
+would mark their own work unpreemptible and the setting would mean nothing. A job in no
+partition is never preempted, so turning this on cannot surprise jobs that predate it.
+
+Three guards, each for a specific failure:
+
+- **`priority_margin`** stops ordinary priority jitter — including fairshare adjustments —
+  becoming eviction churn. It makes preemption a statement about class of work, not a tie-break.
+- **`min_runtime_seconds`** protects work that has just started. Without it a loaded cluster can
+  spend its time starting and killing the same jobs and make no progress at all.
+- **`max_victims_per_job`** bounds what one placement discards. A job wanting a whole large node
+  could otherwise evict everything on it at once.
+
+Gang jobs are excluded on both sides: a rank cannot be evicted without failing every other rank,
+and freeing room for one rank achieves nothing unless room appears for all of them at once.
+
+The `tasch_preemptions_total` metric counts evictions. A number that climbs steadily usually
+means the margin is too small or the cluster is simply short of capacity.
+
 ## Job Isolation
 
 Resource limits say how *much* a job may use. They say nothing about what it can *see*: with no

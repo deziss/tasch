@@ -107,7 +107,7 @@ tasch stop                     # graceful drain + shutdown
 | **Paginated listing** | `ListJobs` pages server-side; the CLI follows pages, and `--limit` bounds what it prints |
 | **CEL matchmaking** | `ad.gpu_count >= 2 && ad.gpu_vendor == "nvidia" && ad.os == "linux"` |
 | **Backfill scheduling** | Lower-priority jobs fill idle nodes while big jobs wait |
-| **Fairshare** | Heavy users get priority penalties (auto-decaying) |
+| **Fairshare** | Resource-weighted: a GPU-second bills far more than a CPU-second. Penalty tracks a user's *share* of recent usage, is recomputed on the queued backlog rather than frozen at submit, and decays with a configurable half-life (default 24h) |
 | **Walltime** | `--walltime=3600` kills jobs exceeding the limit |
 | **Worker loss detection** | Gossip detects node departure → running jobs marked FAILED |
 | **Resource reconciliation** | GPU/CPU/memory accounting is rebuilt from the live job set every 60s, so a missed release cannot permanently shrink a node |
@@ -207,6 +207,11 @@ auth:
 gossip:
   encryption_key: ""         # base64, 16/24/32 bytes: openssl rand -base64 32
   profile: lan               # lan | wan | local
+fairshare:
+  enabled: true
+  half_life_hours: 24        # how fast recorded usage ages out
+  max_penalty: 50            # how far a heavy user's jobs can be pushed back
+  gpu_second_weight: 32      # a GPU-second bills like 32 CPU-seconds
 client_token: ""             # this node's token; prefer TASCH_AUTH_TOKEN
 ```
 

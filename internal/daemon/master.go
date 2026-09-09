@@ -446,6 +446,9 @@ var (
 // reports the master unhealthy. The loop ticks once a second.
 const schedulerStallThreshold = 30 * time.Second
 
+// fairshareInterval is how often usage decays and queued jobs are reprioritised.
+const fairshareInterval = 60 * time.Second
+
 // Page sizing for list responses. The response used to carry every job in one message, which
 // is an unbounded allocation on the master and can exceed gRPC's receive limit outright.
 const (
@@ -566,7 +569,7 @@ func (s *schedulerServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReques
 		ID: jobID, Requirement: req.CelRequirement, Command: req.Command,
 		SubmitTime: time.Now(), Priority: effectivePriority, User: user,
 		WalltimeSeconds: int(req.WalltimeSeconds), GPUsRequired: int(req.GpusRequired),
-		CPUsRequired: cpus, MemoryRequiredMB: mem,
+		CPUsRequired: cpus, MemoryRequiredMB: mem, BasePriority: priority,
 		EnvVars: req.EnvVars, MaxRetries: s.cfg.MaxRetries,
 	}
 
@@ -631,7 +634,8 @@ func (s *schedulerServer) SubmitDistributedJob(ctx context.Context, req *pb.Subm
 			Command: req.Command, SubmitTime: time.Now(), Priority: priority,
 			User: user, WalltimeSeconds: int(req.WalltimeSeconds),
 			GPUsRequired: gpusPerNode, CPUsRequired: cpus, MemoryRequiredMB: mem,
-			EnvVars: envVars, MaxRetries: 0, // No retry for distributed
+			BasePriority: priority - penalty,
+			EnvVars:      envVars, MaxRetries: 0, // No retry for distributed
 		}
 		if err := s.queue.Enqueue(job); err != nil {
 			return nil, status.Errorf(codes.ResourceExhausted, "queue full: %v", err)
@@ -1077,7 +1081,8 @@ func (s *schedulerServer) ReportResult(ctx context.Context, req *pb.ReportResult
 	// Fairshare usage recording
 	dur := job.EndTime.Sub(job.StartTime).Seconds()
 	if dur > 0 {
-		s.fairshare.RecordUsage(job.User, dur)
+		// Bill by what the job held, not just how long it ran.
+		s.fairshare.RecordUsage(job.User, dur, job.CPUsRequired, job.GPUsRequired, job.MemoryRequiredMB)
 	}
 
 	// Job retry logic.
@@ -1778,6 +1783,18 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	queue := scheduler.NewGlobalScheduler()
 	queue.MaxQueueSize = cfg.MaxQueueSize
 	fairshare := scheduler.NewFairshareCalculator()
+	if cfg.Fairshare.Enabled {
+		fairshare.Weights = scheduler.FairshareWeights{
+			PerCPUSecond:    cfg.Fairshare.CPUSecondWeight,
+			PerGPUSecond:    cfg.Fairshare.GPUSecondWeight,
+			PerGBHourMemory: cfg.Fairshare.GBHourMemWeight,
+		}
+		fairshare.MaxPenalty = cfg.Fairshare.MaxPenalty
+	} else {
+		// Zero weights mean nothing accrues, so no job is ever penalised.
+		fairshare.Weights = scheduler.FairshareWeights{}
+		fairshare.MaxPenalty = 0
+	}
 
 	type dbWriteOp struct {
 		job   *scheduler.Job
@@ -1947,13 +1964,28 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 	go maintenanceLoop(shutdownCtx, srv)
 	go walltimeEnforcer(shutdownCtx, srv)
 	go dispatchTimeoutEnforcer(shutdownCtx, srv)
+	halfLife := time.Duration(cfg.Fairshare.HalfLifeHours * float64(time.Hour))
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
+		if !cfg.Fairshare.Enabled {
+			return
+		}
+		ticker := time.NewTicker(fairshareInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				fairshare.DecayUsage(0.95)
+				fairshare.DecayUsage(scheduler.DecayFactorFor(fairshareInterval, halfLife))
+
+				// Recompute the penalty on jobs already waiting. It used to be frozen in at
+				// submission, so a user who filled the queue and only then became the heaviest
+				// consumer kept their whole backlog at its original priority — precisely the
+				// case fairshare exists to handle.
+				if changed := queue.ReprioritizeQueued(func(job *scheduler.Job) int {
+					return fairshare.CalculatePenalty(job.User)
+				}); changed > 0 {
+					slog.Debug("fairshare reprioritised queued jobs", "count", changed)
+				}
+
 				if err := db.SaveFairshare(fairshare.Snapshot()); err != nil {
 					slog.Error("fairshare persist failed", "error", err)
 				}

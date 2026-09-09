@@ -13,16 +13,17 @@ import (
 
 // Config holds the Tasch node configuration written by `tasch setup`.
 type Config struct {
-	Role         string       `yaml:"role"` // master, worker, both
-	NodeName     string       `yaml:"node_name"`
-	MasterAddr   string       `yaml:"master_addr"` // IP/hostname of master node
-	Ports        PortConfig   `yaml:"ports"`
-	MaxQueueSize int          `yaml:"max_queue_size"` // 0 = unlimited
-	MaxRetries   int          `yaml:"max_retries"`    // default 3
-	DrainTimeout int          `yaml:"drain_timeout"`  // seconds, default 60
-	TLS          TLSConfig    `yaml:"tls"`
-	Auth         AuthConfig   `yaml:"auth"`
-	Gossip       GossipConfig `yaml:"gossip"`
+	Role         string          `yaml:"role"` // master, worker, both
+	NodeName     string          `yaml:"node_name"`
+	MasterAddr   string          `yaml:"master_addr"` // IP/hostname of master node
+	Ports        PortConfig      `yaml:"ports"`
+	MaxQueueSize int             `yaml:"max_queue_size"` // 0 = unlimited
+	MaxRetries   int             `yaml:"max_retries"`    // default 3
+	DrainTimeout int             `yaml:"drain_timeout"`  // seconds, default 60
+	TLS          TLSConfig       `yaml:"tls"`
+	Auth         AuthConfig      `yaml:"auth"`
+	Fairshare    FairshareConfig `yaml:"fairshare"`
+	Gossip       GossipConfig    `yaml:"gossip"`
 
 	// MetricsBind is the address the health/metrics server listens on. Defaults to all
 	// interfaces for backward compatibility; set 127.0.0.1 to keep it off the network.
@@ -47,6 +48,27 @@ type Config struct {
 	// ClientToken is the token this node presents when calling the master. Set it via
 	// TASCH_AUTH_TOKEN or client_token; it is what the CLI and the worker authenticate with.
 	ClientToken string `yaml:"client_token"`
+}
+
+// FairshareConfig tunes how past usage penalises a user's priority.
+type FairshareConfig struct {
+	// Enabled turns fairshare on. Off leaves every job at the priority it was submitted with.
+	Enabled bool `yaml:"enabled"`
+
+	// HalfLifeHours is how long it takes for recorded usage to decay by half. The old behaviour
+	// was a hardcoded factor giving a half-life of roughly thirteen minutes, short enough that a
+	// user could saturate the cluster all morning and carry no penalty by lunchtime.
+	HalfLifeHours float64 `yaml:"half_life_hours"`
+
+	// MaxPenalty bounds how far a heavy user's jobs can be pushed back.
+	MaxPenalty int `yaml:"max_penalty"`
+
+	// Billing weights. A GPU-second is charged far more than a CPU-second because accelerators
+	// are the scarce resource; without weighting, a job holding 64 GPUs accrued exactly as much
+	// usage as one running sleep.
+	CPUSecondWeight float64 `yaml:"cpu_second_weight"`
+	GPUSecondWeight float64 `yaml:"gpu_second_weight"`
+	GBHourMemWeight float64 `yaml:"gb_hour_memory_weight"`
 }
 
 // AuthConfig holds gRPC authentication settings.
@@ -125,6 +147,14 @@ func DefaultConfig() *Config {
 		// 3 MiB, comfortably under gRPC's 4 MiB default receive limit.
 		MaxOutputBytes: 3 << 20,
 		Gossip:         GossipConfig{Profile: "lan"},
+		Fairshare: FairshareConfig{
+			Enabled:         true,
+			HalfLifeHours:   24,
+			MaxPenalty:      50,
+			CPUSecondWeight: 1,
+			GPUSecondWeight: 32,
+			GBHourMemWeight: 0.25,
+		},
 		Ports: PortConfig{
 			Gossip:  7946,
 			GRPC:    50051,
@@ -256,6 +286,24 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPIDsPerJob < 0 {
 		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
+	}
+
+	if c.Fairshare.Enabled {
+		if c.Fairshare.HalfLifeHours <= 0 {
+			return fmt.Errorf("fairshare.half_life_hours must be positive (got %v)", c.Fairshare.HalfLifeHours)
+		}
+		if c.Fairshare.MaxPenalty < 0 {
+			return fmt.Errorf("fairshare.max_penalty cannot be negative (got %d)", c.Fairshare.MaxPenalty)
+		}
+		for name, w := range map[string]float64{
+			"cpu_second_weight":     c.Fairshare.CPUSecondWeight,
+			"gpu_second_weight":     c.Fairshare.GPUSecondWeight,
+			"gb_hour_memory_weight": c.Fairshare.GBHourMemWeight,
+		} {
+			if w < 0 {
+				return fmt.Errorf("fairshare.%s cannot be negative (got %v)", name, w)
+			}
+		}
 	}
 
 	switch c.Gossip.Profile {

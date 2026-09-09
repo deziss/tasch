@@ -51,6 +51,26 @@ source to the users of that service.
   configured drain instead of a hardcoded 15 seconds.
 - The dispatch handshake no longer depends on the worker guessing the master's metrics port.
 
+### Changed — fairshare
+
+Fairshare was advertised as a feature but barely functioned. Three defects, all fixed:
+
+- **Usage is now resource-weighted.** It was raw wall-clock seconds, so a job holding 64 GPUs
+  accrued exactly as much as one running `sleep`. A user could saturate every accelerator in the
+  cluster and be billed like an idle one. A GPU-second now costs 32 CPU-seconds by default, with
+  the weights configurable.
+- **The penalty tracks a user's share of recent usage**, not an absolute number of seconds. An
+  absolute figure produced no useful penalty on a small cluster and an overwhelming one on a
+  large busy cluster; a share means the same thing on both.
+- **Queued jobs are reprioritised.** The penalty was applied once at submission and frozen into
+  the job, so a user who filled the queue and only then became the heaviest consumer kept their
+  entire backlog at its original priority — precisely the case fairshare exists to handle.
+- The decay half-life is configurable and defaults to 24 hours. It was a hardcoded factor giving
+  a half-life of roughly thirteen minutes, short enough that a user could saturate the cluster
+  all morning and carry no penalty by lunchtime.
+- Accounts that decay to nothing are dropped, so a cluster that has seen many one-off users does
+  not accumulate entries forever.
+
 ### Added — API
 
 - **`ListJobs` is paginated.** It previously returned every job in one message: an unbounded

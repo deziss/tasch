@@ -28,8 +28,8 @@ func TestFairshareSnapshotUnderConcurrentUsage(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					fc.RecordUsage("alice", 1)
-					fc.RecordUsage("bob", 2)
+					fc.RecordUsage("alice", 1, 1, 0, 0)
+					fc.RecordUsage("bob", 2, 1, 0, 0)
 				}
 			}
 		}(i)
@@ -56,10 +56,10 @@ func TestFairshareSnapshotUnderConcurrentUsage(t *testing.T) {
 // later write cannot mutate a map that is mid-marshal.
 func TestFairshareSnapshotIsDetached(t *testing.T) {
 	fc := NewFairshareCalculator()
-	fc.RecordUsage("alice", 500)
+	fc.RecordUsage("alice", 500, 1, 0, 0)
 
 	snap := fc.Snapshot()
-	fc.RecordUsage("alice", 500)
+	fc.RecordUsage("alice", 500, 1, 0, 0)
 
 	if snap["alice"] != 500 {
 		t.Fatalf("snapshot mutated by a later write: alice = %v, want 500", snap["alice"])

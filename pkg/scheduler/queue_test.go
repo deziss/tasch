@@ -133,14 +133,29 @@ func TestFairshareCalculator(t *testing.T) {
 		t.Fatalf("Expected 0 penalty for unknown user, got %d", p)
 	}
 
-	fc.RecordUsage("alice", 250)
-	if p := fc.CalculatePenalty("alice"); p != 2 {
-		t.Fatalf("Expected penalty 2 for 250 units, got %d", p)
+	// The penalty is a user's share of recent usage, not an absolute count of seconds. An
+	// absolute figure meant the same workload produced no useful penalty on a small cluster and
+	// an overwhelming one on a large busy cluster; a share means the same thing on both.
+	fc.RecordUsage("alice", 300, 1, 0, 0)
+	fc.RecordUsage("bob", 100, 1, 0, 0)
+
+	alice := fc.CalculatePenalty("alice")
+	bob := fc.CalculatePenalty("bob")
+
+	if alice <= bob {
+		t.Fatalf("alice=%d bob=%d: the heavier user must carry the larger penalty", alice, bob)
+	}
+	if want := fc.MaxPenalty * 3 / 4; alice != want {
+		t.Fatalf("alice used 3/4 of the cluster, so expected penalty %d, got %d", want, alice)
 	}
 
+	// Decay applies uniformly, so it ages usage out without disturbing relative standing.
 	fc.DecayUsage(0.5)
-	if p := fc.CalculatePenalty("alice"); p != 1 {
-		t.Fatalf("Expected penalty 1 after 50%% decay, got %d", p)
+	if got := fc.CalculatePenalty("alice"); got != alice {
+		t.Fatalf("uniform decay changed alice's share: %d, want %d", got, alice)
+	}
+	if snap := fc.Snapshot(); snap["alice"] != 150 {
+		t.Fatalf("alice usage after 50%% decay = %v, want 150", snap["alice"])
 	}
 }
 

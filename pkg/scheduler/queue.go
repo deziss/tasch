@@ -3,6 +3,7 @@ package scheduler
 import (
 	"container/heap"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -49,6 +50,10 @@ type Job struct {
 
 	// Internal tracking for heap
 	index int
+
+	// BasePriority is the priority the submitter asked for, before any fairshare penalty. It is
+	// kept so the penalty can be recomputed while a job waits without compounding on itself.
+	BasePriority int `json:"base_priority,omitempty"`
 
 	// Attempt increments on every dispatch. It is the fencing token: a result carrying an
 	// older attempt belongs to a superseded dispatch and must be ignored, or a late report
@@ -545,27 +550,109 @@ func (gs *GlobalScheduler) SetGroupState(groupID, state string) {
 	}
 }
 
+// ReprioritizeQueued recomputes the priority of every queued job and restores heap order.
+//
+// The fairshare penalty was applied once, at submission, and frozen into the job. A user who
+// filled the queue and only then became the heaviest consumer kept their whole backlog at the
+// priority it was submitted with, so fairshare had no effect on exactly the case it exists for.
+//
+// penaltyFor receives a job and returns its new penalty; base priority is preserved separately
+// on the job so penalties do not compound across calls.
+func (gs *GlobalScheduler) ReprioritizeQueued(penaltyFor func(job *Job) int) int {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	changed := 0
+	for _, job := range gs.queue {
+		want := job.BasePriority + penaltyFor(job)
+		if want != job.Priority {
+			job.Priority = want
+			changed++
+		}
+	}
+	if changed > 0 {
+		// Priorities moved arbitrarily, so rebuild rather than sifting individual entries.
+		heap.Init(&gs.queue)
+	}
+	return changed
+}
+
 // --- Fairshare ---
 
+// FairshareWeights convert a job's resources into billable usage.
+//
+// Usage was previously raw wall-clock seconds, so a job holding 64 GPUs accrued exactly as much
+// as one holding a single CPU core. A user could saturate the cluster's accelerators and be
+// charged the same as someone running `sleep`. These weights are the equivalent of Slurm's TRES
+// billing: a GPU-second costs far more than a CPU-second because the GPU is what is scarce.
+type FairshareWeights struct {
+	PerCPUSecond    float64
+	PerGPUSecond    float64
+	PerGBHourMemory float64
+}
+
+// DefaultFairshareWeights charges a GPU-second like 32 CPU-seconds, reflecting how much scarcer
+// accelerators are on the clusters Tasch targets.
+func DefaultFairshareWeights() FairshareWeights {
+	return FairshareWeights{PerCPUSecond: 1, PerGPUSecond: 32, PerGBHourMemory: 0.25}
+}
+
 // FairshareCalculator assesses a user's priority penalty based on past usage.
+//
+// The penalty is derived from a user's *share* of recent cluster usage rather than an absolute
+// number of seconds. A share is scale-invariant: it means the same thing on a two-node cluster
+// and a two-hundred-node one, whereas the previous `seconds/100` produced no useful penalty at
+// all on a small cluster and an overwhelming one on a large busy cluster.
 type FairshareCalculator struct {
 	mu        sync.Mutex
 	UserUsage map[string]float64
+
+	// Weights and MaxPenalty are set once at construction.
+	Weights    FairshareWeights
+	MaxPenalty int
 }
 
 // NewFairshareCalculator creates a new calculator.
 func NewFairshareCalculator() *FairshareCalculator {
 	return &FairshareCalculator{
-		UserUsage: make(map[string]float64),
+		UserUsage:  make(map[string]float64),
+		Weights:    DefaultFairshareWeights(),
+		MaxPenalty: DefaultMaxFairsharePenalty,
 	}
 }
 
-// RecordUsage adds resource usage for a user.
-func (fc *FairshareCalculator) RecordUsage(user string, units float64) {
+// RecordUsage adds a completed job's billable usage to a user's account.
+//
+// seconds is the job's wall-clock duration; the remaining arguments are what it held for that
+// duration.
+func (fc *FairshareCalculator) RecordUsage(user string, seconds float64, cpus, gpus, memMB int) {
+	if seconds <= 0 {
+		return
+	}
+	w := fc.Weights
+
+	// A job that reserved nothing explicitly still consumed a machine, so bill it as one core
+	// rather than as free.
+	billableCPUs := float64(cpus)
+	if billableCPUs <= 0 {
+		billableCPUs = 1
+	}
+
+	units := seconds * billableCPUs * w.PerCPUSecond
+	units += seconds * float64(gpus) * w.PerGPUSecond
+	units += (seconds / 3600) * (float64(memMB) / 1024) * w.PerGBHourMemory
+
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.UserUsage[user] += units
 }
+
+// DefaultMaxFairsharePenalty bounds how much fairshare can add to a job's priority number.
+// Priority is "lower is better", so this is how far a heavy user's jobs can be pushed back.
+const DefaultMaxFairsharePenalty = 50
+
+// fairshareForgetThreshold is the usage below which an account is dropped entirely.
+const fairshareForgetThreshold = 0.001
 
 // Snapshot returns a copy of the usage map, safe to marshal from another goroutine.
 //
@@ -593,22 +680,61 @@ func (fc *FairshareCalculator) Restore(usage map[string]float64) {
 	}
 }
 
-// CalculatePenalty assigns a numerical penalty to base priority.
+// CalculatePenalty returns the priority penalty for a user, from 0 to MaxPenalty.
+//
+// The penalty scales with the user's share of total recent usage, so it reflects how much of
+// the cluster they have been taking relative to everyone else. When one user is alone on the
+// cluster their share is 1 and everyone gets the same penalty — which is correct, since
+// fairshare only orders users against each other.
 func (fc *FairshareCalculator) CalculatePenalty(user string) int {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+
 	usage, exists := fc.UserUsage[user]
-	if !exists {
+	if !exists || usage <= 0 {
 		return 0
 	}
-	return int(usage / 100)
+
+	var total float64
+	for _, u := range fc.UserUsage {
+		total += u
+	}
+	if total <= 0 {
+		return 0
+	}
+
+	maxPenalty := fc.MaxPenalty
+	if maxPenalty <= 0 {
+		maxPenalty = DefaultMaxFairsharePenalty
+	}
+	return int((usage / total) * float64(maxPenalty))
 }
 
-// DecayUsage reduces all user usage by a factor (called periodically).
+// DecayUsage reduces all usage by a factor, ageing out old activity.
 func (fc *FairshareCalculator) DecayUsage(factor float64) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
-	for user := range fc.UserUsage {
-		fc.UserUsage[user] *= factor
+	for user, usage := range fc.UserUsage {
+		decayed := usage * factor
+		// Drop accounts that have decayed to nothing, so a cluster that has seen many one-off
+		// users does not accumulate entries forever.
+		if decayed < fairshareForgetThreshold {
+			delete(fc.UserUsage, user)
+			continue
+		}
+		fc.UserUsage[user] = decayed
 	}
+}
+
+// DecayFactorFor returns the multiplier that halves usage over halfLife when applied once per
+// interval.
+//
+// Decay was previously a hardcoded 0.95 per minute, a half-life of about thirteen minutes. That
+// is far too short to be fairshare: a user could saturate the cluster all morning and carry no
+// penalty by lunchtime. A half-life measured in days is the norm.
+func DecayFactorFor(interval, halfLife time.Duration) float64 {
+	if halfLife <= 0 || interval <= 0 {
+		return 1
+	}
+	return math.Pow(0.5, interval.Seconds()/halfLife.Seconds())
 }

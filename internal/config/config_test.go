@@ -530,3 +530,62 @@ func TestAccountValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name:   "disabled needs nothing",
+			mutate: func(c *Config) { c.API.Enabled = false; c.API.Bind = "" },
+		},
+		{
+			name:   "loopback with an origin",
+			mutate: func(c *Config) { c.API.CORSOrigins = []string{"http://localhost:5173"} },
+		},
+		{
+			name:    "no bind address",
+			mutate:  func(c *Config) { c.API.Bind = "" },
+			wantErr: "api.bind is required",
+		},
+		{
+			name:    "bind without a port",
+			mutate:  func(c *Config) { c.API.Bind = "127.0.0.1" },
+			wantErr: "must be host:port",
+		},
+		{
+			// This endpoint accepts job submissions, so a wildcard origin means any page the
+			// user visits can run commands on the cluster with their token.
+			name:    "wildcard origin",
+			mutate:  func(c *Config) { c.API.CORSOrigins = []string{"*"} },
+			wantErr: "cannot be",
+		},
+		{
+			name:    "bare hostname is not an origin",
+			mutate:  func(c *Config) { c.API.CORSOrigins = []string{"tasch.example.com"} },
+			wantErr: "must be full origins",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.NodeName = "n1"
+			cfg.API.Enabled = true
+			tc.mutate(cfg)
+
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

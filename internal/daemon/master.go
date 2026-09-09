@@ -2608,6 +2608,10 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	authenticator.OnFailure = func(reason string) { authFailuresTotal.WithLabelValues(reason).Inc() }
+
+	// The HTTP API serves the same service to browsers and to anything preferring JSON. It is
+	// started after the authenticator exists, because it enforces exactly the same tokens.
+	apiServer := startHTTPAPI(srv, cfg, authenticator)
 	if !authenticator.Enabled() {
 		slog.Warn("authentication is disabled: any host that can reach the gRPC port can run "+
 			"arbitrary commands on every worker; set auth.enabled in the config",
@@ -2733,6 +2737,13 @@ func StartMaster(cfg *config.Config) (*MasterHandle, error) {
 				slog.Error("health/metrics server shutdown", "error", err)
 			}
 			cancelHTTP()
+			if apiServer != nil {
+				shutdownAPI, cancelAPI := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := apiServer.Shutdown(shutdownAPI); err != nil {
+					slog.Error("http api server shutdown", "error", err)
+				}
+				cancelAPI()
+			}
 			bus.Close()
 			_ = disc.Shutdown()
 			cleanDB()

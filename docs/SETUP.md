@@ -151,6 +151,46 @@ sudo systemctl enable --now tasch
 | 9090 | TCP | Health checks + Prometheus metrics |
 | 8300 | TCP | Raft replication between masters (HA only, configurable) |
 
+## HTTP API
+
+A browser cannot speak gRPC — it has no way to produce the trailers and framing the protocol
+needs — so nothing could talk to Tasch from a web page. The HTTP API fixes that, and gives
+anything that would rather send JSON a way in.
+
+```yaml
+api:
+  enabled: true
+  bind: 127.0.0.1:8080
+  cors_origins: ["http://localhost:5173"]   # exact origins; "*" is refused
+  tls: false                                 # reuses the tls: block when true
+```
+
+It uses [Connect](https://connectrpc.com), which serves the Connect protocol (JSON over a plain
+HTTP POST), gRPC-Web and gRPC from a single handler — all from the same service definition the
+CLI and workers use. There is no second API to keep in step with the first, and no path with
+weaker rules: every method calls the identical handler the gRPC server calls, so ownership
+checks, quotas and leader redirects apply exactly as they do over gRPC.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1.SchedulerService/SubmitJob   -H 'Content-Type: application/json'   -H 'Authorization: Bearer <token>'   -d '{"celRequirement":"ad.gpu_count > 0","command":"./train.sh","gpusRequired":1}'
+```
+
+Three things to know before exposing it:
+
+- **Authentication is the same token.** The `Authorization: Bearer` header replaces gRPC
+  metadata; the principal list, roles and per-job ownership rules are unchanged.
+- **`cors_origins` must be exact origins, and `"*"` is refused at config load.** This endpoint
+  accepts job submissions, so a wildcard would let any page a user visits run commands on the
+  cluster with a token they granted to something else.
+- **It defaults to loopback.** Bound anywhere else without `tls: true` — or without a proxy
+  terminating TLS — tokens and job commands travel in cleartext, and the master says so at
+  startup.
+
+`WatchDispatch` is deliberately not served here. Workers receive work over gRPC with a client
+certificate; putting the dispatch channel on the browser-facing endpoint would widen a leaked
+user token from "can submit jobs" to "can read every node's work, environment variables
+included".
+
 ## GPU Detection
 
 | Platform | GPU Vendors Detected | Detection Method |

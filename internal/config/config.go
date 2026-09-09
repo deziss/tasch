@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -66,6 +67,37 @@ type Config struct {
 
 	// Preemption lets an urgent job take a busy node by evicting lower-priority work.
 	Preemption PreemptionConfig `yaml:"preemption"`
+
+	// API serves the same scheduler service over HTTP, for browsers and for anything that
+	// would rather send JSON than speak gRPC.
+	API APIConfig `yaml:"api"`
+}
+
+// APIConfig serves the scheduler API over HTTP as well as gRPC.
+//
+// A browser cannot speak gRPC: it has no way to set the trailers and framing the protocol
+// requires. Nothing could talk to Tasch from a web page, which is why there was no web UI to
+// have. This endpoint uses Connect, which serves gRPC, gRPC-Web and plain JSON-over-HTTP from
+// one handler — so the browser gets a transport it can use, curl gets JSON, and existing gRPC
+// clients keep working against the same service definition. There is no second API to keep in
+// step with the first.
+type APIConfig struct {
+	// Enabled turns the HTTP endpoint on. Off by default: it is another listener, and a cluster
+	// that only runs the CLI has no use for it.
+	Enabled bool `yaml:"enabled"`
+
+	// Bind is the address to listen on. It defaults to loopback rather than every interface,
+	// because this endpoint accepts the same job submissions the gRPC port does.
+	Bind string `yaml:"bind"`
+
+	// CORSOrigins are the web origins allowed to call this API from a browser. Empty allows
+	// none, which is the right default: a browser page on any origin could otherwise submit
+	// jobs using a token the user had already granted to a different site.
+	CORSOrigins []string `yaml:"cors_origins"`
+
+	// TLS reuses the main TLS settings when set; otherwise the endpoint is plaintext and must
+	// be kept on loopback or behind a reverse proxy that terminates TLS.
+	TLS bool `yaml:"tls"`
 }
 
 // PreemptionConfig controls whether an urgent job may evict running work to get a node.
@@ -399,6 +431,10 @@ func DefaultConfig() *Config {
 		// 3 MiB, comfortably under gRPC's 4 MiB default receive limit.
 		MaxOutputBytes: 3 << 20,
 		Gossip:         GossipConfig{Profile: "lan"},
+		API: APIConfig{
+			Enabled: false,
+			Bind:    "127.0.0.1:8080",
+		},
 		Preemption: PreemptionConfig{
 			// Off, because it throws away work in progress. The numbers are the defaults that
 			// apply once it is switched on.
@@ -574,6 +610,26 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPIDsPerJob < 0 {
 		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
+	}
+
+	if c.API.Enabled {
+		if c.API.Bind == "" {
+			return fmt.Errorf("api.bind is required when the HTTP API is enabled")
+		}
+		if _, _, err := net.SplitHostPort(c.API.Bind); err != nil {
+			return fmt.Errorf("api.bind must be host:port (got %q): %w", c.API.Bind, err)
+		}
+		for _, origin := range c.API.CORSOrigins {
+			if origin == "*" {
+				return fmt.Errorf("api.cors_origins cannot be \"*\": this endpoint accepts job " +
+					"submissions, so allowing every origin lets any page a user visits run " +
+					"commands on the cluster with their token")
+			}
+			if !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
+				return fmt.Errorf("api.cors_origins entries must be full origins like "+
+					"https://tasch.example.com (got %q)", origin)
+			}
+		}
 	}
 
 	if c.Preemption.Enabled {

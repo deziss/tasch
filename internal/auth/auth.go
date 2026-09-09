@@ -249,3 +249,44 @@ func (c TokenCredentials) GetRequestMetadata(ctx context.Context, uri ...string)
 
 // RequireTransportSecurity implements credentials.PerRPCCredentials.
 func (c TokenCredentials) RequireTransportSecurity() bool { return !c.Insecure }
+
+// --- HTTP transport ---
+//
+// The gRPC interceptors above read the token from gRPC metadata, which a browser cannot
+// produce. The Connect endpoint carries the same token in a plain Authorization header, so
+// these expose the identical checks — one authenticator, one principal list, one set of role
+// rules — rather than a second authentication path that could drift from the first.
+
+// PrincipalForHeader resolves an Authorization header value and checks the principal may call
+// the named method. The method is in gRPC form ("/v1.SchedulerService/SubmitJob"), which is
+// what Connect reports too.
+func (a *Authenticator) PrincipalForHeader(header, method string) (*Principal, error) {
+	if !a.enabled {
+		return Anonymous, nil
+	}
+
+	token := strings.TrimSpace(header)
+	token = strings.TrimPrefix(token, "Bearer ")
+	token = strings.TrimPrefix(token, "bearer ")
+	if token == "" {
+		a.reportFailure("missing_token")
+		return nil, status.Error(codes.Unauthenticated, "missing authorization token")
+	}
+
+	p, ok := a.authenticate(token)
+	if !ok {
+		a.reportFailure("invalid_token")
+		return nil, status.Error(codes.Unauthenticated, "invalid authorization token")
+	}
+	if err := authorizeMethod(p, method); err != nil {
+		a.reportFailure("forbidden_method")
+		return nil, err
+	}
+	return p, nil
+}
+
+// WithPrincipal attaches a principal to a context, so handlers reached over HTTP see the same
+// identity the gRPC interceptors would have put there.
+func WithPrincipal(ctx context.Context, p *Principal) context.Context {
+	return context.WithValue(ctx, principalKey{}, p)
+}

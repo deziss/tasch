@@ -18,9 +18,11 @@ const processGroupGrace = 10 * time.Second
 // As on Unix, cancelling must reap the job's descendants and not just the `cmd.exe` wrapper,
 // or a backgrounded process survives a walltime kill and keeps holding its GPU. Windows has no
 // process groups to signal, so the tree is torn down with `taskkill /T`.
-// cg is unused on Windows, which has no cgroup equivalent; see cgroup_other.go.
-func prepareCommand(ctx context.Context, cmdStr string, cg *jobCgroup) *exec.Cmd {
+// cg and sb are unused on Windows, which has neither cgroups nor namespaces; see
+// cgroup_other.go and sandbox_other.go.
+func prepareCommand(ctx context.Context, cmdStr string, env []string, cg *jobCgroup, sb *sandbox) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "cmd.exe", "/d", "/c", cmdStr)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: true,
 		// A new process group keeps the job's console signals from reaching the daemon.
@@ -42,5 +44,5 @@ func prepareCommand(ctx context.Context, cmdStr string, cg *jobCgroup) *exec.Cmd
 	}
 	cmd.WaitDelay = processGroupGrace + 2*time.Second
 
-	return cmd
+	return cmd, nil
 }

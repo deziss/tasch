@@ -53,6 +53,114 @@ type Config struct {
 	// ClientToken is the token this node presents when calling the master. Set it via
 	// TASCH_AUTH_TOKEN or client_token; it is what the CLI and the worker authenticate with.
 	ClientToken string `yaml:"client_token"`
+
+	// Sandbox confines what a job can see and touch on the worker.
+	Sandbox SandboxConfig `yaml:"sandbox"`
+}
+
+// SandboxConfig controls job isolation on the worker.
+//
+// cgroups already cap how much CPU, memory and how many processes a job may use, but a job
+// still ran as the service account with the account's whole filesystem, its process table and
+// its IPC namespace in reach. One job could read another's scratch files, signal another's
+// processes, or read the daemon's own token and TLS key. This closes that.
+//
+// Mode is the one setting that matters:
+//
+//   - "none"    — no namespaces. What Tasch did before this existed, and still the default so
+//     an upgrade does not silently change what a running job can reach.
+//   - "private" — mount, PID, IPC and UTS namespaces. The job gets its own /tmp, /dev/shm and
+//     process table, and the home directory of the account is masked. The rest of the
+//     filesystem stays visible and writable, so shared data paths keep working. This is the
+//     cheapest setting that stops jobs interfering with each other.
+//   - "strict"  — "private" plus a pivot_root into a rootfs assembled from read-only binds.
+//     The job sees only ReadOnlyPaths (the system directories), the paths in WritablePaths,
+//     and its own scratch directory. Nothing else on the host exists as far as it is
+//     concerned. This is the setting that makes an untrusted job safe to run.
+type SandboxConfig struct {
+	Mode string `yaml:"mode"`
+
+	// Network is "host" (default) or "none". "none" puts the job in an empty network
+	// namespace with only loopback, which stops it reaching the cluster's own ports — but also
+	// stops it fetching packages or datasets, and breaks multi-node distributed jobs.
+	Network string `yaml:"network"`
+
+	// ScratchDir is where per-job working directories are created on the host. Each job gets
+	// its own, removed when the job ends.
+	ScratchDir string `yaml:"scratch_dir"`
+
+	// ReadOnlyPaths are host directories bind-mounted read-only into a strict sandbox. They are
+	// what makes an interpreter and its libraries available. Missing paths are skipped.
+	ReadOnlyPaths []string `yaml:"readonly_paths"`
+
+	// WritablePaths are host directories bind-mounted read-write at the same path in both
+	// private and strict mode — shared datasets, model caches, network storage.
+	WritablePaths []string `yaml:"writable_paths"`
+
+	// MaskedPaths are covered with an empty read-only tmpfs so their contents cannot be read.
+	// In private mode this is how the service account's home and Tasch's own state directory
+	// are kept away from jobs.
+	MaskedPaths []string `yaml:"masked_paths"`
+
+	// TmpfsSizeMB bounds the job's private /tmp and /dev/shm. Without a bound, tmpfs is charged
+	// to the cgroup's memory limit, so a job filling /tmp is killed rather than filling the
+	// host disk — but an explicit size gives a clearer error.
+	TmpfsSizeMB int `yaml:"tmpfs_size_mb"`
+
+	// Hostname the job sees. Jobs that log their hostname otherwise leak the node's name.
+	Hostname string `yaml:"hostname"`
+
+	// AllowNewPrivileges leaves setuid binaries and file capabilities working inside the
+	// sandbox. Off by default: with no_new_privs set, a job cannot regain privilege through
+	// sudo or a setuid helper even if one is reachable.
+	AllowNewPrivileges bool `yaml:"allow_new_privileges"`
+
+	// GPUDevices exposes /dev/nvidia*, /dev/dri and friends to jobs that requested a GPU.
+	// Strict mode builds its own /dev, so without this a GPU job finds no device to open.
+	// Defaults to true; there is no reason to schedule a GPU job that cannot use the GPU.
+	GPUDevices *bool `yaml:"gpu_devices"`
+}
+
+// SandboxMode* are the values SandboxConfig.Mode accepts.
+const (
+	SandboxNone    = "none"
+	SandboxPrivate = "private"
+	SandboxStrict  = "strict"
+)
+
+// defaultReadOnlyPaths are the host directories a strict sandbox needs for a shell, an
+// interpreter and its shared libraries to load. Anything absent is skipped, so the same list
+// works on a merged-/usr distribution and an older split one.
+var defaultReadOnlyPaths = []string{
+	"/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32", "/etc", "/opt",
+}
+
+// WantsGPUDevices reports whether GPU device nodes should be exposed, defaulting to true.
+func (s SandboxConfig) WantsGPUDevices() bool {
+	return s.GPUDevices == nil || *s.GPUDevices
+}
+
+// ResolvedReadOnlyPaths returns the configured read-only paths, or the built-in list.
+func (s SandboxConfig) ResolvedReadOnlyPaths() []string {
+	if len(s.ReadOnlyPaths) > 0 {
+		return s.ReadOnlyPaths
+	}
+	return defaultReadOnlyPaths
+}
+
+// ResolvedScratchDir returns where per-job working directories are created.
+func (s SandboxConfig) ResolvedScratchDir() string {
+	if s.ScratchDir != "" {
+		return s.ScratchDir
+	}
+	if info, err := os.Stat("/var/lib/tasch"); err == nil && info.IsDir() {
+		return "/var/lib/tasch/scratch"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "tasch-scratch")
+	}
+	return filepath.Join(home, ".tasch", "scratch")
 }
 
 // HAConfig configures running several masters with automatic failover.
@@ -187,6 +295,14 @@ func DefaultConfig() *Config {
 		// 3 MiB, comfortably under gRPC's 4 MiB default receive limit.
 		MaxOutputBytes: 3 << 20,
 		Gossip:         GossipConfig{Profile: "lan"},
+		Sandbox: SandboxConfig{
+			// "none" keeps an upgrade from changing what running jobs can reach. SETUP.md
+			// explains why a shared cluster should move to "private" or "strict".
+			Mode:        SandboxNone,
+			Network:     "host",
+			TmpfsSizeMB: 512,
+			Hostname:    "tasch-job",
+		},
 		Fairshare: FairshareConfig{
 			Enabled:         true,
 			HalfLifeHours:   24,
@@ -346,6 +462,27 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPIDsPerJob < 0 {
 		return fmt.Errorf("max_pids_per_job cannot be negative (got %d)", c.MaxPIDsPerJob)
+	}
+
+	switch c.Sandbox.Mode {
+	case "", SandboxNone, SandboxPrivate, SandboxStrict:
+	default:
+		return fmt.Errorf("sandbox.mode must be %q, %q or %q (got %q)",
+			SandboxNone, SandboxPrivate, SandboxStrict, c.Sandbox.Mode)
+	}
+	switch c.Sandbox.Network {
+	case "", "host", "none":
+	default:
+		return fmt.Errorf("sandbox.network must be \"host\" or \"none\" (got %q)", c.Sandbox.Network)
+	}
+	if c.Sandbox.TmpfsSizeMB < 0 {
+		return fmt.Errorf("sandbox.tmpfs_size_mb cannot be negative (got %d)", c.Sandbox.TmpfsSizeMB)
+	}
+	for _, p := range append(append([]string{}, c.Sandbox.ReadOnlyPaths...),
+		append(append([]string{}, c.Sandbox.WritablePaths...), c.Sandbox.MaskedPaths...)...) {
+		if !filepath.IsAbs(p) {
+			return fmt.Errorf("sandbox paths must be absolute (got %q)", p)
+		}
 	}
 
 	if c.Fairshare.Enabled {

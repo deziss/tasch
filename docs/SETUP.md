@@ -248,6 +248,61 @@ look for that line rather than assuming limits apply.
 GPUs are not covered: cgroup v2 has no GPU controller, so the injected `CUDA_VISIBLE_DEVICES`
 remains advisory and a job can unset it.
 
+## Job Isolation
+
+Resource limits say how *much* a job may use. They say nothing about what it can *see*: with no
+sandbox, a job runs as the service account with that account's whole filesystem readable,
+including Tasch's own auth token and TLS key, every other job's scratch files, a shared `/tmp`,
+and a process table it can signal at will.
+
+`sandbox.mode` closes that using Linux namespaces. It is `none` by default, because turning it
+on changes what a job can reach and an upgrade should not do that silently.
+
+```yaml
+sandbox:
+  mode: private          # none | private | strict
+  network: host          # host | none
+  scratch_dir: /var/lib/tasch/scratch
+  tmpfs_size_mb: 512
+  hostname: tasch-job
+
+  # strict only: what to map in from the host
+  readonly_paths: [/usr, /bin, /sbin, /lib, /lib64, /etc, /opt]
+  writable_paths: [/mnt/datasets, /mnt/model-cache]
+
+  # private only: extra paths to hide
+  masked_paths: [/home/shared]
+```
+
+**`private`** gives each job its own mount, PID, IPC and UTS namespaces. The job gets a private
+`/tmp` and `/dev/shm`, a process table holding only its own processes, and a working directory
+of its own under `scratch_dir`. The service account's home, `/etc/tasch`, `/var/lib/tasch` and
+`/sys/fs/cgroup` are masked. The rest of the filesystem stays visible and writable, so shared
+data paths keep working with no further configuration. This is the setting to reach for first.
+
+**`strict`** adds a `pivot_root` into a rootfs assembled from read-only bind mounts. The job
+sees `readonly_paths`, `writable_paths`, a minimal `/dev`, a private `/proc`, a private `/tmp`,
+and its own writable `/workspace` — and nothing else. A job's `pwd` is `/workspace`; what it
+writes there lands in `scratch_dir/job-<id>` on the host and is removed when the job ends.
+
+Neither mode needs root. On an unprivileged worker the sandbox is built inside a user namespace
+with the account's uid mapped to 0, so jobs report `uid=0(root)`: that is the mapping, not a
+privilege. Outside the namespace the job has exactly the rights the service account always had.
+Some distributions gate this; if `kernel.unprivileged_userns_clone` is 0, the worker says so at
+startup and names the sysctl.
+
+Two behaviours worth knowing before you turn this on:
+
+- **It fails closed.** If a mode is configured and the sandbox cannot be built, the job is
+  failed with the reason, not run unconfined.
+- **GPU device nodes follow the pinning.** `strict` builds its own `/dev`, so `/dev/nvidia*`,
+  `/dev/dri` and `/dev/kfd` are mapped in only for jobs the master pinned devices to. Set
+  `sandbox.gpu_devices: false` to withhold them entirely.
+
+`sandbox.network: none` puts the job in an empty network namespace with only loopback, which
+stops it reaching the cluster's own ports — and also stops it fetching packages or datasets, and
+breaks multi-node distributed jobs. Leave it at `host` unless you need it.
+
 ## Persistence
 
 Jobs and state are persisted to `~/.tasch/tasch.db` (BoltDB). On master restart:

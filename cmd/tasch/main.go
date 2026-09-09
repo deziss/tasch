@@ -46,6 +46,7 @@ Get started:
 	rootCmd.AddCommand(clusterCmd(loadConfig))
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(configCmd())
+	rootCmd.AddCommand(sandboxInitCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -214,6 +215,22 @@ func stopCmd() *cobra.Command {
 			if err := daemon.StopDaemon(cfg.DrainTimeout + 15); err != nil {
 				log.Fatalf("%v", err)
 			}
+		},
+	}
+}
+
+// --- sandbox-init ---
+
+// sandboxInitCmd is how the worker re-enters this binary inside a job's new namespaces. It is
+// hidden because it is not a user-facing command: it reads its plan from the environment the
+// worker set, and does nothing useful anywhere else.
+func sandboxInitCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "sandbox-init",
+		Hidden: true,
+		Short:  "Internal: run a job inside its sandbox",
+		Run: func(cmd *cobra.Command, args []string) {
+			daemon.SandboxInit()
 		},
 	}
 }

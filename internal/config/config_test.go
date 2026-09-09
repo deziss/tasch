@@ -317,3 +317,103 @@ func TestHARequiresSelfInPeers(t *testing.T) {
 		t.Fatal("a master missing from its own peer list was accepted")
 	}
 }
+
+func TestSandboxValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name:   "default is off and valid",
+			mutate: func(c *Config) {},
+		},
+		{
+			name:   "private mode",
+			mutate: func(c *Config) { c.Sandbox.Mode = SandboxPrivate },
+		},
+		{
+			name:    "unknown mode is rejected rather than silently ignored",
+			mutate:  func(c *Config) { c.Sandbox.Mode = "container" },
+			wantErr: "sandbox.mode must be",
+		},
+		{
+			name:    "unknown network is rejected",
+			mutate:  func(c *Config) { c.Sandbox.Network = "bridge" },
+			wantErr: "sandbox.network must be",
+		},
+		{
+			name:    "negative tmpfs size",
+			mutate:  func(c *Config) { c.Sandbox.TmpfsSizeMB = -1 },
+			wantErr: "tmpfs_size_mb cannot be negative",
+		},
+		{
+			name: "relative bind paths are rejected, since they would resolve against the " +
+				"daemon's working directory and not the operator's",
+			mutate:  func(c *Config) { c.Sandbox.WritablePaths = []string{"datasets"} },
+			wantErr: "sandbox paths must be absolute",
+		},
+		{
+			name:    "relative masked path is rejected too",
+			mutate:  func(c *Config) { c.Sandbox.MaskedPaths = []string{"../secrets"} },
+			wantErr: "sandbox paths must be absolute",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.NodeName = "n1"
+			tc.mutate(cfg)
+
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %q, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The GPU switch defaults to on: there is no point scheduling a GPU job onto a node and then
+// hiding the card from it.
+func TestSandboxGPUDevicesDefaultsOn(t *testing.T) {
+	if !(SandboxConfig{}).WantsGPUDevices() {
+		t.Fatal("GPU device nodes should be exposed unless explicitly disabled")
+	}
+	off := false
+	if (SandboxConfig{GPUDevices: &off}).WantsGPUDevices() {
+		t.Fatal("gpu_devices: false should withhold the device nodes")
+	}
+}
+
+// A strict sandbox with no configured binds must still get the system directories, or no job
+// can find a shell.
+func TestSandboxReadOnlyPathsFallBackToSystemDirs(t *testing.T) {
+	paths := (SandboxConfig{}).ResolvedReadOnlyPaths()
+	for _, want := range []string{"/usr", "/bin", "/lib", "/etc"} {
+		found := false
+		for _, p := range paths {
+			if p == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("default read-only paths %v are missing %s", paths, want)
+		}
+	}
+
+	custom := SandboxConfig{ReadOnlyPaths: []string{"/opt/only"}}
+	if got := custom.ResolvedReadOnlyPaths(); len(got) != 1 || got[0] != "/opt/only" {
+		t.Fatalf("configured paths should replace the defaults, got %v", got)
+	}
+}

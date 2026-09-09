@@ -2,10 +2,12 @@
 
 **Tasch** is a distributed task scheduler with multi-GPU and cross-platform support. One binary, one setup command, and your cluster is ready.
 
-> **Status: alpha.** Authentication and gossip encryption exist but are **off by default**, and
-> jobs are resource-limited rather than isolated — they share the service account's filesystem
-> and network. Set `auth.enabled` and `gossip.encryption_key`, and read
-> [SECURITY.md](SECURITY.md), before running this anywhere but a trusted network.
+> **Status: alpha.** Authentication, gossip encryption and job isolation all exist, and all
+> three are **off by default** so that upgrading does not change what a running cluster does.
+> Set `auth.enabled`, `gossip.encryption_key` and `sandbox.mode`, and read
+> [SECURITY.md](SECURITY.md), before running this anywhere but a trusted network. Even with
+> everything on, jobs still share one service account and there is no syscall filter, so treat
+> the isolation as comparable to a plain container rather than to a VM.
 
 ```
 ┌──────────────────┐        ┌──────────────────┐
@@ -96,6 +98,7 @@ tasch stop                     # graceful drain + shutdown
 | **Cordon / drain** | Take a node out of rotation for maintenance. Cordons survive a master restart, and `tasch nodes` shows why a node is not taking work |
 | **Multi-resource tracking** | Prevents GPU, CPU, and memory oversubscription across concurrent dispatches |
 | **Enforced limits** | On Linux, `--cpus` and `--memory` become real cgroup v2 limits, not just bookkeeping. Every job gets a process cap, so a fork bomb cannot take the worker down. Requires the systemd unit's `Delegate=` |
+| **Job isolation** | Optional. `sandbox.mode: private` gives each job its own mount, PID, IPC and UTS namespaces — its own `/tmp` and process table, with the account's home and Tasch's own credentials masked. `sandbox.mode: strict` adds a `pivot_root` into a rootfs built from read-only binds, so the job sees only the system directories, what you bind in, and its own scratch. Works unprivileged, via a user namespace |
 | **Dispatch handshake** | Worker acknowledges job start; master re-queues unacknowledged jobs after 10s |
 | **Fencing tokens** | Every dispatch carries an attempt number; results from a superseded dispatch are discarded, so a job cannot be double-counted or release another node's resources |
 | **Graceful drain** | `tasch stop` → stop accepting → wait for running jobs → shutdown |

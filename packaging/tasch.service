@@ -32,9 +32,9 @@ Delegate=cpu memory pids
 #
 # Note the inherent limit: a Tasch worker's job is to run arbitrary user commands as this
 # service account, so anything that would confine the *job* also confines the scheduler. These
-# settings therefore protect the host from the daemon. Per-job CPU, memory, and process limits
-# are enforced separately via the delegated cgroup above; what remains missing is filesystem and
-# network isolation, which needs namespaces or containers. See SECURITY.md.
+# settings therefore protect the host from the daemon. Per-job confinement is separate: CPU,
+# memory and process limits come from the delegated cgroup above, and filesystem, PID and IPC
+# isolation from `sandbox.mode` in the config. See SECURITY.md.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=no
@@ -48,7 +48,12 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 RestrictSUIDSGID=yes
-RestrictNamespaces=yes
+# Namespaces are how `sandbox.mode` isolates a job, so they cannot be blocked outright — a
+# worker under `RestrictNamespaces=yes` fails every job it was told to sandbox. This is the
+# narrowest allowance that works: mnt, pid, ipc and uts build the sandbox, user is what lets an
+# unprivileged worker build it at all, and net is only used by `sandbox.network: none`.
+# Remove `user` if the worker runs as root, and `net` if you never set `network: none`.
+RestrictNamespaces=mnt pid ipc uts user net
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 LockPersonality=yes
@@ -57,6 +62,11 @@ AmbientCapabilities=
 
 # PrivateDevices is left off and /dev access preserved so GPU device nodes remain visible to
 # jobs. Narrow this with DeviceAllow if the node has no GPUs.
+#
+# ProtectHome=yes and ProtectSystem=strict apply to the daemon and are inherited by every job it
+# runs, so a job cannot write outside StateDirectory even with `sandbox.mode: none`. That is a
+# useful floor, not a substitute: it does not stop one job reading another's files, which is
+# what the sandbox is for.
 
 [Install]
 WantedBy=multi-user.target

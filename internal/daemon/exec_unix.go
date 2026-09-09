@@ -21,13 +21,22 @@ const processGroupGrace = 10 * time.Second
 // per-rank children — was reparented to init and kept running after a walltime kill or a
 // cancel, holding the GPUs the scheduler had just marked free. Signalling the whole group
 // reclaims them.
-func prepareCommand(ctx context.Context, cmdStr string, cg *jobCgroup) *exec.Cmd {
+// When sb is non-nil the command is replaced by a re-execution of this binary inside new
+// namespaces, which then runs the job; see sandbox.go.
+func prepareCommand(ctx context.Context, cmdStr string, env []string, cg *jobCgroup, sb *sandbox) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = env
 
 	// Place the child into its cgroup at clone time. Writing the pid to cgroup.procs after
 	// Start would leave a window in which the job runs unconfined.
 	cg.apply(cmd.SysProcAttr)
+
+	// Isolation is applied after the cgroup so both land on the same clone: the job starts
+	// already confined and already inside its namespaces, with no window in between.
+	if err := sb.applyTo(cmd, cmdStr); err != nil {
+		return nil, err
+	}
 
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -46,5 +55,5 @@ func prepareCommand(ctx context.Context, cmdStr string, cg *jobCgroup) *exec.Cmd
 	// in a grandchild cannot keep Wait blocked forever.
 	cmd.WaitDelay = processGroupGrace + 2*time.Second
 
-	return cmd
+	return cmd, nil
 }

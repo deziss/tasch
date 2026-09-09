@@ -284,6 +284,23 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 			"reason", cgroupUnavailableReason())
 	}
 
+	// Say plainly what a job on this node can reach. "none" is the default, and an operator
+	// who has not chosen it deliberately should see that jobs share the account's filesystem.
+	switch mode := cfg.Sandbox.Mode; mode {
+	case "", config.SandboxNone:
+		slog.Warn("jobs run without isolation: they share this account's filesystem, network " +
+			"and credentials with each other and with tasch itself; set sandbox.mode to " +
+			"\"private\" or \"strict\" to confine them")
+	default:
+		if err := sandboxSupportErrForLog(); err != nil {
+			slog.Error("job isolation is configured but unavailable; jobs will be rejected",
+				"mode", mode, "reason", err)
+		} else {
+			slog.Info("jobs are isolated in their own namespaces", "mode", mode,
+				"network", cfg.Sandbox.Network)
+		}
+	}
+
 	// Jobs currently executing on this node, reported by /ready.
 	var runningJobCount atomic.Int64
 
@@ -376,6 +393,30 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					stdout := newCappedBuffer(outputLimit)
 					stderr := newCappedBuffer(outputLimit)
 
+					env := os.Environ()
+					for k, v := range p.EnvVars {
+						env = append(env, fmt.Sprintf("%s=%s", k, v))
+					}
+
+					// Isolate the job. Unlike the cgroup below, a failure here is fatal to the
+					// job: a cluster configured to sandbox its work must not quietly stop doing
+					// so and run the next job with the service account's whole filesystem in
+					// reach. Failing loudly is the only honest option.
+					failJob := func(reason string) {
+						logging.Job(p.JobId).Error("cannot run job", "error", reason)
+						reportWithRetry(subCtx, resolve, &pb.ReportResultRequest{
+							JobId: p.JobId, WorkerNode: nodeName, Success: false, Error: reason,
+							StartTime: startTime.Unix(), EndTime: time.Now().Unix(),
+							Attempt: p.Attempt,
+						})
+					}
+					sb, sbErr := newSandbox(cfg, p.JobId, p.EnvVars)
+					if sbErr != nil {
+						failJob(fmt.Sprintf("job isolation could not be set up: %v", sbErr))
+						return
+					}
+					defer func() { _ = sb.Close() }()
+
 					// Confine the job to what it reserved. Failure here is not fatal: many hosts
 					// cannot delegate a cgroup subtree, and a worker that cannot enforce limits
 					// must still be able to run work.
@@ -385,17 +426,13 @@ func StartWorker(cfg *config.Config) (cancel func(), err error) {
 					}
 					defer func() { _ = cg.Close() }()
 
-					cmd := prepareCommand(ctx, p.Command, cg)
+					cmd, prepErr := prepareCommand(ctx, p.Command, env, cg, sb)
+					if prepErr != nil {
+						failJob(fmt.Sprintf("job could not be prepared: %v", prepErr))
+						return
+					}
 					cmd.Stdout = stdout
 					cmd.Stderr = stderr
-
-					if len(p.EnvVars) > 0 {
-						env := os.Environ()
-						for k, v := range p.EnvVars {
-							env = append(env, fmt.Sprintf("%s=%s", k, v))
-						}
-						cmd.Env = env
-					}
 
 					execErr := cmd.Run()
 					endTime := time.Now()

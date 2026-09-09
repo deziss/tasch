@@ -14,43 +14,39 @@ func DetectGPUs() (count int, models []string, memoryMB []int, version string, v
 		return 0, nil, nil, "", ""
 	}
 
-	lines := strings.Split(string(out), "\n")
-	model := "Apple GPU"
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Chipset Model:") {
-			model = strings.TrimSpace(strings.TrimPrefix(line, "Chipset Model:"))
+	gpus := parseMacGPUs(string(out))
+	if len(gpus) == 0 {
+		// A headless Mac or a VM with no graphics hardware. Reporting a GPU here would attract
+		// GPU jobs the node cannot run, which is what the previous unconditional count of 1 did.
+		return 0, nil, nil, "", ""
+	}
+
+	// Apple Silicon shares system memory with the CPU, so system_profiler reports no dedicated
+	// VRAM. Derive a figure from installed memory for those; a discrete card's own number is
+	// used as reported.
+	var unifiedMB int
+	if sysOut, err := probe("sysctl", "-n", "hw.memsize"); err == nil {
+		if bytes, parseErr := strconv.ParseInt(strings.TrimSpace(string(sysOut)), 10, 64); parseErr == nil {
+			unifiedMB = unifiedMemoryMB(bytes)
 		}
 	}
 
-	var vramMB int
-	out2, err := probe("sysctl", "-n", "hw.memsize")
-	if err == nil {
-		bytes, _ := strconv.ParseInt(strings.TrimSpace(string(out2)), 10, 64)
-		if bytes > 0 {
-			// For Unified Memory, allocate 75% of total memory as available VRAM
-			vramMB = int((bytes / 1024 / 1024) * 3 / 4)
+	for _, gpu := range gpus {
+		models = append(models, gpu.Model)
+
+		mb := gpu.VRAMMegabytes
+		if mb == 0 {
+			// No dedicated VRAM. Fall back to the unified-memory share, and to zero when the
+			// system's memory size is unknown — a fabricated figure would let a job match a node
+			// that cannot hold it.
+			mb = unifiedMB
 		}
-	}
-	if vramMB == 0 {
-		vramMB = 8192 // Fallback to 8GB
+		memoryMB = append(memoryMB, mb)
 	}
 
-	models = []string{model}
-	memoryMB = []int{vramMB}
-	count = 1
+	count = len(models)
+	vendor = vendorFromMacModel(models[0])
 	version = "Metal API"
-
-	lowerModel := strings.ToLower(model)
-	if strings.Contains(lowerModel, "nvidia") {
-		vendor = "nvidia"
-	} else if strings.Contains(lowerModel, "amd") || strings.Contains(lowerModel, "radeon") {
-		vendor = "amd"
-	} else if strings.Contains(lowerModel, "intel") {
-		vendor = "intel"
-	} else {
-		vendor = "apple"
-	}
 
 	return count, models, memoryMB, version, vendor
 }

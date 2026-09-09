@@ -53,6 +53,20 @@ source to the users of that service.
 
 ### Fixed — hardware detection
 
+- **Windows reported 0 MB of VRAM for every modern GPU.** `Win32_VideoController.AdapterRAM` is
+  a 32-bit field, so a card with 4 GB or more wraps — PowerShell renders it negative — and the
+  code clamped anything negative to zero. No `ad.gpu_memory_mb` requirement could match on
+  Windows at all. The driver's own 64-bit size is now read from the registry, with the wrapped
+  value reinterpreted as unsigned when the registry has no entry.
+- **macOS advertised a GPU that was not there.** The count was set to 1 whenever
+  `system_profiler` merely succeeded, so a headless Mac or a VM attracted GPU jobs it could not
+  run. Only adapters actually reported are counted now.
+- **macOS kept only the last GPU it saw**, so a machine with a discrete card plus integrated
+  graphics, or an eGPU, reported one instead of two — and could attribute one adapter's VRAM to
+  another.
+- **macOS invented a VRAM figure.** When system memory could not be read it fell back to a
+  hardcoded 8 GB, which would let a job match a machine that could not hold it. It now reports
+  nothing rather than a guess.
 - **GPU probes can no longer hang startup.** All twelve vendor-tool invocations used plain
   `exec.Command` with no deadline. An `nvidia-smi` stuck in uninterruptible sleep — the routine
   outcome when a GPU falls off the bus, which is exactly when you want the node to still report

@@ -316,6 +316,7 @@ message NodeSchedulingState {
 
 message ListJobsRequest {
   string state_filter = 1; // Optional: filter by state
+  string user_filter = 4;  // Optional: filter by owner
 
   // Pagination. The response previously carried every job in one message, which on a busy
   // cluster is both an unbounded allocation on the master and a response that can exceed gRPC's
@@ -340,6 +341,22 @@ message JobInfo {
   string user = 7;
   int64 submit_time = 8;
   string group_id = 9;
+
+  // Timing and placement. Without these a list of jobs cannot show how long anything has been
+  // running, which is the first thing anyone looks for, and cannot be grouped by the partition
+  // or account the scheduling decisions were actually made against.
+  int64 start_time = 10;
+  int64 end_time = 11;
+  string partition = 12;
+  string account = 13;
+  string array_id = 14;
+  int32 array_index = 15;
+
+  // What the job reserved, so a list makes clear why a large job is still waiting.
+  int32 gpus_required = 16;
+  int32 cpus_required = 17;
+  int32 memory_required_mb = 18;
+  int32 retry_count = 19;
 }
 
 message ReportResultRequest {

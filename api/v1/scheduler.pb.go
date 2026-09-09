@@ -2089,6 +2089,7 @@ func (x *NodeSchedulingState) GetGpusAllocated() int32 {
 type ListJobsRequest struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	StateFilter string                 `protobuf:"bytes,1,opt,name=state_filter,json=stateFilter,proto3" json:"state_filter,omitempty"` // Optional: filter by state
+	UserFilter  string                 `protobuf:"bytes,4,opt,name=user_filter,json=userFilter,proto3" json:"user_filter,omitempty"`    // Optional: filter by owner
 	// Pagination. The response previously carried every job in one message, which on a busy
 	// cluster is both an unbounded allocation on the master and a response that can exceed gRPC's
 	// receive limit, making the call fail outright rather than return a large result.
@@ -2131,6 +2132,13 @@ func (*ListJobsRequest) Descriptor() ([]byte, []int) {
 func (x *ListJobsRequest) GetStateFilter() string {
 	if x != nil {
 		return x.StateFilter
+	}
+	return ""
+}
+
+func (x *ListJobsRequest) GetUserFilter() string {
+	if x != nil {
+		return x.UserFilter
 	}
 	return ""
 }
@@ -2210,18 +2218,32 @@ func (x *ListJobsResponse) GetTotalMatching() int32 {
 }
 
 type JobInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	State         string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
-	Command       string                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
-	Requirement   string                 `protobuf:"bytes,4,opt,name=requirement,proto3" json:"requirement,omitempty"`
-	WorkerNode    string                 `protobuf:"bytes,5,opt,name=worker_node,json=workerNode,proto3" json:"worker_node,omitempty"`
-	Priority      int32                  `protobuf:"varint,6,opt,name=priority,proto3" json:"priority,omitempty"`
-	User          string                 `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
-	SubmitTime    int64                  `protobuf:"varint,8,opt,name=submit_time,json=submitTime,proto3" json:"submit_time,omitempty"`
-	GroupId       string                 `protobuf:"bytes,9,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	JobId       string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	State       string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	Command     string                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
+	Requirement string                 `protobuf:"bytes,4,opt,name=requirement,proto3" json:"requirement,omitempty"`
+	WorkerNode  string                 `protobuf:"bytes,5,opt,name=worker_node,json=workerNode,proto3" json:"worker_node,omitempty"`
+	Priority    int32                  `protobuf:"varint,6,opt,name=priority,proto3" json:"priority,omitempty"`
+	User        string                 `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
+	SubmitTime  int64                  `protobuf:"varint,8,opt,name=submit_time,json=submitTime,proto3" json:"submit_time,omitempty"`
+	GroupId     string                 `protobuf:"bytes,9,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// Timing and placement. Without these a list of jobs cannot show how long anything has been
+	// running, which is the first thing anyone looks for, and cannot be grouped by the partition
+	// or account the scheduling decisions were actually made against.
+	StartTime  int64  `protobuf:"varint,10,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
+	EndTime    int64  `protobuf:"varint,11,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	Partition  string `protobuf:"bytes,12,opt,name=partition,proto3" json:"partition,omitempty"`
+	Account    string `protobuf:"bytes,13,opt,name=account,proto3" json:"account,omitempty"`
+	ArrayId    string `protobuf:"bytes,14,opt,name=array_id,json=arrayId,proto3" json:"array_id,omitempty"`
+	ArrayIndex int32  `protobuf:"varint,15,opt,name=array_index,json=arrayIndex,proto3" json:"array_index,omitempty"`
+	// What the job reserved, so a list makes clear why a large job is still waiting.
+	GpusRequired     int32 `protobuf:"varint,16,opt,name=gpus_required,json=gpusRequired,proto3" json:"gpus_required,omitempty"`
+	CpusRequired     int32 `protobuf:"varint,17,opt,name=cpus_required,json=cpusRequired,proto3" json:"cpus_required,omitempty"`
+	MemoryRequiredMb int32 `protobuf:"varint,18,opt,name=memory_required_mb,json=memoryRequiredMb,proto3" json:"memory_required_mb,omitempty"`
+	RetryCount       int32 `protobuf:"varint,19,opt,name=retry_count,json=retryCount,proto3" json:"retry_count,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *JobInfo) Reset() {
@@ -2315,6 +2337,76 @@ func (x *JobInfo) GetGroupId() string {
 		return x.GroupId
 	}
 	return ""
+}
+
+func (x *JobInfo) GetStartTime() int64 {
+	if x != nil {
+		return x.StartTime
+	}
+	return 0
+}
+
+func (x *JobInfo) GetEndTime() int64 {
+	if x != nil {
+		return x.EndTime
+	}
+	return 0
+}
+
+func (x *JobInfo) GetPartition() string {
+	if x != nil {
+		return x.Partition
+	}
+	return ""
+}
+
+func (x *JobInfo) GetAccount() string {
+	if x != nil {
+		return x.Account
+	}
+	return ""
+}
+
+func (x *JobInfo) GetArrayId() string {
+	if x != nil {
+		return x.ArrayId
+	}
+	return ""
+}
+
+func (x *JobInfo) GetArrayIndex() int32 {
+	if x != nil {
+		return x.ArrayIndex
+	}
+	return 0
+}
+
+func (x *JobInfo) GetGpusRequired() int32 {
+	if x != nil {
+		return x.GpusRequired
+	}
+	return 0
+}
+
+func (x *JobInfo) GetCpusRequired() int32 {
+	if x != nil {
+		return x.CpusRequired
+	}
+	return 0
+}
+
+func (x *JobInfo) GetMemoryRequiredMb() int32 {
+	if x != nil {
+		return x.MemoryRequiredMb
+	}
+	return 0
+}
+
+func (x *JobInfo) GetRetryCount() int32 {
+	if x != nil {
+		return x.RetryCount
+	}
+	return 0
 }
 
 type ReportResultRequest struct {
@@ -2651,16 +2743,18 @@ const file_scheduler_proto_rawDesc = "" +
 	"\rcordon_reason\x18\x02 \x01(\tR\fcordonReason\x12%\n" +
 	"\x0ecircuit_broken\x18\x03 \x01(\bR\rcircuitBroken\x12!\n" +
 	"\frunning_jobs\x18\x04 \x01(\x05R\vrunningJobs\x12%\n" +
-	"\x0egpus_allocated\x18\x05 \x01(\x05R\rgpusAllocated\"p\n" +
+	"\x0egpus_allocated\x18\x05 \x01(\x05R\rgpusAllocated\"\x91\x01\n" +
 	"\x0fListJobsRequest\x12!\n" +
-	"\fstate_filter\x18\x01 \x01(\tR\vstateFilter\x12\x1b\n" +
+	"\fstate_filter\x18\x01 \x01(\tR\vstateFilter\x12\x1f\n" +
+	"\vuser_filter\x18\x04 \x01(\tR\n" +
+	"userFilter\x12\x1b\n" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x03 \x01(\tR\tpageToken\"\x82\x01\n" +
 	"\x10ListJobsResponse\x12\x1f\n" +
 	"\x04jobs\x18\x01 \x03(\v2\v.v1.JobInfoR\x04jobs\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12%\n" +
-	"\x0etotal_matching\x18\x03 \x01(\x05R\rtotalMatching\"\xff\x01\n" +
+	"\x0etotal_matching\x18\x03 \x01(\x05R\rtotalMatching\"\xc6\x04\n" +
 	"\aJobInfo\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x18\n" +
@@ -2672,7 +2766,21 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x04user\x18\a \x01(\tR\x04user\x12\x1f\n" +
 	"\vsubmit_time\x18\b \x01(\x03R\n" +
 	"submitTime\x12\x19\n" +
-	"\bgroup_id\x18\t \x01(\tR\agroupId\"\xe9\x01\n" +
+	"\bgroup_id\x18\t \x01(\tR\agroupId\x12\x1d\n" +
+	"\n" +
+	"start_time\x18\n" +
+	" \x01(\x03R\tstartTime\x12\x19\n" +
+	"\bend_time\x18\v \x01(\x03R\aendTime\x12\x1c\n" +
+	"\tpartition\x18\f \x01(\tR\tpartition\x12\x18\n" +
+	"\aaccount\x18\r \x01(\tR\aaccount\x12\x19\n" +
+	"\barray_id\x18\x0e \x01(\tR\aarrayId\x12\x1f\n" +
+	"\varray_index\x18\x0f \x01(\x05R\n" +
+	"arrayIndex\x12#\n" +
+	"\rgpus_required\x18\x10 \x01(\x05R\fgpusRequired\x12#\n" +
+	"\rcpus_required\x18\x11 \x01(\x05R\fcpusRequired\x12,\n" +
+	"\x12memory_required_mb\x18\x12 \x01(\x05R\x10memoryRequiredMb\x12\x1f\n" +
+	"\vretry_count\x18\x13 \x01(\x05R\n" +
+	"retryCount\"\xe9\x01\n" +
 	"\x13ReportResultRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1f\n" +
 	"\vworker_node\x18\x02 \x01(\tR\n" +

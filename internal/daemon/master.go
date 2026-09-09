@@ -929,6 +929,31 @@ func (s *schedulerServer) GetJobStatus(ctx context.Context, req *pb.GetJobStatus
 	return resp, nil
 }
 
+// jobInfo converts a job for the list API.
+//
+// One converter for both the live queue and the dead-letter bucket, so a job does not describe
+// itself differently depending on which bucket it was read from.
+func jobInfo(j *scheduler.Job) *pb.JobInfo {
+	info := &pb.JobInfo{
+		JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
+		WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
+		SubmitTime: j.SubmitTime.Unix(), GroupId: j.GroupID,
+		Partition: j.Partition, Account: j.Account,
+		ArrayId: j.ArrayID, ArrayIndex: int32(j.ArrayIndex),
+		GpusRequired: int32(j.GPUsRequired), CpusRequired: int32(j.CPUsRequired),
+		MemoryRequiredMb: int32(j.MemoryRequiredMB), RetryCount: int32(j.RetryCount),
+	}
+	// A zero-valued time is "not set", and sending its Unix epoch would render as 1970 in any
+	// client that does not know to special-case it.
+	if !j.StartTime.IsZero() {
+		info.StartTime = j.StartTime.Unix()
+	}
+	if !j.EndTime.IsZero() {
+		info.EndTime = j.EndTime.Unix()
+	}
+	return info
+}
+
 func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest) (*pb.ListJobsResponse, error) {
 	// Listing is scoped to what the caller owns. An unscoped list handed out every job ID,
 	// user, and command in the cluster, which is both a disclosure and the enumeration step
@@ -961,11 +986,7 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 				return nil, err
 			}
 			for _, j := range page {
-				infos = append(infos, &pb.JobInfo{
-					JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
-					WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
-					SubmitTime: j.SubmitTime.Unix(), GroupId: j.GroupID,
-				})
+				infos = append(infos, jobInfo(j))
 			}
 			return &pb.ListJobsResponse{
 				Jobs: infos, NextPageToken: nextToken, TotalMatching: int32(len(visible)),
@@ -978,9 +999,15 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 
 	visible := jobs[:0]
 	for _, j := range jobs {
-		if auth.CanAccessJob(caller, j.User) {
-			visible = append(visible, j)
+		if !auth.CanAccessJob(caller, j.User) {
+			continue
 		}
+		// The user filter narrows what the caller may already see; it never widens it, so an
+		// admin can focus on one person's work without it becoming a way around the check above.
+		if req.UserFilter != "" && j.User != req.UserFilter {
+			continue
+		}
+		visible = append(visible, j)
 	}
 
 	// Jobs live in a map, so impose a deterministic order before paging. Newest first, with the
@@ -997,11 +1024,7 @@ func (s *schedulerServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest)
 		return nil, err
 	}
 	for _, j := range page {
-		infos = append(infos, &pb.JobInfo{
-			JobId: j.ID, State: j.State, Command: j.Command, Requirement: j.Requirement,
-			WorkerNode: j.WorkerNode, Priority: int32(j.Priority), User: j.User,
-			SubmitTime: j.SubmitTime.Unix(), GroupId: j.GroupID,
-		})
+		infos = append(infos, jobInfo(j))
 	}
 	return &pb.ListJobsResponse{
 		Jobs: infos, NextPageToken: nextToken, TotalMatching: int32(len(visible)),

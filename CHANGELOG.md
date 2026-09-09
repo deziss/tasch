@@ -71,8 +71,14 @@ source to the users of that service.
 - Masters now share one gossip cluster via `gossip.join`. Without it each forms its own
   membership view and a leader can only dispatch to the workers that happened to join it.
 - Off by default, and off is exactly the previous single-master behaviour: no quorum requirement,
-  no replication, no new failure modes. Enabling it requires an odd number of masters, three at
-  minimum — two are worse than one, since losing either leaves no majority.
+  no replication, no new failure modes.
+- Enabling it requires an odd number of masters, three at minimum. Raft commits nothing without a
+  majority, so quorum is `floor(N/2)+1` and the failures survived are `N-quorum`. Two masters
+  have a quorum of two: losing either leaves the survivor holding a complete copy of the state
+  but unable to elect a leader or commit anything. That is the same zero failures a single
+  master tolerates, with twice the hardware that can fail and a far harder recovery — so the
+  configuration is rejected rather than allowed to look like an improvement. Even sizes are
+  rejected for the same arithmetic: four survive one failure, exactly like three.
 
 ### Changed — master restart
 

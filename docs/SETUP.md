@@ -341,10 +341,41 @@ gossip:
 master_addrs: ["10.0.1.11", "10.0.1.12", "10.0.1.13"]
 ```
 
-**Use an odd number, three at minimum.** Raft needs a majority to make progress: three masters
-tolerate one failure, five tolerate two. Two masters are worse than one — losing either leaves no
-majority, so the cluster stops rather than continuing degraded. The config refuses an even count
-for that reason.
+### How many masters
+
+Raft commits nothing without a majority of the configured cluster, so the useful number is
+`quorum = floor(N/2) + 1`, and what you can survive is `N - quorum`:
+
+| Masters | Quorum | Failures tolerated |
+|---------|--------|--------------------|
+| 1       | 1      | 0                  |
+| 2       | 2      | **0**              |
+| 3       | 2      | 1                  |
+| 4       | 3      | 1                  |
+| 5       | 3      | 2                  |
+
+**Two masters are worse than one, which is why the config refuses them.** Quorum with two is
+two: you need both. Lose either and the survivor cannot elect a leader or commit a single entry
+— it sits holding a complete copy of the state, refusing to act. So two hosts tolerate exactly
+as many failures as one, zero, while doubling the hardware that can cause an outage.
+
+Recovery is also harder. A dead single master is a restart, or restoring its database onto a new
+host. A two-master cluster with one host permanently gone needs its Raft configuration manually
+rewritten to shrink to one — a delicate operation, and doing it while the "dead" master is
+merely partitioned leaves two masters both accepting writes, at which point one set of jobs
+disappears at the next election.
+
+The same arithmetic explains the odd-number rule: four masters tolerate one failure, exactly
+like three, while adding a fourth machine that can fail. Every even size is strictly worse than
+the odd size below it.
+
+> Two nodes *can* be made to work with a witness — a third voting member that holds no state and
+> exists only to break ties, as etcd learners and MongoDB arbiters do. Tasch does not implement
+> one, so three real masters is the floor here.
+
+If three masters are not practical, run a single master. It survives its own restart without
+losing running jobs (see **Master Restart** in the architecture guide) — it just cannot survive
+losing the host.
 
 `data_dir` must be local to each master and never shared; it holds that master's copy of the
 replicated log.

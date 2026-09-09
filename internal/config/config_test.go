@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,5 +223,97 @@ func TestPrincipalsFromFile(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate rejected a file-based principal list: %v", err)
+	}
+}
+
+// TestHAQuorumSizing pins the cluster-size rule, which is a correctness constraint rather than
+// a style preference: Raft commits nothing without a majority, so quorum is floor(N/2)+1 and the
+// failures survived are N-quorum.
+func TestHAQuorumSizing(t *testing.T) {
+	peers := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("master-%d=10.0.0.%d:8300", i, i+1)
+		}
+		return out
+	}
+
+	base := func(n int) *Config {
+		cfg := DefaultConfig()
+		cfg.HA = HAConfig{
+			Enabled: true, NodeID: "master-0",
+			BindAddr: "10.0.0.1:8300", DataDir: "/var/lib/tasch/raft",
+			Peers: peers(n),
+		}
+		return cfg
+	}
+
+	cases := []struct {
+		size    int
+		wantErr bool
+		why     string
+	}{
+		// One master is a valid deployment, but not as an HA cluster: there is nothing to fail
+		// over to, so it must be configured with ha.enabled off.
+		{size: 1, wantErr: true, why: "a single peer is not a cluster"},
+		// Two is the important case. Quorum is 2, so losing either master stops everything —
+		// the same zero failures as one master, with twice the hardware that can fail.
+		{size: 2, wantErr: true, why: "two masters tolerate no failures and are worse than one"},
+		{size: 3, wantErr: false, why: "three tolerate one failure"},
+		// Four shares three's quorum of 3, so it survives no more failures while adding a
+		// machine that can fail.
+		{size: 4, wantErr: true, why: "even sizes are strictly worse than the odd size below"},
+		{size: 5, wantErr: false, why: "five tolerate two failures"},
+		{size: 6, wantErr: true, why: "even sizes are strictly worse than the odd size below"},
+		{size: 7, wantErr: false, why: "seven tolerate three failures"},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%dmasters", tc.size), func(t *testing.T) {
+			err := base(tc.size).Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("%d masters was accepted: %s", tc.size, tc.why)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("%d masters was rejected (%s): %v", tc.size, tc.why, err)
+			}
+		})
+	}
+}
+
+// TestHAErrorsExplainWhy confirms the rejection tells an operator what is wrong rather than just
+// that something is. Someone hitting this is mid-deployment and needs the reasoning, not a rule.
+func TestHAErrorsExplainWhy(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HA = HAConfig{
+		Enabled: true, NodeID: "master-0", BindAddr: "10.0.0.1:8300",
+		DataDir: "/var/lib/tasch/raft",
+		Peers:   []string{"master-0=10.0.0.1:8300", "master-1=10.0.0.2:8300"},
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("two masters were accepted")
+	}
+	for _, want := range []string{"tolerates no failures", "single master"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestHARequiresSelfInPeers confirms a master that is not in its own peer list is rejected: it
+// would start, replicate nothing, and never be eligible for leadership.
+func TestHARequiresSelfInPeers(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HA = HAConfig{
+		Enabled: true, NodeID: "master-9", BindAddr: "10.0.0.9:8300",
+		DataDir: "/var/lib/tasch/raft",
+		Peers: []string{
+			"master-0=10.0.0.1:8300", "master-1=10.0.0.2:8300", "master-2=10.0.0.3:8300",
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a master missing from its own peer list was accepted")
 	}
 }

@@ -376,13 +376,23 @@ func (c *Config) Validate() error {
 		if c.HA.DataDir == "" {
 			return fmt.Errorf("ha.data_dir is required and must not be shared between masters")
 		}
+		// Raft commits nothing without a majority, so quorum is floor(N/2)+1 and the number of
+		// failures survived is N-quorum. Two masters have a quorum of two: losing either leaves
+		// the survivor holding a complete copy of the state but unable to elect a leader or
+		// commit anything. That tolerates the same zero failures as a single master while
+		// doubling the hardware that can cause an outage, and it is far harder to recover from
+		// — a lone survivor needs its Raft configuration rewritten by hand.
 		if len(c.HA.Peers) < 3 {
-			// Two masters cannot form a majority once either is lost, so the cluster stops on
-			// the first failure — worse than a single master, which at least restarts.
-			return fmt.Errorf("ha.peers needs at least 3 masters to tolerate a failure (got %d)", len(c.HA.Peers))
+			return fmt.Errorf("ha.peers needs at least 3 masters: %d tolerates no failures at all "+
+				"(quorum of %d), so it is worse than running a single master",
+				len(c.HA.Peers), len(c.HA.Peers)/2+1)
 		}
+		// An even size shares the quorum of the odd size below it, so it adds a machine that can
+		// fail without surviving any more failures.
 		if len(c.HA.Peers)%2 == 0 {
-			return fmt.Errorf("ha.peers should be an odd number of masters; %d gives no better fault tolerance than %d", len(c.HA.Peers), len(c.HA.Peers)-1)
+			return fmt.Errorf("ha.peers should be an odd number of masters: %d tolerates %d "+
+				"failure(s), the same as %d, while adding another machine that can fail",
+				len(c.HA.Peers), len(c.HA.Peers)-(len(c.HA.Peers)/2+1), len(c.HA.Peers)-1)
 		}
 		seen := make(map[string]bool, len(c.HA.Peers))
 		selfListed := false
